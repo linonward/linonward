@@ -3,6 +3,8 @@ import postgres from "postgres";
 
 import * as schema from "./schema";
 
+export * from "./schema";
+
 let database: ReturnType<typeof drizzle<typeof schema>> | undefined;
 
 export function getDatabase() {

@@ -4,7 +4,7 @@ if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required for dat
 
 export default defineConfig({
   dialect: "postgresql",
-  schema: "./src/server/db/schema.ts",
+  schema: "./src/schema.ts",
   out: "./drizzle",
   dbCredentials: { url: process.env.DATABASE_URL },
 });

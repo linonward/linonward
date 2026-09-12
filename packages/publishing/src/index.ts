@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
 
-import { getTheme, parseDraft, renderWechatHtml, sanitizeWechatHtml } from "@linonward/editor";
+import {
+  getTheme,
+  parseDraft,
+  renderWechatHtml,
+  sanitizeWechatHtml,
+} from "@linonward/editor/publishing";
 
-import type { getPublishedArticleById } from "./articles";
+import type { getPublishedArticleById } from "@linonward/content";
 
 type Article = NonNullable<Awaited<ReturnType<typeof getPublishedArticleById>>>;
 type WechatErrorResponse = { errcode?: number; errmsg?: string };

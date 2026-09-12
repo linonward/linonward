@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   updateWechatDelivery: vi.fn(),
 }));
 
-vi.mock("@/server/articles", () => ({
+vi.mock("@linonward/content", () => ({
   claimWechatDelivery: mocks.claimWechatDelivery,
   getArticle: mocks.getArticle,
   getPublishedArticleById: mocks.getPublishedArticleById,
@@ -18,7 +18,7 @@ vi.mock("@/server/articles", () => ({
   updateWechatDelivery: mocks.updateWechatDelivery,
 }));
 vi.mock("@/server/auth", () => ({ isAdministrator: mocks.isAdministrator }));
-vi.mock("@/server/wechat", () => ({ createWechatDraft: mocks.createWechatDraft }));
+vi.mock("@linonward/publishing", () => ({ createWechatDraft: mocks.createWechatDraft }));
 
 import { POST } from "./route";
 

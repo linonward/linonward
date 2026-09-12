@@ -2,7 +2,7 @@ import { ArrowUpRight } from "lucide-react";
 import Link from "next/link";
 
 import { SiteHeader } from "@/components/site-header";
-import { listPublishedArticles } from "@/server/articles";
+import { listPublishedArticles } from "@linonward/content";
 
 export const dynamic = "force-dynamic";
 

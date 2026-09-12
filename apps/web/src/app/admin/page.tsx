@@ -3,7 +3,7 @@ import Link from "next/link";
 
 import { AdminHeader } from "@/components/admin-header";
 import { NewArticleButton } from "@/components/new-article-button";
-import { listArticles } from "@/server/articles";
+import { listArticles } from "@linonward/content";
 
 export default async function AdminPage() {
   const articles = await listArticles();

@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { ArticleEditor } from "@/components/article-editor";
-import { getArticle } from "@/server/articles";
+import { getArticle } from "@linonward/content";
 
 export default async function EditorPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

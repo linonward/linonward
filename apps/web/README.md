@@ -3,13 +3,27 @@
 `apps/web` powers the public content site at `notes.linonward.com` and its single-administrator
 publishing interface under `/admin`.
 
+## Architecture
+
+The site remains one deployable Next.js application, while server responsibilities are separated
+into workspace packages:
+
+- `@linonward/database` owns the PostgreSQL connection, schema, and migrations.
+- `@linonward/content` owns the article draft, revision, and publishing lifecycle.
+- `@linonward/publishing` owns external publishing integrations such as WeChat drafts.
+- `@linonward/web` owns pages, authentication, and thin HTTP adapters.
+
+Server Components call the domain packages directly. Route Handlers should only handle HTTP and
+authentication concerns before delegating to those packages. This keeps the domain boundaries ready
+for a future worker or standalone API deployment without adding a network hop today.
+
 ## Local setup
 
 Copy `.env.example` to `.env.local`, configure PostgreSQL, GitHub OAuth, Cloudflare R2, and the
 WeChat Official Account credentials, then run from the repository root:
 
 ```sh
-pnpm --filter @linonward/web db:migrate
+pnpm --filter @linonward/database db:migrate
 pnpm turbo run dev --filter=@linonward/web
 ```
 

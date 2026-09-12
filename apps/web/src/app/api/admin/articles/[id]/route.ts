@@ -1,7 +1,7 @@
 import { parseDraft, serializeDraftValue } from "@linonward/editor";
 import type { EditorDraftValue } from "@linonward/editor";
+import { getArticle, saveArticle } from "@linonward/content";
 
-import { getArticle, saveArticle } from "@/server/articles";
 import { isAdministrator } from "@/server/auth";
 
 const isDraftValue = (value: unknown): value is EditorDraftValue => {
