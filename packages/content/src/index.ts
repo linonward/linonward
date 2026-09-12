@@ -1,10 +1,15 @@
-import type { EditorDraftValue } from "@linonward/editor";
 import { and, desc, eq, ne, or, sql } from "drizzle-orm";
 
-import { getDatabase } from "./db";
-import { articleRevisions, articles, channelDeliveries } from "./db/schema";
+import { articleRevisions, articles, channelDeliveries, getDatabase } from "@linonward/database";
 
-export const EMPTY_DOCUMENT: EditorDraftValue = {
+export type ArticleDraftValue = {
+  version: 3;
+  title: string;
+  themeId: string;
+  document: Record<string, unknown>;
+};
+
+export const EMPTY_DOCUMENT: ArticleDraftValue = {
   version: 3,
   title: "未命名文章",
   themeId: "default",
@@ -117,7 +122,7 @@ export type SaveArticleResult =
 
 export async function saveArticle(
   id: string,
-  draft: EditorDraftValue,
+  draft: ArticleDraftValue,
   expectedVersion: number,
 ): Promise<SaveArticleResult> {
   const database = getDatabase();

@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { SiteHeader } from "@/components/site-header";
-import { getPublishedArticle } from "@/server/articles";
+import { getPublishedArticle } from "@linonward/content";
 
 export const dynamic = "force-dynamic";
 

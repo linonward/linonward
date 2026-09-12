@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   saveArticle: vi.fn(),
 }));
 
-vi.mock("@/server/articles", () => ({
+vi.mock("@linonward/content", () => ({
   getArticle: mocks.getArticle,
   saveArticle: mocks.saveArticle,
 }));

@@ -1,4 +1,4 @@
-import { createArticle, listArticles } from "@/server/articles";
+import { createArticle, listArticles } from "@linonward/content";
 import { isAdministrator } from "@/server/auth";
 
 export async function GET() {

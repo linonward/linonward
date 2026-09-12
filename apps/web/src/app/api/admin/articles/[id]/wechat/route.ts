@@ -4,9 +4,9 @@ import {
   getPublishedArticleById,
   getWechatDelivery,
   updateWechatDelivery,
-} from "@/server/articles";
+} from "@linonward/content";
 import { isAdministrator } from "@/server/auth";
-import { createWechatDraft } from "@/server/wechat";
+import { createWechatDraft } from "@linonward/publishing";
 
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
   if (!(await isAdministrator())) return Response.json({ error: "Unauthorized" }, { status: 401 });

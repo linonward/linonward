@@ -1,4 +1,4 @@
-import { publishArticle } from "@/server/articles";
+import { publishArticle } from "@linonward/content";
 import { isAdministrator } from "@/server/auth";
 
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
