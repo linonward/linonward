@@ -60,6 +60,11 @@ pnpm turbo run lint --filter=@linonward/utils
 - When changing dependency metadata, run `pnpm install` and commit the updated `pnpm-lock.yaml`.
 - Ensure `pnpm install --frozen-lockfile` succeeds after lockfile changes.
 
+## Test-Driven Development
+
+For behavior changes and bug fixes, read and follow [`.claude/rules/tdd.md`](.claude/rules/tdd.md).
+It is the canonical source for the test-driven development workflow in this repository.
+
 ## Git Workflow
 
 Before creating branches or worktrees, editing files, committing, pushing, or working with pull
