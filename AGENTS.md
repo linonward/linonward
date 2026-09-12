@@ -60,10 +60,8 @@ pnpm turbo run lint --filter=@linonward/utils
 - When changing dependency metadata, run `pnpm install` and commit the updated `pnpm-lock.yaml`.
 - Ensure `pnpm install --frozen-lockfile` succeeds after lockfile changes.
 
-## Git and Commits
+## Git Workflow
 
-- Never commit directly on `main`. Create a focused topic branch before making changes.
-- All changes must reach `main` through a pull request. Never push directly to `main`.
-- Follow Conventional Commits, for example `feat: add api workspace`.
-- Let Husky and lint-staged run normally; do not bypass hooks with `--no-verify`.
-- Keep commits scoped to the requested change and do not modify unrelated user work.
+Before creating branches or worktrees, editing files, committing, pushing, or working with pull
+requests, read and follow [`.claude/rules/git.md`](.claude/rules/git.md). It is the canonical source
+for all Git workflow rules in this repository; do not duplicate those rules here.
