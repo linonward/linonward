@@ -1,0 +1,86 @@
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-height: calc(100vh - 163px);
+}
+
+.editorPane {
+  overflow: auto;
+  border-right: 1px solid #e3e4e9;
+  background: #fff;
+}
+
+.formatBrushActive .editorPane,
+.formatBrushActive .editorPane * {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath fill='%234438e8' d='m21.7 3.4 6.9 6.9-3.2 3.2-2-2-8.2 8.2 1.4 1.4-1.7 1.7-1.4-1.4-6.9 6.9-3.2-3.2 6.9-6.9-1.4-1.4 1.7-1.7 1.4 1.4 8.2-8.2-2-2z'/%3E%3Cpath fill='%23fff' d='m23.4 7.5 1.2 1.2-8.2 8.2-1.2-1.2z'/%3E%3C/svg%3E")
+    3 28,
+    crosshair !important;
+}
+
+.editorFrame,
+.previewFrame {
+  width: 768px;
+  max-width: 100%;
+  min-height: calc(100vh - 163px);
+  margin: 0 auto;
+  padding: 30px 70px 72px;
+}
+
+.preview {
+  overflow: auto;
+  background: #fff;
+}
+
+.previewFrame {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.previewDark {
+  background: #17191f;
+}
+
+.previewDark .previewFrame {
+  background: #252a34;
+}
+
+.previewDark article,
+.previewDark article :is(p, li, blockquote) {
+  color: #e2e5ec !important;
+}
+
+.previewDark article :is(h1, h2, h3, h4, h5, h6) {
+  color: #fff !important;
+}
+
+.previewDark article a {
+  color: #9fc3ff !important;
+}
+
+.previewDark article blockquote {
+  border-left-color: #697386 !important;
+}
+
+.previewDark article :is(pre, code) {
+  border-color: #454d5c !important;
+  background: #1a1f28 !important;
+  color: #d8deeb !important;
+}
+
+.previewDark article :is(th, td) {
+  border-color: #454d5c !important;
+  color: #e2e5ec !important;
+}
+
+.previewDark article th {
+  background: #323947 !important;
+  color: #fff !important;
+}
+
+@media (max-width: 760px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+}
