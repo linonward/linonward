@@ -18,9 +18,10 @@ GitHub user ID of the only allowed administrator.
 
 ## Publishing
 
-Articles are autosaved to PostgreSQL. “发布网站” creates an immutable revision and exposes the
-article on the public site. “同步微信草稿” uploads article images and the first image as the cover,
-then creates a WeChat draft. It never submits or publishes the draft.
+Articles are autosaved to PostgreSQL without changing the public version. “发布网站” creates an
+immutable revision and advances the version exposed on the public site. “同步微信草稿” uses that
+same published revision, uploads its images and the first image as the cover, then creates a WeChat
+draft. It never submits or publishes the draft.
 
 R2 must allow `PUT` requests from the application origin and expose the uploaded objects through
 the HTTPS origin configured in `R2_PUBLIC_BASE_URL`.

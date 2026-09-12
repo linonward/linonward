@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  check,
   index,
   integer,
   jsonb,
@@ -32,6 +33,7 @@ export const articles = pgTable(
     coverAssetId: uuid("cover_asset_id"),
     status: articleStatus("status").notNull().default("draft"),
     version: integer("version").notNull().default(1),
+    publishedVersion: integer("published_version"),
     publishedAt: timestamp("published_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
@@ -40,6 +42,10 @@ export const articles = pgTable(
       .$onUpdate(() => sql`now()`),
   },
   (table) => [
+    check(
+      "articles_published_version_check",
+      sql`${table.status} <> 'published' OR ${table.publishedVersion} IS NOT NULL`,
+    ),
     uniqueIndex("articles_slug_unique").on(table.slug),
     index("articles_status_idx").on(table.status),
   ],

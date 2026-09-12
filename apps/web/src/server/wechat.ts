@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 
 import { getTheme, parseDraft, renderWechatHtml, sanitizeWechatHtml } from "@linonward/editor";
 
-import type { getArticle } from "./articles";
+import type { getPublishedArticleById } from "./articles";
 
-type Article = NonNullable<Awaited<ReturnType<typeof getArticle>>>;
+type Article = NonNullable<Awaited<ReturnType<typeof getPublishedArticleById>>>;
 type WechatErrorResponse = { errcode?: number; errmsg?: string };
 
 let tokenCache: { value: string; expiresAt: number } | undefined;
