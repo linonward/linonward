@@ -31,7 +31,7 @@ export default async function HomePage() {
                 {articles.map((article) => (
                   <Link
                     className="group grid gap-5 border-b border-[#0c2030]/20 py-8 no-underline sm:grid-cols-[1fr_auto]"
-                    href={`/articles/${article.slug}`}
+                    href={`/articles/${article.id}`}
                     key={article.id}
                   >
                     <div>

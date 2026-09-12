@@ -3,21 +3,26 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { SiteHeader } from "@/components/site-header";
-import { getPublishedArticle } from "@linonward/content";
+import { getPublishedArticleById } from "@linonward/content";
 
 export const dynamic = "force-dynamic";
 
-type ArticlePageProps = { params: Promise<{ slug: string }> };
+type ArticlePageProps = { params: Promise<{ id: string }> };
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const findPublishedArticle = (id: string) =>
+  uuidPattern.test(id) ? getPublishedArticleById(id) : Promise.resolve(null);
 
 export async function generateMetadata({ params }: ArticlePageProps): Promise<Metadata> {
-  const { slug } = await params;
-  const article = await getPublishedArticle(slug);
+  const { id } = await params;
+  const article = await findPublishedArticle(id);
   return article ? { title: article.title, description: article.summary } : {};
 }
 
 export default async function ArticlePage({ params }: ArticlePageProps) {
-  const { slug } = await params;
-  const article = await getPublishedArticle(slug);
+  const { id } = await params;
+  const article = await findPublishedArticle(id);
   if (!article) notFound();
   const draft = parseDraft({
     version: 3,
