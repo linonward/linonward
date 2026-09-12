@@ -33,12 +33,8 @@
     "typescript-eslint": "8.70.0"
   },
   "lint-staged": {
-    "{*.{js,mjs,cjs,ts,mts,cts},scripts/**/*.{js,mjs,cjs,ts,mts,cts},apps/cli/**/*.{js,mjs,cjs,ts,mts,cts},packages/**/*.{js,mjs,cjs,ts,mts,cts}}": [
+    "*.{js,mjs,cjs,ts,mts,cts}": [
       "eslint --fix --max-warnings=0",
-      "biome format --write"
-    ],
-    "apps/www/**/*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}": [
-      "apps/www/node_modules/.bin/eslint --config apps/www/eslint.config.mjs --fix --max-warnings=0 --no-warn-ignored",
       "biome format --write"
     ],
     "*.{json,jsonc}": "biome format --write"

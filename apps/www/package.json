@@ -10,6 +10,13 @@
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx,mjs,cjs}": [
+      "eslint --fix --max-warnings=0 --no-warn-ignored",
+      "biome format --write"
+    ],
+    "*.{json,jsonc,css}": "biome format --write"
+  },
   "dependencies": {
     "lucide-react": "1.44.0",
     "next": "16.3.4",
