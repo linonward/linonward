@@ -10,13 +10,14 @@
   },
   "scripts": {
     "build": "turbo run build",
-    "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm format:check",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm format:check",
     "check:branch": "node scripts/check-branch.mjs",
     "dev": "turbo run dev",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "eslint eslint.config.mjs commitlint.config.mjs scripts --max-warnings=0 && turbo run lint",
     "prepare": "husky",
+    "test": "turbo run test",
     "typecheck": "turbo run typecheck"
   },
   "devDependencies": {
