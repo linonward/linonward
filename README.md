@@ -28,3 +28,8 @@ pnpm check        # 执行 lint、类型检查、测试、构建和格式检查
 
 提交前，Husky 会对暂存文件运行 lint-staged；提交信息遵循 Conventional Commits，
 例如 `feat: add user profile`。
+
+## AI 员工
+
+`apps/feishu` 提供飞书长连接入口，并通过 GitHub Actions 中的 `claude-code-action` 执行仓库任务、将结果回帖到原话题。部署与凭据配置见
+[`apps/feishu/README.md`](apps/feishu/README.md)。

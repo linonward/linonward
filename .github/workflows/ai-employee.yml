@@ -1,0 +1,188 @@
+name: AI employee
+
+run-name: AI employee · ${{ inputs.feishu_sender || github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Task for the AI employee
+        required: true
+        type: string
+      feishu_message_id:
+        description: Feishu message id used for the final reply
+        required: false
+        default: ""
+        type: string
+      feishu_image_keys:
+        description: JSON array of Feishu image resource keys
+        required: false
+        default: "[]"
+        type: string
+      feishu_sender:
+        description: Feishu sender open_id
+        required: false
+        default: ""
+        type: string
+      thread_key:
+        description: Stable Feishu topic key
+        required: false
+        default: ""
+        type: string
+      session_uuid:
+        description: Stable Claude session UUID for this Feishu topic
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: >-
+    ${{ inputs.thread_key != ''
+        && format('ai-employee-thread-{0}', inputs.thread_key)
+        || format('ai-employee-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DO_NOT_TRACK: 1
+      TURBO_TELEMETRY_DISABLED: 1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate AI employee GitHub App configuration
+        env:
+          APP_CLIENT_ID: ${{ vars.AI_EMPLOYEE_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.AI_EMPLOYEE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_CLIENT_ID" ]; then
+            echo "Missing repository variable AI_EMPLOYEE_CLIENT_ID." >&2
+            exit 1
+          fi
+          if [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "Missing repository secret AI_EMPLOYEE_PRIVATE_KEY." >&2
+            exit 1
+          fi
+
+      - name: Generate least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AI_EMPLOYEE_CLIENT_ID }}
+          private-key: ${{ secrets.AI_EMPLOYEE_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Download Feishu images
+        if: inputs.feishu_image_keys != '[]'
+        env:
+          FEISHU_IMAGE_KEYS: ${{ inputs.feishu_image_keys }}
+          LARKSUITE_CLI_APP_ID: ${{ secrets.LARKSUITE_CLI_APP_ID }}
+          LARKSUITE_CLI_APP_SECRET: ${{ secrets.LARKSUITE_CLI_APP_SECRET }}
+          MESSAGE_ID: ${{ inputs.feishu_message_id }}
+        run: node .github/scripts/feishu-download-images.mjs
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Feishu topic session
+        if: inputs.thread_key != ''
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.claude/projects
+          key: ai-employee-session-${{ inputs.thread_key }}-${{ github.run_id }}
+          restore-keys: |
+            ai-employee-session-${{ inputs.thread_key }}-
+
+      - name: Decide Claude session mode
+        id: session-mode
+        env:
+          SESSION_UUID: ${{ inputs.session_uuid }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SESSION_UUID" ]; then
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            echo "argument=" >> "$GITHUB_OUTPUT"
+          elif compgen -G "$HOME/.claude/projects/*/${SESSION_UUID}.jsonl" > /dev/null; then
+            echo "mode=resume" >> "$GITHUB_OUTPUT"
+            echo "argument=--resume ${SESSION_UUID}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=fresh" >> "$GITHUB_OUTPUT"
+            echo "argument=--session-id ${SESSION_UUID}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build trusted prompt
+        id: prompt
+        env:
+          FEISHU_IMAGE_KEYS: ${{ inputs.feishu_image_keys }}
+          SESSION_MODE: ${{ steps.session-mode.outputs.mode }}
+          USER_PROMPT: ${{ inputs.prompt }}
+        run: |
+          set -euo pipefail
+          delimiter="PROMPT_$(uuidgen)"
+          {
+            printf 'value<<%s\n' "$delimiter"
+            cat .github/prompts/ai-employee.md
+            if [ "$SESSION_MODE" = "resume" ]; then
+              printf '\n这是同一飞书话题的后续消息，已恢复 Claude 会话。当前 runner 是全新环境，继续前必须重新检查仓库和 Git 状态。\n'
+            elif [ "$SESSION_MODE" = "fresh" ]; then
+              printf '\n这是本话题的首次消息；同一话题内的后续消息会继续本次会话。\n'
+            fi
+            if [ "$FEISHU_IMAGE_KEYS" != "[]" ]; then
+              printf '\n消息图片已下载至 .feishu-images/，处理任务时必须查看并结合这些图片。\n'
+            fi
+            printf '\n<task>\n%s\n</task>\n' "$USER_PROMPT"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@0a8d3c9443bbff909ab973b6a17a340b913f229f # v1.0.221
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: ${{ steps.prompt.outputs.value }}
+          claude_args: >-
+            --dangerously-skip-permissions
+            ${{ steps.session-mode.outputs.argument }}
+          show_full_output: false
+
+      - name: Save Feishu topic session
+        if: always() && inputs.thread_key != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.claude/projects
+          key: ai-employee-session-${{ inputs.thread_key }}-${{ github.run_id }}
+
+      - name: Reply on Feishu
+        if: always() && inputs.feishu_message_id != ''
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          LARKSUITE_CLI_APP_ID: ${{ secrets.LARKSUITE_CLI_APP_ID }}
+          LARKSUITE_CLI_APP_SECRET: ${{ secrets.LARKSUITE_CLI_APP_SECRET }}
+          MESSAGE_ID: ${{ inputs.feishu_message_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SESSION_UUID: ${{ inputs.session_uuid }}
+        run: node .github/scripts/feishu-reply.mjs

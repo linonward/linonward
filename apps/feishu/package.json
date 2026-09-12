@@ -1,0 +1,21 @@
+{
+  "name": "@linonward/feishu",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "node --env-file-if-exists=.env --watch --import tsx src/index.ts",
+    "lint": "eslint src --max-warnings=0",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.73.0"
+  },
+  "devDependencies": {
+    "tsx": "4.21.0",
+    "vitest": "5.0.0"
+  }
+}
