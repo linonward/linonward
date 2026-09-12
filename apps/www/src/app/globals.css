@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-brand-navy: var(--navy);
+  --color-brand-orange: var(--orange);
+  --color-brand-ivory: var(--ivory);
+  --color-page: var(--page-bg);
+  --color-surface: var(--surface-bg);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-header: var(--header-bg);
+  --color-panel: var(--panel-bg);
+  --color-panel-alt: var(--panel-alt-bg);
+  --color-on-panel: var(--on-panel);
+  --color-on-panel-soft: var(--on-panel-soft);
+  --color-panel-line: var(--panel-line);
+  --color-visual: var(--visual-bg);
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+:root {
+  --navy: #0c2030;
+  --orange: #ff8838;
+  --ivory: #f8f6f1;
+  --page-bg: var(--ivory);
+  --surface-bg: #fffdf9;
+  --ink: var(--navy);
+  --ink-soft: #334b59;
+  --muted: #50606a;
+  --line: rgba(12, 32, 48, 0.22);
+  --header-bg: rgba(248, 246, 241, 0.96);
+  --panel-bg: var(--navy);
+  --panel-alt-bg: #112d41;
+  --on-panel: var(--ivory);
+  --on-panel-soft: #ccd6db;
+  --panel-line: rgba(248, 246, 241, 0.3);
+  --visual-bg: #e8e9e5;
+  --header-height: 76px;
+}
+
+html[data-theme="dark"] {
+  --page-bg: #071722;
+  --surface-bg: #0d2433;
+  --ink: #f8f6f1;
+  --ink-soft: #cbd7dc;
+  --muted: #afbec5;
+  --line: rgba(248, 246, 241, 0.2);
+  --header-bg: rgba(7, 23, 34, 0.96);
+  --panel-bg: #04111a;
+  --panel-alt-bg: #091d2a;
+  --on-panel: #f8f6f1;
+  --on-panel-soft: #c2d0d6;
+  --panel-line: rgba(248, 246, 241, 0.24);
+  --visual-bg: #102936;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: calc(var(--header-height) + 20px);
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  :focus-visible {
+    outline: 3px solid var(--orange);
+    outline-offset: 4px;
+  }
+}
+
+@media (max-width: 640px) {
+  :root {
+    --header-height: 68px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
