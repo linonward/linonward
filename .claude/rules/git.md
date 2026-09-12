@@ -104,6 +104,17 @@ When preparing a pull request:
 5. Do not claim checks passed unless they were actually run successfully.
 6. Do not merge the pull request unless the user explicitly requests it.
 
+## Merge Strategy
+
+- Use squash merge for every pull request. Merge commits and rebase merges are prohibited.
+- Treat the pull request title as the final commit subject. It must follow Conventional Commits,
+  for example `feat(api): add health endpoint`.
+- Use the pull request description as the squash commit body. Keep its summary and validation
+  results accurate before merging.
+- Merge only when the branch is up to date with `main` and every required status check has passed.
+- Never bypass branch protection or required checks, including for administrators.
+- Delete the remote topic branch after a successful merge.
+
 ## After a Pull Request Is Merged
 
 After confirming that a pull request was merged successfully, run cleanup from the primary
@@ -116,10 +127,9 @@ After confirming that a pull request was merged successfully, run cleanup from t
 4. Confirm that local `main` matches `origin/main` and includes the merged pull request.
 5. Confirm the task worktree is clean, then remove it with
    `git worktree remove ../linonward-<feat>-branch`.
-6. Delete a normally merged topic branch with `git branch -d <branch>`. After a squash merge, Git
-   does not consider the original branch tip merged; only after verifying the PR is merged and the
-   synchronized `main` contains its squash commit, delete it with `git branch -D <branch>`. Never
-   use `-D` before those checks.
+6. Because squash merge does not make the original branch tip an ancestor of `main`, delete the
+   local topic branch with `git branch -D <branch>` only after verifying the PR is merged and the
+   synchronized `main` contains its squash commit.
 7. If the remote topic branch still exists, delete it with `git push origin --delete <branch>`.
 8. Run `git worktree list` and verify the primary working tree is clean. Create a new sibling
    worktree before starting any further change.
