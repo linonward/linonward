@@ -1,0 +1,65 @@
+@import "tailwindcss";
+@import "@linonward/editor/styles.css";
+@source "../../../../packages/editor/src";
+
+@theme inline {
+  --color-brand-navy: #0c2030;
+  --color-brand-orange: #ff8838;
+  --color-brand-ivory: #f8f6f1;
+  --font-sans: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  background: #f8f6f1;
+  color: #0c2030;
+  font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid #ff8838;
+  outline-offset: 3px;
+}
+
+.article-content {
+  color: #243b49;
+  font-size: 18px;
+  line-height: 1.9;
+}
+
+.article-content > section {
+  margin: 0 auto;
+  max-width: 720px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
