@@ -11,10 +11,11 @@
   "scripts": {
     "build": "turbo run build",
     "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm format:check",
+    "check:branch": "node scripts/check-branch.mjs",
     "dev": "turbo run dev",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "lint": "turbo run lint",
+    "lint": "eslint eslint.config.mjs commitlint.config.mjs scripts --max-warnings=0 && turbo run lint",
     "prepare": "husky",
     "typecheck": "turbo run typecheck"
   },
@@ -36,6 +37,6 @@
       "eslint --fix --max-warnings=0",
       "biome format --write"
     ],
-    "*.{json,jsonc,md,yaml,yml}": "biome format --write"
+    "*.{json,jsonc}": "biome format --write"
   }
 }
