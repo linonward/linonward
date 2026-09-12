@@ -5,6 +5,7 @@ packages:
 allowBuilds:
   '@biomejs/biome': true
   esbuild: true
+  protobufjs: true
   unrs-resolver: true
 
 minimumReleaseAgeExclude:
