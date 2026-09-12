@@ -116,8 +116,10 @@ After confirming that a pull request was merged successfully, run cleanup from t
 4. Confirm that local `main` matches `origin/main` and includes the merged pull request.
 5. Confirm the task worktree is clean, then remove it with
    `git worktree remove ../linonward-<feat>-branch`.
-6. Delete the local topic branch with `git branch -d <branch>`. Do not use `-D` to hide an
-   unmerged branch.
+6. Delete a normally merged topic branch with `git branch -d <branch>`. After a squash merge, Git
+   does not consider the original branch tip merged; only after verifying the PR is merged and the
+   synchronized `main` contains its squash commit, delete it with `git branch -D <branch>`. Never
+   use `-D` before those checks.
 7. If the remote topic branch still exists, delete it with `git push origin --delete <branch>`.
 8. Run `git worktree list` and verify the primary working tree is clean. Create a new sibling
    worktree before starting any further change.
