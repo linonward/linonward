@@ -9,7 +9,7 @@ import {
   type EditorDraft,
   type EditorDraftValue,
 } from "@linonward/editor";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 
 const responseError = async (response: Response, fallback: string) => {
   const payload = (await response.json().catch(() => null)) as { error?: string } | null;
@@ -17,21 +17,37 @@ const responseError = async (response: Response, fallback: string) => {
 };
 
 export function ArticleEditor({ articleId }: { articleId: string }) {
+  const articleVersion = useRef<number | null>(null);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const repository = useMemo<DraftRepository>(
     () => ({
       async load(documentId) {
         const response = await fetch(`/api/admin/articles/${documentId}`, { cache: "no-store" });
         if (!response.ok) throw await responseError(response, "无法加载文章。");
-        const payload = (await response.json()) as { draft: EditorDraftValue };
+        const payload = (await response.json()) as { draft: EditorDraftValue; version: number };
+        articleVersion.current = payload.version;
         return parseDraft(payload.draft);
       },
       async save(documentId, draft: EditorDraft) {
-        const response = await fetch(`/api/admin/articles/${documentId}`, {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(serializeDraftValue(draft)),
-        });
-        if (!response.ok) throw await responseError(response, "无法保存文章。");
+        const nextSave = saveQueue.current
+          .catch(() => undefined)
+          .then(async () => {
+            const expectedVersion = articleVersion.current;
+            if (expectedVersion === null) throw new Error("文章版本尚未加载。");
+            const response = await fetch(`/api/admin/articles/${documentId}`, {
+              method: "PUT",
+              headers: {
+                "content-type": "application/json",
+                "if-match": String(expectedVersion),
+              },
+              body: JSON.stringify(serializeDraftValue(draft)),
+            });
+            if (!response.ok) throw await responseError(response, "无法保存文章。");
+            const payload = (await response.json()) as { version: number };
+            articleVersion.current = payload.version;
+          });
+        saveQueue.current = nextSave;
+        return nextSave;
       },
       async list(): Promise<DocumentSummary[]> {
         const response = await fetch("/api/admin/articles", { cache: "no-store" });

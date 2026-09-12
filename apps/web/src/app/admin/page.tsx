@@ -29,8 +29,12 @@ export default async function AdminPage() {
                 <div>
                   <h2 className="text-xl font-bold">{article.title}</h2>
                   <p className="mt-2 text-sm text-[#62727b]">
-                    {article.status === "published" ? "已发布" : "草稿"} · 版本 {article.version} ·{" "}
-                    {article.updatedAt.toLocaleString("zh-CN")}
+                    {article.status === "published"
+                      ? article.publishedVersion === article.version
+                        ? "已发布"
+                        : "有未发布更改"
+                      : "草稿"}{" "}
+                    · 版本 {article.version} · {article.updatedAt.toLocaleString("zh-CN")}
                   </p>
                 </div>
                 <ArrowRight className="size-5" aria-hidden="true" />
