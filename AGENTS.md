@@ -65,6 +65,14 @@ pnpm turbo run lint --filter=@linonward/utils
 For behavior changes and bug fixes, read and follow [`.claude/rules/tdd.md`](.claude/rules/tdd.md).
 It is the canonical source for the test-driven development workflow in this repository.
 
+## WeChat Articles
+
+For requests to plan, draft, rewrite, review, calibrate the style of, or prepare illustration plans
+for WeChat Official Account articles, read and follow
+[`.claude/skills/write-wechat/SKILL.md`](.claude/skills/write-wechat/SKILL.md), including the
+references it routes to for the requested mode. The skill does not authorize publishing or other
+external writes unless the user explicitly requests them.
+
 ## Git Workflow
 
 Before creating branches or worktrees, editing files, committing, pushing, or working with pull
