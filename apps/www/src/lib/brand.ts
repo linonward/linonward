@@ -23,6 +23,7 @@ export const brand = {
     { label: "关于", href: "#about" },
     { label: "内容", href: "#content" },
     { label: "文章", href: "https://notes.linonward.com" },
+    { label: "Skills", href: "https://skills.linonward.com" },
     { label: "产品", href: "#products" },
     { label: "关注", href: "#follow" },
   ],
