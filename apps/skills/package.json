@@ -9,7 +9,7 @@
     "lint": "eslint . --max-warnings=0",
     "start": "next start",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit"
   },
   "dependencies": {
     "lucide-react": "1.44.0",
