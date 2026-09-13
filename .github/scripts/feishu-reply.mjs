@@ -4,6 +4,7 @@ import { join } from "node:path";
 import process from "node:process";
 
 import {
+  buildReplyCard,
   formatExecutionReply,
   formatInterruptedReply,
   parseMessages,
@@ -88,10 +89,7 @@ async function getTenantAccessToken() {
 }
 
 async function replyToFeishu(token, id, text) {
-  const card = {
-    body: { elements: [{ content: text, tag: "markdown" }] },
-    schema: "2.0",
-  };
+  const card = buildReplyCard(text);
   const response = await globalThis.fetch(
     `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(id)}/reply`,
     {
