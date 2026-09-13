@@ -11,6 +11,9 @@
 4. GitHub Actions 下载附件、恢复话题对应的 Claude 会话并运行 AI 员工。
 5. 独立的回帖步骤读取执行结果并用飞书凭据回复；Claude 执行步骤不会获得飞书密钥。
 
+当任务要求交付微信公众号成稿时，AI 员工会把完整文章写入当前仓库的 GitHub Issue，
+飞书只收到 Issue 链接。同一话题继续修改同一篇文章时，会更新原 Issue 并返回相同链接。
+
 同一飞书话题会映射到同一个稳定的 Claude session UUID，并通过 GitHub Actions cache 保存会话记录。不同话题相互隔离，同一话题的任务串行执行。
 
 ## 安全模型
