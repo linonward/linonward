@@ -30,6 +30,35 @@ export function extractResultText(messages) {
   return extractLatestAssistantText(messages);
 }
 
+export function buildReplyCard(text) {
+  const issueUrl = getStandaloneGitHubIssueUrl(text);
+  if (issueUrl) {
+    return {
+      body: {
+        elements: [
+          { content: "**状态：** 已完成", tag: "markdown" },
+          {
+            behaviors: [{ default_url: issueUrl, type: "open_url" }],
+            tag: "button",
+            text: { content: "打开链接", tag: "plain_text" },
+            type: "primary",
+          },
+        ],
+      },
+      header: {
+        template: "blue",
+        title: { content: "微信公众号文章已完成", tag: "plain_text" },
+      },
+      schema: "2.0",
+    };
+  }
+
+  return {
+    body: { elements: [{ content: text, tag: "markdown" }] },
+    schema: "2.0",
+  };
+}
+
 export function formatExecutionReply(messages, runUrl) {
   const failure = findFailure(messages);
   if (!failure) return extractResultText(messages);
@@ -77,4 +106,11 @@ function extractLatestAssistantText(messages) {
     if (text) return text;
   }
   return undefined;
+}
+
+function getStandaloneGitHubIssueUrl(text) {
+  const value = text.trim();
+  return /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/[1-9]\d*$/.test(value)
+    ? value
+    : undefined;
 }
