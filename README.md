@@ -1,35 +1,37 @@
-# linonward
+# LinOnward
 
-基于 pnpm、Turborepo 和 TypeScript 的 monorepo。
+独立开发者，正在把模糊的想法变成可以上线、可以验证、也可以长期维护的产品。
 
-## 环境
+我关注 AI 原生软件开发、工程决策与个人工作流。比起堆叠功能，我更在意目标是否清楚、范围是否克制、事实是否可靠，以及最终交付是否真的解决了问题。
 
-- Node.js 24
-- pnpm 12
+## 正在构建
 
-启用 Corepack 并安装依赖：
+### [LinOnward Skills](https://skills.linonward.com)
 
-```sh
-corepack enable
-pnpm install
+一套面向独立开发者和小团队的决策、创作与交付技能包。它们帮助 AI Agent 在实现之外，做好需求塑形、范围取舍、计划挑战、故障定位、行为验收、代码评审与文档同步。
+
+[浏览 Skills](https://skills.linonward.com) · [查看源码](https://github.com/linonward/skills)
+
+### [linonward](https://github.com/linonward/linonward)
+
+承载 LinOnward 产品与工程实践的 TypeScript monorepo。目前包含 Web 应用、内容工具、访谈应用、Skills 展示站，以及 AI 协作与发布基础设施。
+
+## 工作方式
+
+```text
+shape the outcome → cut the scope → challenge the plan
+        → build → prove behavior → inspect the change
 ```
 
-## 常用命令
+- 从结果而不是功能列表开始。
+- 用证据缩小不确定性，而不是假装它不存在。
+- 优先交付最小但完整的用户价值。
+- 让文档、测试和运行状态与真实行为保持一致。
 
-```sh
-pnpm dev          # 启动开发任务
-pnpm build        # 构建全部 workspace
-pnpm lint         # 使用 ESLint 检查代码
-pnpm test         # 运行全部 workspace 测试
-pnpm typecheck    # TypeScript 类型检查
-pnpm format       # 使用 Biome 格式化
-pnpm check        # 执行 lint、类型检查、测试、构建和格式检查
-```
+## 技术方向
 
-提交前，Husky 会对暂存文件运行 lint-staged；提交信息遵循 Conventional Commits，
-例如 `feat: add user profile`。
+`TypeScript` · `React` · `Next.js` · `Node.js` · `PostgreSQL` · `AI Agents`
 
-## AI 员工
+---
 
-`apps/feishu` 提供飞书长连接入口，并通过 GitHub Actions 中的 `claude-code-action` 执行仓库任务、将结果回帖到原话题。部署与凭据配置见
-[`apps/feishu/README.md`](apps/feishu/README.md)。
+**Keep moving, with judgment.**
