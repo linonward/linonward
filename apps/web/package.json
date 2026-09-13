@@ -9,7 +9,7 @@
     "lint": "eslint . --max-warnings=0",
     "start": "next start",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1131.0",
