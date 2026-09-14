@@ -1,7 +1,13 @@
 <LessonOverview
   outcome="构建一个显式的上下文装配器：系统 Prompt、用户任务、仓库资料和运行历史各自有清晰边界，并在预算内进入模型。"
   prerequisites="第 01 章的最小模型调用可以正常返回文本。"
-  files={["src/system-prompt.ts", "src/context.ts", "src/model.ts", "src/index.ts"]}
+  files={[
+    "src/system-prompt.ts",
+    "src/context.ts",
+    "src/model.ts",
+    "src/index.ts",
+    "tests/context.test.ts",
+  ]}
 />
 
 Agent 的能力不只取决于模型。每一轮模型真正看到的内容，才是它能够做出决策的世界。这里把上下文拆成四层：
@@ -66,7 +72,7 @@ export function buildSystemPrompt(options: PromptOptions): string {
     "Finish only when the requested outcome is implemented and checked.",
     "Report changed files, validation commands, results, and remaining risks.",
     "</completion>",
-  ].join("\\n");
+  ].join("\n");
 }
 ```
 
@@ -159,9 +165,9 @@ export function buildModelRequest(options: {
         "label: " + source.label,
         source.content,
         "</source>",
-      ].join("\\n"),
+      ].join("\n"),
     )
-    .join("\\n\\n");
+    .join("\n\n");
 
   return {
     instructions: buildSystemPrompt({
@@ -177,7 +183,7 @@ export function buildModelRequest(options: {
           "<context_sources>",
           context,
           "</context_sources>",
-        ].join("\\n"),
+        ].join("\n"),
       },
     ],
   };
@@ -223,10 +229,73 @@ console.error({
 });
 ```
 
+创建 `tests/context.test.ts`，同时验证预算选择和请求边界。测试不访问网络，也不需要 API Key：
+
+```typescript
+import { describe, expect, it } from "vitest";
+
+import {
+  buildModelRequest,
+  selectContext,
+  type ContextSource,
+} from "../src/context.js";
+
+describe("selectContext", () => {
+  it("优先保留高优先级来源", () => {
+    const sources: ContextSource[] = [
+      {
+        id: "rule",
+        kind: "workspace_rule",
+        label: "AGENTS.md",
+        content: "keep",
+        priority: 100,
+      },
+      {
+        id: "observation",
+        kind: "tool_observation",
+        label: "old output",
+        content: "too-large",
+        priority: 10,
+      },
+    ];
+
+    expect(selectContext(sources, 5).map((source) => source.id)).toEqual(["rule"]);
+  });
+
+  it("分离系统规则、用户任务和参考资料", () => {
+    const request = buildModelRequest({
+      task: "检查 package.json",
+      cwd: "/workspace",
+      toolNames: ["read_file"],
+      sources: [
+        {
+          id: "package",
+          kind: "file_excerpt",
+          label: "package.json",
+          content: '{"private":true}',
+          priority: 50,
+        },
+      ],
+    });
+
+    expect(request.instructions).toContain("You are a repository coding agent.");
+    expect(request.instructions).toContain("/workspace");
+    expect(request.input[0]).toEqual({
+      role: "user",
+      content: "检查 package.json",
+    });
+    expect(request.input[1]?.content).toContain("<context_sources>");
+    expect(request.input[1]?.content).toContain('{"private":true}');
+  });
+});
+```
+
+运行 `pnpm test` 时，这两个测试分别证明“选对内容”和“放对位置”。它们不能证明 Prompt 能抵御所有注入攻击；安全边界仍要由后续工具验证与权限策略共同保证。
+
 </Step>
 
-<Checkpoint command="pnpm typecheck">
+<Checkpoint command="pnpm typecheck && pnpm test">
 
-为 `selectContext` 添加测试：高优先级规则必须保留，超出预算的低优先级片段必须被丢弃。打印一次 `buildModelRequest` 的结果，确认系统 Prompt、用户任务和资料区是三个清晰边界。
+先运行类型检查和测试，确认高优先级规则被保留、超预算的低优先级片段被丢弃。然后执行 `pnpm dev -- "验证上下文装配"`，检查 stderr 中 `instructionCharacters` 大于 0、`inputMessages` 等于 2；若临时打印完整 request，确认系统 Prompt 位于 `instructions`、用户任务只出现一次，资料只出现在 `<context_sources>` 内。验证后删除完整 Prompt 日志，避免把敏感仓库内容留在终端记录中。
 
 </Checkpoint>
