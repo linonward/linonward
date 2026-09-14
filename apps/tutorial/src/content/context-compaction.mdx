@@ -1,0 +1,313 @@
+<LessonOverview
+  outcome="实现一条可验证的上下文压缩链路：在安全边界生成结构化快照，保留最近原始事件，并让 Agent Loop 在上下文耗尽前继续工作。"
+  prerequisites="第 08 章已经有完整 Agent Loop，能够在每轮重新组装 ContextSource 并记录模型、工具、计划与 Skill 事件。"
+  files={["src/compaction.ts", "src/context.ts", "src/types.ts", "src/agent-loop.ts", "tests/compaction.test.ts"]}
+/>
+
+长任务的问题不是“历史消息太多”这么简单。真正的风险是：为了节省 token 删除旧内容时，把用户约束、尚未完成的计划、工具证据或一次失败尝试一起删掉，Agent 随后重复工作、越权操作，甚至错误地宣布完成。
+
+本章采用两层策略：Harness 保存一份**可检查、可验证的结构化摘要**，模型上下文只携带这份摘要和最近的原始事件；如果 Model Adapter 支持原生压缩，还可以把它作为模型侧连续性的优化。官方 Responses API 提供 `responses.compact`，返回可在后续请求中继续使用的压缩项；这些项应被视为不透明数据，而不是应用状态的替代品。参见 [OpenAI：Compact conversation](https://developers.openai.com/api/reference/resources/responses/methods/compact) 与 [Conversation state](https://developers.openai.com/api/docs/guides/conversation-state)。
+
+<Step id="define-compaction-contract" number={1} title="先定义哪些内容绝不能丢">
+
+压缩不是截断字符串，而是把一段已发生的运行历史转换成下一阶段所需的最小充分状态。先扩展 `AgentState`：
+
+```typescript
+export interface CompactionSnapshot {
+  id: string;
+  createdAt: string;
+  sourceEventRange: { from: number; to: number };
+  goal: string;
+  constraints: string[];
+  decisions: Array<{ statement: string; evidenceEventIds: string[] }>;
+  completedWork: Array<{ stepId: string; evidence: string[] }>;
+  pendingWork: Array<{ stepId: string; reason: string }>;
+  acceptanceCriteria: AcceptanceCriterion[];
+  activeSkills: string[];
+  changedFiles: string[];
+  validationResults: string[];
+  unresolvedQuestions: string[];
+  failedAttempts: string[];
+  checksum: string;
+}
+
+export interface CompactionState {
+  snapshots: CompactionSnapshot[];
+  compactedThroughEvent: number;
+  providerItems?: unknown[];
+}
+
+export interface AgentState {
+  // 保留 runId、task、plan、messages、contextSources、skills、steps 等字段
+  compaction: CompactionState;
+}
+```
+
+以下内容必须从权威状态重新注入，不能交给摘要模型自由改写：系统安全规则、用户原始目标、当前 `TaskPlan`、验收条件状态、权限决定、未完成工具调用以及 Harness 的预算与停止规则。
+
+<Callout>
+
+消息历史是“发生过什么”，任务状态是“现在什么是真的”。压缩历史时，以后者为事实源；摘要模型只能整理证据，不能擅自把 Step 标成完成或把验收条件改成 passed。
+
+</Callout>
+
+</Step>
+
+<Step id="choose-compaction-boundary" number={2} title="在耗尽前、且只在安全边界压缩">
+
+为上下文预留输出、工具结果和意外增长空间。不要等 API 返回 context-length error 才处理，也不要在模型已返回工具调用、但工具结果还没全部写回时压缩。
+
+```typescript
+export interface ContextUsage {
+  estimatedInputTokens: number;
+  contextWindowTokens: number;
+  reservedOutputTokens: number;
+}
+
+export function shouldCompact(usage: ContextUsage): boolean {
+  const usableInput = usage.contextWindowTokens - usage.reservedOutputTokens;
+  const trigger = Math.floor(usableInput * 0.8);
+  return usage.estimatedInputTokens >= trigger;
+}
+
+export function isSafeCompactionBoundary(state: AgentState): boolean {
+  return state.pendingToolCalls.length === 0 && state.pendingOutputs.length === 0;
+}
+```
+
+`0.8` 是 Harness 的保守策略，不是模型的固定限制。生产环境应使用模型暴露的上下文窗口和真实 token counter；没有精确 tokenizer 时，估算器必须倾向高估，并记录估算值与实际 usage 的偏差。
+
+适合压缩的时机包括：一个计划 Step 刚完成、工具批次已经完整落盘、进入新的调查阶段，或下一轮组装预计超过阈值。禁止在以下时机压缩：并行工具批次执行中、等待用户批准时尚未保存审批请求、正在流式接收模型输出，或事件日志尚未提交。
+
+</Step>
+
+<Step id="build-compaction-snapshot" number={3} title="从状态与事件生成结构化快照">
+
+不要让模型面对无边界的“总结一下”。`Compactor` 接收确定的事件区间和当前状态投影，只返回可校验的 JSON：
+
+```typescript
+export interface CompactorInput {
+  task: string;
+  plan: TaskPlan;
+  events: AgentEvent[];
+  activeSkillNames: string[];
+  changedFiles: string[];
+}
+
+export interface Compactor {
+  compact(input: CompactorInput): Promise<Omit<CompactionSnapshot, "id" | "createdAt" | "checksum">>;
+}
+
+export async function buildCompactionSnapshot(options: {
+  state: AgentState;
+  events: AgentEvent[];
+  compactor: Compactor;
+}): Promise<CompactionSnapshot> {
+  const from = options.state.compaction.compactedThroughEvent + 1;
+  const to = options.events.at(-1)?.sequence ?? from - 1;
+  const draft = await options.compactor.compact({
+    task: options.state.task,
+    plan: options.state.plan,
+    events: options.events.filter((event) => event.sequence >= from && event.sequence <= to),
+    activeSkillNames: Object.keys(options.state.skills.activeSkills),
+    changedFiles: options.state.changedFiles,
+  });
+
+  const snapshotWithoutChecksum = {
+    ...draft,
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    sourceEventRange: { from, to },
+  };
+
+  return {
+    ...snapshotWithoutChecksum,
+    checksum: sha256(canonicalJson(snapshotWithoutChecksum)),
+  };
+}
+```
+
+压缩 Prompt 要求每个决定引用原始 `eventId`，明确列出失败尝试与未解决问题，并写明“没有证据就保留 unknown，不得推断完成”。结构化输出仍是不可信输入：Harness 需要 schema 校验、长度限制和事实对照。
+
+如果 Model Adapter 使用 OpenAI 原生压缩，可以另外保存其返回项：
+
+```typescript
+const compacted = await openai.responses.compact({
+  model,
+  input: responseItems,
+  instructions: systemPrompt,
+});
+
+state.compaction.providerItems = compacted.output;
+```
+
+原生 `providerItems` 只用于同一 Provider 的续轮输入。应用自己的 `CompactionSnapshot` 仍负责审计、跨进程恢复、UI 展示和 Provider 切换。
+
+</Step>
+
+<Step id="validate-compaction" number={4} title="验证摘要覆盖了关键事实">
+
+先做确定性覆盖检查，再接受摘要。计划和验收条件来自状态，因此可以逐项比对：
+
+```typescript
+export function validateCompaction(
+  snapshot: CompactionSnapshot,
+  state: AgentState,
+  events: AgentEvent[],
+): void {
+  const criterionIds = new Set(snapshot.acceptanceCriteria.map((criterion) => criterion.id));
+  for (const criterion of state.plan.acceptanceCriteria) {
+    if (!criterionIds.has(criterion.id)) throw new Error(`missing criterion: ${criterion.id}`);
+  }
+
+  const pendingIds = new Set(snapshot.pendingWork.map((step) => step.stepId));
+  for (const step of state.plan.steps.filter((step) => step.status !== "completed")) {
+    if (!pendingIds.has(step.id)) throw new Error(`missing pending step: ${step.id}`);
+  }
+
+  for (const file of state.changedFiles) {
+    if (!snapshot.changedFiles.includes(file)) throw new Error(`missing changed file: ${file}`);
+  }
+
+  for (const decision of snapshot.decisions) {
+    for (const eventId of decision.evidenceEventIds) {
+      if (!events.some((event) => event.id === eventId)) {
+        throw new Error(`unknown evidence event: ${eventId}`);
+      }
+    }
+  }
+
+  if (snapshot.sourceEventRange.to < snapshot.sourceEventRange.from) {
+    throw new Error("empty compaction range");
+  }
+}
+```
+
+校验失败时保留原上下文并发出 `compaction_rejected`，不能使用一个“差不多”的摘要继续。连续失败时停止并报告原因，让操作者扩大预算、拆分任务或修复 Compactor。
+
+</Step>
+
+<Step id="replace-history-with-snapshot" number={5} title="保留摘要、原始尾部与证据索引">
+
+压缩成功后也不删除审计日志。只改变下一次模型请求的上下文投影：旧事件留在 durable store，中间历史由快照代替，最近事件保持原文。
+
+```typescript
+export interface CompactedContext {
+  snapshot: CompactionSnapshot;
+  rawTail: AgentEvent[];
+}
+
+export function projectCompactedContext(options: {
+  snapshot: CompactionSnapshot;
+  events: AgentEvent[];
+  rawTailSize: number;
+}): CompactedContext {
+  const afterSnapshot = options.events.filter(
+    (event) => event.sequence > options.snapshot.sourceEventRange.to,
+  );
+  return {
+    snapshot: options.snapshot,
+    rawTail: afterSnapshot.slice(-options.rawTailSize),
+  };
+}
+
+export function compactionAsContextSources(context: CompactedContext): ContextSource[] {
+  return [
+    {
+      id: `compaction:${context.snapshot.id}`,
+      kind: "compaction_snapshot",
+      label: "Verified task memory",
+      content: JSON.stringify(context.snapshot),
+      priority: 95,
+    },
+    ...context.rawTail.map(eventAsContextSource),
+  ];
+}
+```
+
+`rawTail` 不是固定取“最后 N 条消息”就结束：至少要覆盖当前 Step 开始后的事件、最近一个完整工具批次和最后一次用户输入。体积仍过大时，优先把大型工具输出存成 artifact，只在上下文里保留路径、hash、截取范围和结论。
+
+</Step>
+
+<Step id="connect-compaction-to-loop" number={6} title="把压缩门禁接入 Agent Loop">
+
+压缩发生在“状态更新完成”与“下一轮 buildModelRequest”之间。它自身也是可观察状态转换：
+
+```typescript
+export async function maybeCompactContext(options: {
+  state: AgentState;
+  events: AgentEvent[];
+  usage: ContextUsage;
+  compactor: Compactor;
+  emit: (event: AgentEventInput) => Promise<void>;
+}): Promise<void> {
+  if (!shouldCompact(options.usage)) return;
+  if (!isSafeCompactionBoundary(options.state)) return;
+
+  await options.emit({ type: "compaction_started", through: options.events.at(-1)?.sequence ?? 0 });
+  const snapshot = await buildCompactionSnapshot(options);
+  validateCompaction(snapshot, options.state, options.events);
+
+  options.state.compaction.snapshots.push(snapshot);
+  options.state.compaction.compactedThroughEvent = snapshot.sourceEventRange.to;
+  await options.emit({
+    type: "compaction_completed",
+    snapshotId: snapshot.id,
+    sourceEventRange: snapshot.sourceEventRange,
+  });
+}
+```
+
+在 Loop 中的顺序如下：
+
+```text
+OBSERVE tool results
+UPDATE plan and acceptance evidence
+PERSIST events and state
+MAYBE COMPACT at a safe boundary
+ASSEMBLE authoritative state + latest snapshot + rawTail
+CALL model
+```
+
+不要每轮压缩。每次压缩都会增加延迟与费用，也会产生信息损耗。只有超过阈值或阶段边界明确要求时才执行，并记录压缩前后 token 数、覆盖事件区间和拒绝原因。
+
+</Step>
+
+<Step id="test-compaction" number={7} title="用不变量测试信息保真">
+
+创建 `tests/compaction.test.ts`。先测试临界点，再测试内容覆盖：
+
+```typescript
+it("keeps authoritative task state and only replaces old history", async () => {
+  const state = createLongRunningFixture();
+  const events = createEventsThroughCompletedStep();
+
+  await maybeCompactContext({
+    state,
+    events,
+    usage: {
+      estimatedInputTokens: 82_000,
+      contextWindowTokens: 100_000,
+      reservedOutputTokens: 10_000,
+    },
+    compactor: createFakeCompactor(),
+    emit: appendFixtureEvent,
+  });
+
+  const snapshot = state.compaction.snapshots.at(-1);
+  expect(snapshot?.goal).toBe(state.task);
+  expect(snapshot?.pendingWork.map((step) => step.stepId)).toContain("run-tests");
+  expect(snapshot?.changedFiles).toEqual(state.changedFiles);
+  expect(state.plan.steps).toEqual(originalPlan);
+});
+```
+
+继续覆盖：阈值以下不压缩、有 pending tool call 时不压缩、摘要漏掉验收条件时拒绝、引用不存在事件时拒绝、重复压缩区间不重叠、`rawTail` 保留完整工具批次、超大 observation 转 artifact，以及 Provider 原生压缩失败时仍能使用应用快照继续。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+构造一段包含 200 条 observation 的 Fake Run，确认压缩前后用户目标、当前计划、所有未通过验收条件、changedFiles、失败尝试和证据引用完全一致；下一轮模型输入只包含权威状态、一个 `CompactionSnapshot` 与最近 `rawTail`，不再重复注入被覆盖的原始历史。
+
+</Checkpoint>

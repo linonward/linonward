@@ -1,0 +1,63 @@
+<LessonOverview
+  outcome="完成一个具有确定权限边界、步骤预算和完成证据的本地工程 Agent。"
+  prerequisites="Agent 已经能够调查、修改并验证一个小型代码任务。"
+  files={["src/tool.ts", "src/policy.ts", "src/execute-tool.ts", "src/index.ts"]}
+/>
+
+<Step id="risk-levels" number={1} title="给每个工具标记风险等级">
+
+扩展工具契约，让风险属于代码配置，而不是交给模型自我判断。
+
+```typescript
+export type ToolEffect = "read" | "write" | "execute" | "external";
+
+export interface Tool<Input, Output> {
+  name: string;
+  description: string;
+  effect: ToolEffect;
+  schema: ZodType<Input>;
+  execute(input: Input, context: ToolContext): Promise<Output>;
+}
+```
+
+</Step>
+
+<Step id="authorize" number={2} title="在执行前应用授权策略">
+
+创建 `src/policy.ts`。首版允许读取和工作区写入，只允许白名单命令，拒绝所有外部副作用。
+
+```typescript
+export function authorize(tool: Tool<unknown, unknown>): PolicyDecision {
+  if (tool.effect === "external") {
+    return { type: "deny", reason: "external_effect_not_allowed" };
+  }
+
+  if (tool.effect === "execute" && tool.name !== "run_command") {
+    return { type: "deny", reason: "command_not_allowed" };
+  }
+
+  return { type: "allow" };
+}
+```
+
+把 `authorize` 放在参数校验之后、工具执行之前。拒绝结果作为 observation 返回模型，并记录到运行轨迹。
+
+</Step>
+
+<Step id="final-run" number={3} title="完成贯穿教程的真实任务">
+
+在一个临时示例仓库中运行最终任务：
+
+```shell
+pnpm dev -- "给 CLI 增加 --name 参数，并补充测试。先调查现有实现，完成后运行最窄相关检查并汇报证据。"
+```
+
+观察运行轨迹，确认它按顺序完成调查、修改、验证和汇报。最终回答至少列出修改文件、运行命令、退出结果和未解决风险。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+同时执行三个负向验收：读取工作区外文件必须失败；请求外部副作用必须被拒绝；把 `maxSteps` 设为 `1` 时必须以明确的预算原因停止。三项都满足后，这个 Agent 才达到教程定义的“可用”。
+
+</Checkpoint>

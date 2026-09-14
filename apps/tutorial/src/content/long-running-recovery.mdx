@@ -1,0 +1,295 @@
+<LessonOverview
+  outcome="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
+  prerequisites="第 09 章已经能生成带事件范围与校验和的 CompactionSnapshot，Agent Loop 的每个重要状态转换都有事件。"
+  files={["src/run-store.ts", "src/checkpoint.ts", "src/recovery.ts", "src/agent-loop.ts", "src/index.ts", "tests/recovery.test.ts"]}
+/>
+
+上下文压缩解决“一次运行能思考多久”，长程恢复解决“运行进程消失后还能不能正确继续”。只把 `AgentState` 写进 JSON 不够：崩溃可能发生在写文件、执行命令、提交工具结果或更新计划之间。恢复器必须知道最后一个已提交事件、是否存在执行到一半的副作用，以及哪些外部资源仍可信。
+
+本章使用 **append-only event log + 原子 checkpoint + 单写者 lease**。Checkpoint 加速加载，事件日志提供审计与重放；二者共同保证恢复的不是“看起来相似的会话”，而是同一个任务状态机。
+
+<Step id="separate-runtime-and-durable-state" number={1} title="区分可持久化状态与运行时依赖">
+
+不要序列化整个 `AgentLoopOptions`。函数、连接池、`AbortSignal`、工具实现、API Key 和打开的文件句柄都只能在恢复时重新注入。
+
+```typescript
+export interface DurableAgentState {
+  runId: string;
+  task: string;
+  cwd: string;
+  status: "running" | "waiting" | "completed" | "failed";
+  plan: TaskPlan;
+  activeStepId?: string;
+  messages: AgentMessage[];
+  contextSources: PersistedContextSource[];
+  skills: PersistedSkillState;
+  compaction: CompactionState;
+  changedFiles: string[];
+  counters: { modelSteps: number; toolCalls: number };
+  providerCursor?: { provider: string; model: string; previousResponseId: string };
+}
+
+export interface AgentRuntime {
+  model: ModelDriver;
+  planner: Planner;
+  tools: ToolRegistry;
+  store: RunStore;
+  clock: Clock;
+  signal?: AbortSignal;
+}
+```
+
+持久化 `providerCursor` 只是优化提示。恢复时必须确认 Provider、模型、保留策略和游标仍兼容；否则从应用快照、权威任务状态与原始尾部启动一个新 response。`previous_response_id` 不能替代事件日志，因为它不保存你的本地文件状态、计划事务和工具副作用。
+
+Secret 永远只保存引用，例如 `credentialRef: "openai/default"`，不把真实值写进事件或 checkpoint。
+
+</Step>
+
+<Step id="define-recovery-records" number={2} title="定义带版本的事件与检查点">
+
+所有记录必须有单调 sequence、schema 版本和完整性校验。事件 payload 使用可辨识联合类型：
+
+```typescript
+export type DurableEvent =
+  | { type: "run_started"; task: string }
+  | { type: "plan_updated"; plan: TaskPlan }
+  | { type: "model_completed"; responseId: string; turn: PersistedModelTurn }
+  | { type: "tool_intent"; call: PersistedToolCall; idempotencyKey: string }
+  | { type: "tool_result"; callId: string; idempotencyKey: string; output: string }
+  | { type: "compaction_completed"; snapshot: CompactionSnapshot }
+  | { type: "run_waiting"; reason: string }
+  | { type: "run_stopped"; reason: StopReason };
+
+export interface EventRecord {
+  schemaVersion: 1;
+  runId: string;
+  sequence: number;
+  eventId: string;
+  recordedAt: string;
+  event: DurableEvent;
+  checksum: string;
+}
+
+export interface RunCheckpoint {
+  schemaVersion: 1;
+  runId: string;
+  throughSequence: number;
+  savedAt: string;
+  state: DurableAgentState;
+  checksum: string;
+}
+```
+
+以后修改结构时新增迁移函数，按 `schemaVersion` 逐级升级；不知道的未来版本必须拒绝加载，不能用类型断言强行继续。`eventId` 用于去重，`sequence` 用于排序和发现缺口，checksum 用于发现截断或损坏。
+
+</Step>
+
+<Step id="write-atomic-checkpoints" number={3} title="先追加事件，再原子替换 Checkpoint">
+
+定义一个与存储介质无关的接口：
+
+```typescript
+export interface RunStore {
+  append(runId: string, expectedSequence: number, event: DurableEvent): Promise<EventRecord>;
+  loadCheckpoint(runId: string): Promise<RunCheckpoint | undefined>;
+  saveCheckpoint(checkpoint: RunCheckpoint): Promise<void>;
+  readEvents(runId: string, afterSequence: number): Promise<EventRecord[]>;
+  acquireLease(runId: string, ownerId: string, ttlMs: number): Promise<RunLease>;
+}
+```
+
+本地文件实现不能直接覆盖 `checkpoint.json`。应写入同目录临时文件、刷新内容、原子 rename，再刷新目录：
+
+```typescript
+export async function atomicWriteJson(path: string, value: unknown): Promise<void> {
+  const directory = dirname(path);
+  const temporary = join(directory, `.checkpoint-${crypto.randomUUID()}.tmp`);
+  const handle = await open(temporary, "wx", 0o600);
+
+  try {
+    await handle.writeFile(`${canonicalJson(value)}\n`, "utf8");
+    await handle.sync(); // fsync file contents
+  } finally {
+    await handle.close();
+  }
+
+  await rename(temporary, path);
+  const directoryHandle = await open(directory, "r");
+  try {
+    await directoryHandle.sync(); // fsync directory entry
+  } finally {
+    await directoryHandle.close();
+  }
+}
+```
+
+事件先落盘，状态机再应用事件，最后异步或按边界写 checkpoint。即使 checkpoint 写到一半崩溃，恢复器也能读取上一个完整 checkpoint 并重放后续事件。
+
+`expectedSequence` 是乐观并发控制。另一个进程已经追加事件时，本次 append 必须失败；不要让两个 Loop 同时推进同一个 run。
+
+</Step>
+
+<Step id="record-tool-intents" number={4} title="用意图与结果包围工具副作用">
+
+最危险的窗口是：工具已经执行成功，但进程在写入 observation 前崩溃。恢复后盲目重跑可能重复发消息、重复扣款或覆盖文件。
+
+```typescript
+export async function executeDurably(options: {
+  state: DurableAgentState;
+  call: PersistedToolCall;
+  tool: ToolDefinition;
+  store: RunStore;
+}): Promise<string> {
+  const idempotencyKey = `${options.state.runId}:${options.call.callId}`;
+  await options.store.append(options.state.runId, nextSequence(options.state), {
+    type: "tool_intent",
+    call: options.call,
+    idempotencyKey,
+  });
+
+  const output = await options.tool.execute(options.call.arguments, { idempotencyKey });
+
+  await options.store.append(options.state.runId, nextSequence(options.state), {
+    type: "tool_result",
+    callId: options.call.callId,
+    idempotencyKey,
+    output,
+  });
+  return output;
+}
+```
+
+为工具声明恢复策略：
+
+```typescript
+export type RecoveryPolicy =
+  | { kind: "replay_safe" }
+  | { kind: "idempotent"; keyLocation: "header" | "argument" }
+  | { kind: "verify_then_continue"; verify: ToolStateVerifier }
+  | { kind: "manual_reconciliation" };
+```
+
+纯读取通常是 `replay_safe`；支持 `idempotencyKey` 的外部 API 可以安全重试；文件写入应比较预期 hash 或读取目标状态；无法查询结果且没有幂等键的副作用必须暂停，要求人工核对。绝不能因为“多数时候没事”就把未知调用标记完成。
+
+</Step>
+
+<Step id="restore-and-replay" number={5} title="校验 Checkpoint 并重放后续事件">
+
+恢复器先拿 lease，再加载与验证记录：
+
+```typescript
+export async function restoreRun(options: {
+  runId: string;
+  ownerId: string;
+  store: RunStore;
+}): Promise<{ state: DurableAgentState; lease: RunLease; inFlight: PersistedToolCall[] }> {
+  const lease = await options.store.acquireLease(options.runId, options.ownerId, 30_000);
+  const checkpoint = await options.store.loadCheckpoint(options.runId);
+  if (!checkpoint) throw new Error("checkpoint_not_found");
+  verifyCheckpointChecksum(checkpoint);
+
+  let state = migrateCheckpoint(checkpoint).state;
+  const records = await options.store.readEvents(options.runId, checkpoint.throughSequence);
+  assertContiguousSequences(records, checkpoint.throughSequence + 1);
+
+  for (const record of records) {
+    verifyEventChecksum(record);
+    state = reduceDurableEvent(state, record.event);
+  }
+
+  return {
+    state,
+    lease,
+    inFlight: findToolIntentsWithoutResults(records),
+  };
+}
+```
+
+事件 reducer 必须是纯函数；对同一 checkpoint 与事件序列重复执行，结果必须完全一致。遇到 sequence 缺口、重复但内容不同的 event、checksum 错误或未知 schema 时停止恢复并保留原文件供调查。
+
+Checkpoint 的 `cwd` 也需要重新验证：路径存在、仓库身份匹配、关键基线 hash 没有意外漂移。环境漂移不代表一定失败，但必须转成显式 observation，触发重新调查或计划修订。
+
+</Step>
+
+<Step id="resume-agent-loop" number={6} title="协调未完成调用并续跑 Loop">
+
+恢复入口先处理 in-flight 工具，再调用已有 Loop：
+
+```typescript
+export async function resumeAgentRun(
+  runId: string,
+  runtime: AgentRuntime,
+): Promise<AgentResult> {
+  const restored = await restoreRun({
+    runId,
+    ownerId: crypto.randomUUID(),
+    store: runtime.store,
+  });
+
+  startLeaseHeartbeat(restored.lease, runtime.clock, runtime.signal);
+
+  for (const call of restored.inFlight) {
+    await reconcileInFlightTool(call, restored.state, runtime);
+  }
+
+  const canReuseProviderCursor = await runtime.model.canResume?.(
+    restored.state.providerCursor,
+  );
+  if (!canReuseProviderCursor) restored.state.providerCursor = undefined;
+
+  return runAgentLoopFromState(restored.state, runtime);
+}
+```
+
+`runAgentLoopFromState` 不重新创建任务或计划，也不把计数器归零。它从已有 `activeStepId`、预算、CompactionSnapshot 与 raw tail 继续；如果 Provider cursor 无效，就用重建上下文调用 `model.start`，而不是伪造一次 `continue`。
+
+CLI 明确区分新运行与恢复：
+
+```typescript
+const [command, value] = process.argv.slice(2);
+
+if (command === "run") {
+  await startAgentRun(value, runtime);
+} else if (command === "resume") {
+  await resumeAgentRun(value, runtime);
+} else {
+  throw new Error("usage: agent run <task> | agent resume <run-id>");
+}
+```
+
+Lease 要定期续期，并在正常停止时释放。Lease 过期只允许新 worker 抢占，不代表旧 worker 一定死亡；所有 append 仍要比较 owner/epoch，防止暂停后的旧进程恢复运行并写入分叉历史。
+
+</Step>
+
+<Step id="test-crash-recovery" number={7} title="在每个提交边界注入崩溃">
+
+恢复逻辑不能只测“保存后立即读取”。Fake Store 应允许在每个 await 后抛出模拟断电：
+
+```typescript
+it.each([
+  "after_tool_intent",
+  "after_tool_effect",
+  "after_tool_result",
+  "before_checkpoint_rename",
+  "after_checkpoint_rename",
+])("recovers safely from %s", async (crashPoint) => {
+  const fixture = createCrashFixture(crashPoint);
+  await expect(fixture.start()).rejects.toThrow("simulated_crash");
+
+  const result = await resumeAgentRun(fixture.runId, fixture.restartedRuntime());
+
+  expect(result.status).toBe("completed");
+  expect(fixture.externalEffectCount()).toBe(1);
+  expect(fixture.eventSequences()).toEqual(fixture.contiguousSequences());
+});
+```
+
+继续覆盖：两个 worker 争抢 lease、旧 epoch 写入被拒绝、损坏 checkpoint 回退到上一版本、event sequence 缺口、schema migration、无幂等能力的 in-flight 工具转人工核对、Provider cursor 失效后从快照重启，以及恢复后仍遵守原 `maxSteps` 与 `maxToolCalls`。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+运行一个 Fake Agent，让它在工具副作用已经发生、`tool_result` 尚未写入时崩溃。重启后用同一 `runId` 恢复：Harness 必须获取新 lease，根据工具的 `idempotencyKey` 或 verifier 对账，确保副作用总计只发生一次，然后从原计划、验收状态、压缩快照、计数器与最近事件继续到完成。
+
+</Checkpoint>

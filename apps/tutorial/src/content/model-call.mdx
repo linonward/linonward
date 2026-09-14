@@ -1,0 +1,87 @@
+<LessonOverview
+  outcome="CLI 会把用户任务发送给模型，并打印真实回复。"
+  prerequisites="已经完成第 00 章，并准备好可用的 OpenAI API Key 与模型 ID。"
+  files={["package.json", ".env", ".gitignore", "src/model.ts", "src/index.ts"]}
+/>
+
+<Step id="install-sdk" number={1} title="安装 OpenAI SDK">
+
+```shell
+pnpm add openai
+```
+
+SDK 只存在于模型适配器中。Harness 不会直接依赖它。
+
+</Step>
+
+<Step id="configure-env" number={2} title="配置本地环境">
+
+创建 `.env`，填写你账号可用的模型 ID。不要把 API Key 写进源码或提交到 Git。
+
+```dotenv
+OPENAI_API_KEY=your-local-key
+OPENAI_MODEL=your-model-id
+```
+
+同时创建 `.gitignore`：
+
+```gitignore
+.env
+node_modules
+dist
+```
+
+</Step>
+
+<Step id="call-model" number={3} title="完成第一次 Responses API 调用">
+
+创建 `src/model.ts`。[官方 Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create) 使用 `input` 接收文本，并可通过 `output_text` 取得聚合后的文本输出。
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI();
+
+export async function askModel(input: string): Promise<string> {
+  const model = process.env.OPENAI_MODEL;
+  if (!model) throw new Error("缺少 OPENAI_MODEL");
+
+  const response = await client.responses.create({ model, input });
+  return response.output_text;
+}
+```
+
+在 `src/index.ts` 中调用它：
+
+```typescript
+import { askModel } from "./model.js";
+
+const task = process.argv.slice(2).join(" ").trim();
+if (!task) throw new Error("请提供任务");
+
+console.log(await askModel(task));
+```
+
+</Step>
+
+<Step id="extract-port" number={4} title="抽出最小 Model 接口">
+
+把函数包装成接口，为后面的假模型测试和提供商替换留下边界。
+
+```typescript
+export interface Model {
+  generate(input: string): Promise<string>;
+}
+
+export const model: Model = {
+  generate: askModel,
+};
+```
+
+</Step>
+
+<Checkpoint command='pnpm dev -- "只回复：模型已连接"'>
+
+应看到模型返回的文本，且 `pnpm typecheck` 通过。若返回鉴权错误，先检查本地 `.env`，不要绕过错误继续下一章。
+
+</Checkpoint>

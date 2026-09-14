@@ -1,0 +1,79 @@
+<LessonOverview
+  outcome="把一次模型请求升级成具有明确状态、上下文来源和停止原因的任务运行。"
+  prerequisites="第 02 章已经能够组装系统 Prompt 与动态上下文。"
+  files={["src/types.ts", "src/state.ts", "src/index.ts"]}
+/>
+
+<Step id="define-messages" number={1} title="定义消息与步骤">
+
+创建 `src/types.ts`。聊天消息用于模型上下文，步骤用于 Harness 控制与审计，两者不要混在一个数组里。
+
+```typescript
+export interface AgentMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AgentStep {
+  number: number;
+  kind: "model" | "tool";
+  summary: string;
+}
+```
+
+</Step>
+
+<Step id="define-state" number={2} title="定义任务状态">
+
+继续在 `src/types.ts` 添加：
+
+```typescript
+import type { ContextSource } from "./context.js";
+
+export interface AgentState {
+  runId: string;
+  task: string;
+  cwd: string;
+  status: "running" | "completed" | "failed" | "blocked";
+  messages: AgentMessage[];
+  contextSources: ContextSource[];
+  steps: AgentStep[];
+  changedFiles: string[];
+  validations: string[];
+}
+```
+
+</Step>
+
+<Step id="initialize-state" number={3} title="从 CLI 任务初始化状态">
+
+创建 `src/state.ts`：
+
+```typescript
+import { randomUUID } from "node:crypto";
+import type { AgentState } from "./types.js";
+
+export function createInitialState(task: string, cwd: string): AgentState {
+  return {
+    runId: randomUUID(),
+    task,
+    cwd,
+    status: "running",
+    messages: [{ role: "user", content: task }],
+    contextSources: [],
+    steps: [],
+    changedFiles: [],
+    validations: [],
+  };
+}
+```
+
+在 `src/index.ts` 中创建状态，再把 `state.task` 发送给模型。先打印 `runId`，后续日志都使用它关联同一次运行。
+
+</Step>
+
+<Checkpoint command='pnpm dev -- "检查 package.json"'>
+
+终端应先输出唯一的 `runId`，随后打印模型回复。连续运行两次时，两个 `runId` 必须不同。
+
+</Checkpoint>
