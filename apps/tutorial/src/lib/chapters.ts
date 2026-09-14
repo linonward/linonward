@@ -9,6 +9,9 @@ interface ChapterModule {
   default: ComponentType;
 }
 
+export const tutorialGoal =
+  "通过逐章可运行的增量，理解 Agent 的模型、上下文、任务状态、规划、工具、Skills 与 Agent Loop 等关键组件，并从零构建一个由 Harness 约束、不依赖 Agent 框架的可用 Agent。";
+
 export interface Chapter {
   slug: string;
   number: string;
@@ -25,8 +28,9 @@ export const chapters: Chapter[] = [
     number: "00",
     title: "开始",
     label: "开始",
-    description: "定义最终要交付的 Agent，以及贯穿教程的工程边界。",
+    description: "理解逐章搭建路径，定义最终要交付的 Agent 与贯穿教程的工程边界。",
     toc: [
+      { id: "understand-learning-path", title: "理解搭建路径" },
       { id: "verify-toolchain", title: "确认本地工具链" },
       { id: "create-project", title: "创建项目与依赖" },
       { id: "configure-project", title: "配置项目" },
@@ -92,6 +96,7 @@ export const chapters: Chapter[] = [
       { id: "replan-from-evidence", title: "基于证据重规划" },
       { id: "connect-plan-to-loop", title: "把计划接入 Loop" },
       { id: "test-planning", title: "测试计划状态机" },
+      { id: "verify-real-task", title: "用真实任务验收规划" },
     ],
     load: () => import("../content/task-planning.mdx"),
   },

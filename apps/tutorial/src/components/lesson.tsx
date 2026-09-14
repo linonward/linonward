@@ -2,16 +2,21 @@ import type { ReactNode } from "react";
 
 interface LessonOverviewProps {
   files?: string[];
-  outcome: string;
+  goal: string;
   prerequisites?: string;
+  task: string;
 }
 
-export function LessonOverview({ files = [], outcome, prerequisites }: LessonOverviewProps) {
+export function LessonOverview({ files = [], goal, prerequisites, task }: LessonOverviewProps) {
   return (
     <section className="lesson-overview">
       <div>
-        <span>本章完成后</span>
-        <strong>{outcome}</strong>
+        <span>本章任务</span>
+        <strong>{task}</strong>
+      </div>
+      <div>
+        <span>章节目标</span>
+        <strong>{goal}</strong>
       </div>
       {prerequisites ? (
         <div>

@@ -1,5 +1,6 @@
 <LessonOverview
-  outcome="实现一条可验证的上下文压缩链路：在安全边界生成结构化快照，保留最近原始事件，并让 Agent Loop 在上下文耗尽前继续工作。"
+  goal="实现一条可验证的上下文压缩链路：在安全边界生成结构化快照，保留最近原始事件，并让 Agent Loop 在上下文耗尽前继续工作。"
+  task="压缩包含 200 条 observation 的运行，并证明目标、计划和证据没有丢失。"
   prerequisites="第 08 章已经有完整 Agent Loop，能够在每轮重新组装 ContextSource 并记录模型、工具、计划与 Skill 事件。"
   files={["src/compaction.ts", "src/context.ts", "src/types.ts", "src/agent-loop.ts", "tests/compaction.test.ts"]}
 />

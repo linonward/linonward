@@ -224,6 +224,27 @@ summary {
   padding: 54px 0 72px;
 }
 
+.tutorial-goal {
+  margin: 0 0 26px;
+  border-left: 3px solid var(--accent);
+  padding: 2px 0 2px 16px;
+}
+
+.tutorial-goal span {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.tutorial-goal p {
+  max-width: 680px;
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 620;
+  line-height: 1.6;
+}
+
 .article-header {
   padding-bottom: 30px;
   border-bottom: 1px solid var(--line);

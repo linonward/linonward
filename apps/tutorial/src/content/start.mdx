@@ -1,10 +1,43 @@
 <LessonOverview
-  outcome="得到一个具备开发、类型检查和测试命令的 TypeScript CLI 项目，后续每章都在它上面继续修改。"
+  goal="得到一个具备开发、类型检查和测试命令的 TypeScript CLI 项目，后续每章都在它上面继续修改。"
+  task="创建 agent-from-scratch CLI 骨架，并让它接收“分析这个仓库”任务。"
   prerequisites="Node.js 24、pnpm 12，以及一个空目录。"
   files={["package.json", "tsconfig.json", "src/index.ts", "tests/"]}
 />
 
-<Step id="verify-toolchain" number={1} title="确认本地工具链">
+<Step id="understand-learning-path" number={1} title="理解这条搭建路径">
+
+这不是一组彼此独立的代码片段。你会始终修改同一个 `agent-from-scratch` 项目，让它从只能接收命令行文本的程序，逐章成长为能够理解任务、规划、调用工具、修改代码并验证结果的 Agent。
+
+每一章都遵循同一套学习契约：
+
+1. **搭建能力**：完成一个边界清楚、可以运行的新能力，而不是只阅读概念。
+2. **理解组件**：解释它解决什么问题、接收什么输入、产生什么输出，以及为什么不能把职责交给模型自由发挥。
+3. **加入约束**：把能力接入 Harness，由代码控制状态转换、上下文与轮次预算、工具权限、完成证据和停止条件。
+4. **实际验证**：使用本章指定的真实任务和 Checkpoint 验收；失败时先修正，不带着坏状态进入下一章。
+
+最终系统的控制关系如下。模型只提出下一步行动，Harness 才是 Agent 的运行时控制层：
+
+```text
+用户任务
+   ↓
+Harness
+   ├─ 组装 Context + System Prompt
+   ├─ 维护 Task State + Plan
+   ├─ 调用 Model Adapter
+   ├─ 校验 Tool Registry + Permission Policy
+   └─ 检查 Budget + Evidence + Stop Conditions
+          ↓
+       Agent 结果
+```
+
+这里的“无框架”指不使用 LangChain 等 Agent 框架替你实现控制流。模型 SDK 只负责与模型通信；上下文组装、状态机、规划、工具调度、循环、恢复和安全策略都由你亲手实现，因此每个关键边界都是可见、可测试、可替换的。
+
+教程的增量路线是：先建立 CLI 与模型边界，再加入上下文、任务状态和规划；随后构建 Harness、工具系统、Skills 与完整 Agent Loop；最后补上上下文压缩、长程恢复、仓库读写、验证和权限安全。走到最后时，你会用同一个最终任务验证整条链路。
+
+</Step>
+
+<Step id="verify-toolchain" number={2} title="确认本地工具链">
 
 先检查运行时和包管理器版本。教程只使用 pnpm，不混用 npm、Yarn 或 Bun。
 
@@ -17,7 +50,7 @@ pnpm --version
 
 </Step>
 
-<Step id="create-project" number={2} title="创建项目并安装开发依赖">
+<Step id="create-project" number={3} title="创建项目并安装开发依赖">
 
 在终端创建目录、初始化包，并安装 TypeScript 执行器、Node 类型与测试框架。教程后面的命令都从这个目录执行。
 
@@ -33,7 +66,7 @@ mkdir src tests
 
 </Step>
 
-<Step id="configure-project" number={3} title="配置脚本与 TypeScript">
+<Step id="configure-project" number={4} title="配置脚本与 TypeScript">
 
 把 `package.json` 改成下面这样。`check` 是贯穿教程的最低本地门禁。
 
@@ -83,7 +116,7 @@ mkdir src tests
 
 </Step>
 
-<Step id="accept-first-task" number={4} title="接收第一个任务">
+<Step id="accept-first-task" number={5} title="接收第一个任务">
 
 创建 `src/index.ts`。现在它还不是 Agent，只负责证明任务可以从 CLI 进入程序。
 
@@ -111,7 +144,7 @@ describe("tutorial toolchain", () => {
 
 </Step>
 
-<Step id="define-finish-line" number={5} title="写下最终完成标准">
+<Step id="define-finish-line" number={6} title="写下最终完成标准">
 
 在项目根目录创建 `GOAL.md`，固定贯穿教程的验收任务：
 

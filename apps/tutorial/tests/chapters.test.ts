@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { chapters, getChapter, getChapterNeighbors } from "../src/lib/chapters";
+import { chapters, getChapter, getChapterNeighbors, tutorialGoal } from "../src/lib/chapters";
 
 describe("chapter catalog", () => {
+  it("declares the tutorial-wide goal separately from chapter goals", () => {
+    expect(tutorialGoal).toBe(
+      "通过逐章可运行的增量，理解 Agent 的模型、上下文、任务状态、规划、工具、Skills 与 Agent Loop 等关键组件，并从零构建一个由 Harness 约束、不依赖 Agent 框架的可用 Agent。",
+    );
+  });
+
   it("keeps the build path in a stable learning order", () => {
     expect(chapters.map((chapter) => chapter.slug)).toEqual([
       "start",

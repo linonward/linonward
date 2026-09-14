@@ -1,5 +1,6 @@
 <LessonOverview
-  outcome="Agent 能在工作区内搜索文本和读取文件，但不能通过路径逃逸读取外部内容。"
+  goal="Agent 能在工作区内搜索文本和读取文件，但不能通过路径逃逸读取外部内容。"
+  task="让 Agent 读取 package.json，回答项目使用的包管理器，并拒绝工作区外路径。"
   prerequisites="工具注册表和 Agent Loop 已经能够处理一次工具调用。"
   files={["src/workspace.ts", "src/tools/read-file.ts", "src/tools/search-text.ts", "src/index.ts"]}
 />

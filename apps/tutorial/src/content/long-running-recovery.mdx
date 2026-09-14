@@ -1,5 +1,6 @@
 <LessonOverview
-  outcome="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
+  goal="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
+  task="在工具副作用后注入崩溃，恢复同一 runId，并确保副作用只发生一次。"
   prerequisites="第 09 章已经能生成带事件范围与校验和的 CompactionSnapshot，Agent Loop 的每个重要状态转换都有事件。"
   files={["src/run-store.ts", "src/checkpoint.ts", "src/recovery.ts", "src/agent-loop.ts", "src/index.ts", "tests/recovery.test.ts"]}
 />

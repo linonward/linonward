@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 
-import { chapters, getChapterNeighbors, type Chapter } from "@/lib/chapters";
+import { chapters, getChapterNeighbors, type Chapter, tutorialGoal } from "@/lib/chapters";
 
 import { ArrowIcon, BookIcon, MenuIcon } from "./icons";
 
@@ -75,6 +75,10 @@ export function TutorialShell({ chapter, children }: TutorialShellProps) {
 
       <main className="tutorial-main">
         <article className="tutorial-article">
+          <aside className="tutorial-goal">
+            <span>教程整体目标</span>
+            <p>{tutorialGoal}</p>
+          </aside>
           <header className="article-header">
             <span className="article-number">{chapter.number}</span>
             <h1>{chapter.title}</h1>
