@@ -1,0 +1,407 @@
+<LessonOverview
+  outcome="把此前的上下文、模型适配器、工具注册表和状态机连接成一个完整、可测试、能够多轮工作的 Agent Loop。"
+  prerequisites="第 07 章已经能发现 Skill、按需加载完整指令与资源，并通过工具链返回 observation。"
+  files={["src/agent-loop.ts", "src/types.ts", "src/index.ts", "tests/agent-loop.test.ts"]}
+/>
+
+Agent Loop 是整个 Agent 的心脏。它不是一句“重复调用模型直到完成”，而是由确定性代码管理的一组状态转换：**选择计划步骤 → 渐进加载相关 Skill → 组装上下文 → 请求模型 → 分类模型输出 → 执行工具 → 记录 observation → 更新或修订计划 → 进入下一轮或停止**。
+
+<AgentLoopDiagram />
+
+<Step id="define-invariants" number={1} title="先定义循环不变量">
+
+写循环之前先固定任何一轮都不能破坏的规则：
+
+1. 只有 Harness 可以修改运行状态和决定停止；
+2. 每次模型请求前检查取消信号与模型轮次上限；
+3. 模型返回的每个工具调用都先验证，再执行；
+4. 同一批调用要么有足够预算全部处理，要么一个都不处理；
+5. 每个 observation 必须保留原始 `call_id`；
+6. 有工具调用时不能把同时出现的文本误当最终答案；
+7. 没有工具调用时，只有非空最终文本才能完成；
+8. 最终文本只有在计划完成且验收条件全部通过时才能结束运行；
+9. 未激活 Skill 的正文和未请求资源永远不能进入本轮上下文；
+10. 每次模型调用、Skill 加载、工具调用、计划修订和停止原因都写入可审计状态。
+
+<Callout>
+
+Loop 记录的是可观察事件和结果，不记录或要求模型暴露隐藏思维过程。调试需要的是输入来源、调用参数、observation、计数器和停止原因。
+
+</Callout>
+
+</Step>
+
+<Step id="define-loop-contract" number={2} title="定义 Loop 依赖与续轮输入">
+
+Loop 依赖领域接口，不直接依赖 OpenAI SDK。这样 Fake Model 可以完整测试控制流。
+
+```typescript
+import type { ModelRequest } from "./context.js";
+import type { ModelTurn } from "./model.js";
+import type { ToolRegistry } from "./tool-registry.js";
+
+export interface FunctionCallOutput {
+  type: "function_call_output";
+  call_id: string;
+  output: string;
+}
+
+export interface ModelDriver {
+  start(options: {
+    request: ModelRequest;
+    tools: ReturnType<ToolRegistry["definitions"]>;
+  }): Promise<ModelTurn>;
+  continue(options: {
+    previousResponseId: string;
+    instructions: string;
+    outputs: FunctionCallOutput[];
+    tools: ReturnType<ToolRegistry["definitions"]>;
+  }): Promise<ModelTurn>;
+}
+
+export interface AgentLoopOptions {
+  cwd: string;
+  skillsDirectory: string;
+  maxSteps: number;
+  maxToolCalls: number;
+  toolTimeoutMs: number;
+  model: ModelDriver;
+  planner: Planner;
+  tools: ToolRegistry;
+  signal?: AbortSignal;
+  onEvent?: (event: AgentEvent) => void;
+}
+```
+
+这里选择用 `previous_response_id` 维护模型侧的多轮状态。根据 [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)，续轮的 `instructions` 不会自动继承，所以 `continue` 明确要求再次传入它。如果使用 `store: false` 或零数据保留模式，则要改为在应用侧保存并回传所需的 response output items。
+
+</Step>
+
+<Step id="read-one-iteration" number={3} title="读懂单轮状态转换">
+
+先用伪代码理解每轮的唯一入口和三个出口：
+
+```text
+WHILE status is running
+  GUARD: cancelled? model budget exhausted?
+  PLAN: select the next dependency-ready step; replan only after invalidating evidence
+  ASSEMBLE: build goal + criteria + active step + selected context
+  DECIDE: call model once
+
+  IF model requested tools
+    GUARD: enough tool-call budget for the whole batch?
+    FOR EACH tool call
+      ACT: validate, authorize, execute with timeout
+      OBSERVE: store result and preserve call_id
+    CONTINUE with all function_call_output items
+
+  ELSE IF model returned non-empty final text
+    COMPLETE only if the plan and every acceptance criterion are complete
+    OTHERWISE reject early completion and continue
+
+  ELSE
+    FAIL with invalid_model_output
+```
+
+`maxSteps` 统计模型轮次，`maxToolCalls` 统计工具调用次数。两者必须独立，否则模型可以在一次响应中生成大量工具调用绕过总预算。
+
+</Step>
+
+<Step id="implement-complete-loop" number={4} title="实现完整 Agent Loop">
+
+创建 `src/agent-loop.ts`。下面是完整控制流，不再省略工具分支或停止分支。
+
+```typescript
+import { buildModelRequest } from "./context.js";
+import { executeToolCall } from "./execute-tool.js";
+import {
+  allCriteriaPassed,
+  completeStep,
+  createInitialPlan,
+  reconcilePlan,
+  selectNextStep,
+  startStep,
+} from "./plan.js";
+import { createInitialState } from "./state.js";
+import { discoverSkills, skillCatalogAsContextSource } from "./skill-catalog.js";
+import type { AgentResult, AgentState, StopReason } from "./types.js";
+
+export async function runAgentLoop(
+  task: string,
+  options: AgentLoopOptions,
+): Promise<AgentResult> {
+  const state = createInitialState(task, options.cwd);
+  state.skills.catalog = await discoverSkills(options.skillsDirectory);
+  const toolDefinitions = options.tools.definitions();
+  state.plan = await createInitialPlan(
+    task,
+    summarizeSources(state.contextSources),
+    options.tools.names(),
+    options.planner,
+  );
+
+  let modelStepCount = 0;
+  let toolCallCount = 0;
+  let previousResponseId: string | undefined;
+  let pendingOutputs: FunctionCallOutput[] = [];
+
+  options.onEvent?.({ type: "run_started", runId: state.runId });
+
+  while (state.status === "running") {
+    if (options.signal?.aborted) return stop(state, "cancelled", options);
+    if (modelStepCount >= options.maxSteps) return stop(state, "max_steps", options);
+
+    let activeStep = state.plan.steps.find((step) => step.id === state.activeStepId);
+    if (!activeStep) {
+      activeStep = selectNextStep(state.plan);
+      if (activeStep) {
+        state.plan = startStep(state.plan, activeStep.id);
+        state.activeStepId = activeStep.id;
+        activeStep = state.plan.steps.find((step) => step.id === activeStep?.id);
+      } else if (state.plan.steps.some((step) => step.status !== "completed")) {
+        return stop(state, "blocked_plan", options);
+      }
+    }
+
+    const request = buildModelRequest({
+      task: state.task,
+      cwd: state.cwd,
+      toolNames: options.tools.names(),
+      sources: [
+        ...state.contextSources,
+        planAsContextSource(state.plan, activeStep),
+        skillCatalogAsContextSource(state.skills.catalog),
+        ...Object.values(state.skills.activeSkills).map((skill) => ({
+          id: `skill:${skill.name}`,
+          kind: "skill_instructions" as const,
+          label: skill.name,
+          content: skill.instructions,
+          priority: 96,
+        })),
+      ],
+    });
+
+    modelStepCount += 1;
+    options.onEvent?.({ type: "model_started", step: modelStepCount });
+
+    let turn: ModelTurn;
+    try {
+      turn = previousResponseId
+        ? await options.model.continue({
+            previousResponseId,
+            instructions: request.instructions,
+            outputs: pendingOutputs,
+            tools: toolDefinitions,
+          })
+        : await options.model.start({ request, tools: toolDefinitions });
+    } catch (error) {
+      state.steps.push({
+        number: state.steps.length + 1,
+        kind: "model",
+        summary: error instanceof Error ? error.message : String(error),
+      });
+      return stop(state, "model_error", options);
+    }
+
+    state.steps.push({
+      number: state.steps.length + 1,
+      kind: "model",
+      summary: turn.toolCalls.length > 0 ? "模型请求工具" : "模型返回文本",
+    });
+    options.onEvent?.({ type: "model_completed", step: modelStepCount });
+
+    if (turn.toolCalls.length === 0) {
+      const answer = turn.finalText.trim();
+      if (!answer) return stop(state, "invalid_model_output", options);
+
+      const planCompleted = state.plan.steps.every((step) => step.status === "completed");
+      if (!planCompleted || !allCriteriaPassed(state.plan)) {
+        state.contextSources.push({
+          id: "completion-rejected-" + modelStepCount,
+          kind: "harness_feedback",
+          label: "completion rejected",
+          content: "继续执行：计划或验收条件尚未完成。",
+          priority: 100,
+        });
+        previousResponseId = undefined;
+        pendingOutputs = [];
+        continue;
+      }
+
+      state.messages.push({ role: "assistant", content: answer });
+      state.status = "completed";
+      options.onEvent?.({ type: "run_stopped", reason: "final_answer" });
+      return {
+        status: "completed",
+        answer,
+        stopReason: "final_answer",
+        state,
+      };
+    }
+
+    if (toolCallCount + turn.toolCalls.length > options.maxToolCalls) {
+      return stop(state, "max_tool_calls", options);
+    }
+    if (!activeStep) return stop(state, "blocked_plan", options);
+
+    const outputs: FunctionCallOutput[] = [];
+    const observations: string[] = [];
+    for (const call of turn.toolCalls) {
+      if (options.signal?.aborted) return stop(state, "cancelled", options);
+
+      const result = await executeToolCall({
+        call,
+        registry: options.tools,
+        cwd: state.cwd,
+        timeoutMs: options.toolTimeoutMs,
+      });
+      toolCallCount += 1;
+
+      state.steps.push({
+        number: state.steps.length + 1,
+        kind: "tool",
+        summary: call.name,
+      });
+      state.contextSources.push({
+        id: call.callId,
+        kind: "tool_observation",
+        label: call.name,
+        content: result.output,
+        priority: 80,
+      });
+      outputs.push({
+        type: "function_call_output",
+        call_id: call.callId,
+        output: result.output,
+      });
+      observations.push(result.output);
+    }
+
+    const progress = await options.planner.evaluate({
+      step: activeStep,
+      observations,
+    });
+    assertEvidenceComesFromObservations(progress.evidence, observations);
+    state.plan = applyCriterionEvidence(state.plan, progress.passedCriteria, observations);
+
+    if (progress.completed) {
+      state.plan = completeStep(state.plan, activeStep.id, progress.evidence.join("\n"));
+      state.activeStepId = undefined;
+    }
+
+    if (progress.replanReason) {
+      const draft = await options.planner.revise({
+        current: state.plan,
+        reason: progress.replanReason,
+        observations,
+      });
+      state.plan = reconcilePlan(state.plan, draft, progress.replanReason);
+      state.planHistory.push({
+        version: state.plan.version,
+        reason: progress.replanReason,
+        changedAt: new Date().toISOString(),
+      });
+      options.onEvent?.({
+        type: "plan_revised",
+        version: state.plan.version,
+        reason: progress.replanReason,
+      });
+      state.activeStepId = undefined;
+    }
+
+    previousResponseId = turn.responseId;
+    pendingOutputs = outputs;
+  }
+
+  return stop(state, "invalid_model_output", options);
+}
+
+function stop(
+  state: AgentState,
+  reason: StopReason,
+  options: AgentLoopOptions,
+): AgentResult {
+  state.status = reason === "cancelled" ? "blocked" : "failed";
+  options.onEvent?.({ type: "run_stopped", reason });
+  return { status: state.status, answer: "", stopReason: reason, state };
+}
+```
+
+注意三个细节：`buildModelRequest` 必须在循环内执行，才能带上新的计划状态与 observation；工具失败仍由 `executeToolCall` 编码成 observation，Planner 可以据此修订计划；模型 API 自身失败属于 `model_error`，Loop 直接停止，重试策略应封装在 Model Adapter 内部。
+
+</Step>
+
+<Step id="trace-one-run" number={5} title="追踪一次真实运行">
+
+以“读取 `package.json` 并解释 scripts”为例，外部可观察轨迹应类似：
+
+1. **初始化任务与计划**：创建 Goal、验收标准和 `inspect-package` Step；
+2. **选择 Step**：`inspect-package` 从 `pending` 进入 `in_progress`；
+3. **Model 请求 `read_file`**：`modelStepCount=1`，保存 `responseId`；
+4. **Executor 读取文件**：`toolCallCount=1`，记录 observation 与 `call_id`；
+5. **评估步骤**：observation 满足完成证据，Step 进入 `completed`；
+6. **Model 收到 `function_call_output`**：`modelStepCount=2`；
+7. **Model 返回解释文本**：Harness 确认计划和验收条件全部通过；
+8. **Harness 完成**：`status=completed`，`stopReason=final_answer`。
+
+如果第 1 步返回未知工具，Executor 不抛出未处理异常，而是生成 `unknown_tool` observation；第 3 步模型可以换用已有工具。如果连续耗尽预算，Harness 才以确定的停止原因结束。
+
+</Step>
+
+<Step id="test-loop" number={6} title="测试循环而不是测试模型">
+
+创建 `tests/agent-loop.test.ts`。Fake Model 固定返回两个 turn：先请求工具，再检查 observation 并返回答案。
+
+```typescript
+import { describe, expect, it, vi } from "vitest";
+import { runAgentLoop } from "../src/agent-loop.js";
+
+it("runs model → tool → observation → model → final", async () => {
+  const start = vi.fn().mockResolvedValue({
+    responseId: "response-1",
+    finalText: "",
+    toolCalls: [
+      { callId: "call-1", name: "read_file", argumentsJson: '{"path":"package.json"}' },
+    ],
+  });
+  const continueTurn = vi.fn().mockResolvedValue({
+    responseId: "response-2",
+    finalText: "package.json defines the project scripts.",
+    toolCalls: [],
+  });
+
+  const result = await runAgentLoop("Explain package.json", {
+    cwd: "/workspace",
+    skillsDirectory: "/workspace/skills",
+    maxSteps: 4,
+    maxToolCalls: 4,
+    toolTimeoutMs: 1_000,
+    model: { start, continue: continueTurn },
+    tools: createFakeRegistry(),
+  });
+
+  expect(result.stopReason).toBe("final_answer");
+  expect(result.state.steps.map((step) => step.kind)).toEqual(["model", "tool", "model"]);
+  expect(continueTurn).toHaveBeenCalledWith(
+    expect.objectContaining({
+      previousResponseId: "response-1",
+      outputs: [
+        expect.objectContaining({
+          type: "function_call_output",
+          call_id: "call-1",
+        }),
+      ],
+    }),
+  );
+});
+```
+
+继续补充：纯文本提前完成被拒绝、计划无 ready Step、证据不足、计划修订、空输出、模型异常、取消、模型轮次耗尽、工具预算不足、工具错误后恢复，以及一轮多个工具调用。测试断言计划状态、事件和停止原因，不断言模型内部思考。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+运行 Fake Model 测试，确认成功轨迹严格为 `model → tool → model`，续轮携带原始 `responseId`、重复的系统 Prompt，以及原 `call_id` 对应的 `function_call_output`。把 `maxSteps` 和 `maxToolCalls` 分别设为 0，两个测试应得到不同的停止原因。
+
+</Checkpoint>

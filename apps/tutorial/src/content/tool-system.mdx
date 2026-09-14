@@ -1,0 +1,292 @@
+<LessonOverview
+  outcome="模型可以发起严格的函数调用；Harness 会校验、执行、限制输出，并把结果送回同一次推理链，直到得到最终答案。"
+  prerequisites="第 05 章的 Harness 已具备状态、停止条件、取消和错误边界。"
+  files={["src/tool.ts", "src/tool-registry.ts", "src/model.ts", "src/execute-tool.ts", "src/harness.ts"]}
+/>
+
+工具不是“让模型执行一个函数”。模型只能生成调用意图，真正的副作用必须穿过应用控制的执行链。
+
+<Step id="understand-tool-chain" number={1} title="理解完整工具调用链">
+
+一次工具循环包含七个不可省略的阶段：
+
+1. 应用把工具名称、描述和 JSON Schema 发给模型；
+2. 模型返回一个或多个 `function_call`；
+3. 适配器按 `type` 过滤输出，并保留每个 `call_id`；
+4. Executor 解析 JSON、校验 Schema、执行权限策略；
+5. 工具在超时和工作区边界内运行；
+6. 结果被限制大小、序列化为 `function_call_output`；
+7. Harness 把结果交回模型，模型基于 observation 决定下一步。
+
+任何工具错误也应形成 observation，而不是让循环直接崩溃。只有 Harness 能决定重试、换工具或停止。
+
+</Step>
+
+<Step id="define-tool" number={2} title="从一个 Schema 定义工具">
+
+安装 Zod。运行时校验和模型可见 JSON Schema 必须来自同一个定义，避免两份 Schema 漂移。
+
+```shell
+pnpm add zod
+```
+
+创建 `src/tool.ts`：
+
+```typescript
+import { z, type ZodType } from "zod";
+
+export interface ToolContext {
+  cwd: string;
+  signal: AbortSignal;
+}
+
+export interface RegisteredTool {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  run(input: unknown, context: ToolContext): Promise<unknown>;
+}
+
+export function defineTool<Input>(definition: {
+  name: string;
+  description: string;
+  schema: ZodType<Input>;
+  execute(input: Input, context: ToolContext): Promise<unknown>;
+}): RegisteredTool {
+  const { $schema: _, ...parameters } = z.toJSONSchema(definition.schema);
+
+  return {
+    name: definition.name,
+    description: definition.description,
+    parameters,
+    run: (input, context) =>
+      definition.execute(definition.schema.parse(input), context),
+  };
+}
+```
+
+例如，一个读取文件的定义只写一次输入约束：
+
+```typescript
+export const readFileTool = defineTool({
+  name: "read_file",
+  description: "Read one UTF-8 text file inside the workspace root.",
+  schema: z.object({ path: z.string().min(1) }).strict(),
+  async execute({ path }, context) {
+    return readWorkspaceFile(context.cwd, path, context.signal);
+  },
+});
+```
+
+开启 [strict function calling](https://developers.openai.com/api/docs/guides/function-calling#strict-mode) 时，对象 Schema 需要 `additionalProperties: false`，并把所有字段列入 `required`；可选值应通过包含 `null` 来表达。Zod 的严格对象可避免接受模型偷偷增加的字段。
+
+</Step>
+
+<Step id="build-registry" number={3} title="注册工具并生成模型工具列表">
+
+创建 `src/tool-registry.ts`。注册阶段拒绝重名，运行阶段只按精确名称查找。
+
+```typescript
+import type { RegisteredTool } from "./tool.js";
+
+export class ToolRegistry {
+  private readonly tools = new Map<string, RegisteredTool>();
+
+  register(tool: RegisteredTool): void {
+    if (this.tools.has(tool.name)) {
+      throw new Error("Duplicate tool: " + tool.name);
+    }
+    this.tools.set(tool.name, tool);
+  }
+
+  get(name: string): RegisteredTool | undefined {
+    return this.tools.get(name);
+  }
+
+  names(): string[] {
+    return [...this.tools.keys()];
+  }
+
+  definitions() {
+    return [...this.tools.values()].map((tool) => ({
+      type: "function" as const,
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      strict: true,
+    }));
+  }
+}
+```
+
+工具描述要说明用途、边界和返回值，避免写“万能文件工具”这类模糊能力。默认设置 `parallel_tool_calls: false`，先获得确定的执行顺序；以后只对无副作用、彼此独立的读取工具开放并行。
+
+</Step>
+
+<Step id="parse-model-turn" number={4} title="解析 Responses API 的 function_call">
+
+把 OpenAI SDK 隔离在 `src/model.ts`。不要假设 `response.output[0]` 是文本；输出数组的顺序和长度取决于模型。本教程把函数参数保留为 JSON 字符串，交给 Executor 统一解析。
+
+```typescript
+import OpenAI from "openai";
+import type { ModelRequest } from "./context.js";
+
+const client = new OpenAI();
+
+export interface ToolCall {
+  callId: string;
+  name: string;
+  argumentsJson: string;
+}
+
+export interface ModelTurn {
+  responseId: string;
+  finalText: string;
+  toolCalls: ToolCall[];
+}
+
+function toModelTurn(response: Awaited<ReturnType<typeof client.responses.create>>): ModelTurn {
+  const toolCalls: ToolCall[] = [];
+
+  for (const item of response.output) {
+    if (item.type !== "function_call") continue;
+    toolCalls.push({
+      callId: item.call_id,
+      name: item.name,
+      argumentsJson: item.arguments,
+    });
+  }
+
+  return {
+    responseId: response.id,
+    finalText: response.output_text,
+    toolCalls,
+  };
+}
+```
+
+然后实现首轮调用：
+
+```typescript
+export async function startModelTurn(
+  model: string,
+  request: ModelRequest,
+  tools: ReturnType<ToolRegistry["definitions"]>,
+): Promise<ModelTurn> {
+  const response = await client.responses.create({
+    model,
+    instructions: request.instructions,
+    input: request.input,
+    tools,
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+  });
+
+  return toModelTurn(response);
+}
+```
+
+</Step>
+
+<Step id="execute-call" number={5} title="建立受控的唯一执行入口">
+
+创建 `src/execute-tool.ts`。未知工具、坏 JSON、Schema 失败、超时和工具异常都返回结构化 observation。不要把堆栈、密钥或无限长输出直接送回模型。
+
+```typescript
+import { ZodError } from "zod";
+
+const MAX_OBSERVATION_CHARACTERS = 12_000;
+
+export async function executeToolCall(options: {
+  call: ToolCall;
+  registry: ToolRegistry;
+  cwd: string;
+  timeoutMs: number;
+}): Promise<{ callId: string; output: string }> {
+  const tool = options.registry.get(options.call.name);
+  if (!tool) return observation(options.call.callId, { ok: false, error: "unknown_tool" });
+
+  let input: unknown;
+  try {
+    input = JSON.parse(options.call.argumentsJson);
+  } catch {
+    return observation(options.call.callId, { ok: false, error: "invalid_json" });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+
+  try {
+    const data = await tool.run(input, { cwd: options.cwd, signal: controller.signal });
+    return observation(options.call.callId, { ok: true, data });
+  } catch (error) {
+    const code =
+      controller.signal.aborted ? "timeout" : error instanceof ZodError ? "invalid_arguments" : "tool_error";
+    return observation(options.call.callId, { ok: false, error: code });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function observation(callId: string, value: unknown) {
+  const serialized = JSON.stringify(value);
+  const output =
+    serialized.length <= MAX_OBSERVATION_CHARACTERS
+      ? serialized
+      : JSON.stringify({
+          ok: false,
+          error: "output_too_large",
+          preview: serialized.slice(0, MAX_OBSERVATION_CHARACTERS),
+        });
+  return { callId, output };
+}
+```
+
+超时只有在工具实现尊重 `AbortSignal` 时才能真正终止底层工作；因此文件、网络和子进程工具都必须把 signal 继续传给自己的 API。
+
+</Step>
+
+<Step id="extend-loop" number={6} title="把工具结果提交回同一次推理链">
+
+执行完本轮所有调用后，使用原始 `call_id` 构造 `function_call_output`，并通过 `previous_response_id` 继续。根据 Responses API 的规则，续轮仍要显式传入相同的 `instructions`。
+
+```typescript
+export async function continueModelTurn(options: {
+  model: string;
+  previousResponseId: string;
+  instructions: string;
+  outputs: { callId: string; output: string }[];
+  tools: ReturnType<ToolRegistry["definitions"]>;
+}): Promise<ModelTurn> {
+  const response = await client.responses.create({
+    model: options.model,
+    previous_response_id: options.previousResponseId,
+    instructions: options.instructions,
+    input: options.outputs.map((item) => ({
+      type: "function_call_output" as const,
+      call_id: item.callId,
+      output: item.output,
+    })),
+    tools: options.tools,
+    parallel_tool_calls: false,
+  });
+
+  return toModelTurn(response);
+}
+```
+
+至此，模型适配器已经能完成“首轮”和“续轮”两个原子操作。下一章会把它们放进真正的 Agent Loop，并统一处理计数器、状态写入、工具批次和全部停止分支。
+
+</Step>
+
+<Step id="test-tool-chain" number={7} title="验证模型与工具边界">
+
+分别测试两个原子边界：Model Adapter 能从混合 `output` 中提取全部 `function_call`；Executor 能处理未知工具、坏 JSON、Schema 不匹配、工具抛错、超时和超大输出。此处不测试循环，下一章用 Fake Model 验证完整状态机。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+给 Model Adapter 输入一份包含文本与两个函数调用的固定响应，确认两个调用都被保留；再给 Executor 注册固定工具，确认成功与失败 observation 都是长度受限的有效 JSON，并保留原始 `call_id`。
+
+</Checkpoint>

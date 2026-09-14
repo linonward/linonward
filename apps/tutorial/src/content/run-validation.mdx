@@ -1,0 +1,67 @@
+<LessonOverview
+  outcome="Agent 能运行允许的验证命令，并且修改代码后不能在没有成功验证时宣布完成。"
+  prerequisites="写入工具已经能记录 changedFiles。"
+  files={["src/tools/run-command.ts", "src/types.ts", "src/completion.ts", "src/harness.ts"]}
+/>
+
+<Step id="run-command" number={1} title="实现无 Shell 的命令工具">
+
+创建 `src/tools/run-command.ts`。参数必须拆成 `command` 和 `args`，并设置超时；不要接受一整段 Shell 字符串。
+
+```typescript
+const inputSchema = z.object({
+  command: z.enum(["pnpm", "node"]),
+  args: z.array(z.string()).max(20),
+});
+
+const child = spawn(input.command, input.args, {
+  cwd: context.cwd,
+  shell: false,
+  signal: AbortSignal.timeout(60_000),
+});
+```
+
+收集退出码、stdout 和 stderr，并把总输出限制在 20,000 个字符。截断必须显式标记。
+
+</Step>
+
+<Step id="record-validation" number={2} title="把成功命令记为验证证据">
+
+给状态增加结构化验证记录。只有退出码为 `0` 的命令才能成为成功证据。
+
+```typescript
+export interface ValidationRecord {
+  command: string;
+  exitCode: number;
+  durationMs: number;
+  status: "passed" | "failed";
+}
+```
+
+Harness 在 `run_command` 返回后追加记录；失败结果也要保存，因为模型需要据此修正。
+
+</Step>
+
+<Step id="completion-gate" number={3} title="加入完成门禁">
+
+创建 `src/completion.ts`。当模型给出最终回答时先执行检查，不满足条件就把反馈作为 observation 送回循环。
+
+```typescript
+export function checkCompletion(state: AgentState): string | undefined {
+  if (state.changedFiles.length === 0) return undefined;
+
+  const latest = state.validations.at(-1);
+  if (!latest) return "已经修改文件，但还没有运行验证。";
+  if (latest.status === "failed") return "最近一次验证失败，请继续修复。";
+
+  return undefined;
+}
+```
+
+</Step>
+
+<Checkpoint command='pnpm dev -- "给示例函数补一个失败测试并修复实现"'>
+
+轨迹中必须出现写入、失败验证、再次写入和成功验证。删除最终验证步骤后重跑，Harness 应拒绝模型的完成声明。
+
+</Checkpoint>

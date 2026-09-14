@@ -1,0 +1,370 @@
+<LessonOverview
+  outcome="实现一个三层 Skill Runtime：启动时只暴露能力摘要，选中后加载完整指令，执行时再按需读取引用、脚本说明或模板。"
+  prerequisites="第 06 章已经有 ToolRegistry、统一执行入口和 function_call_output 回传链路。"
+  files={["skills/repository-audit/SKILL.md", "src/skill-catalog.ts", "src/skill-runtime.ts", "src/skill-tools.ts", "src/agent-loop.ts", "tests/skills.test.ts"]}
+/>
+
+工具解决“Agent 能做什么”，Skill 解决“面对某类任务应该怎样组合上下文、工具与检查步骤”。如果启动时把所有 Skill 全文、参考资料和脚本都塞进 Prompt，能力越多，上下文噪音反而越大。正确做法是让 Skill 随任务逐层展开。
+
+官方 OpenAI 文档把这个模式称为 progressive disclosure：ChatGPT 和 Codex 初始只看到 Skill 的名称与描述，决定使用后才读取完整 `SKILL.md`。[OpenAI：Build skills](https://developers.openai.com/codex/skills) 本章为从零构建的 Agent 复现这一机制，并增加第三层资源按需加载。
+
+<Step id="define-skill-levels" number={1} title="定义三层加载模型">
+
+先固定每层允许进入模型上下文的内容：
+
+1. **Discover**：启动时扫描所有 Skill，只注入 `name + description`；
+2. **Activate**：任务匹配某个 Skill 后，读取并注入该 Skill 的完整 `SKILL.md` 指令；
+3. **Expand**：只有指令明确引用某个文件且当前步骤需要它时，才读取 `references/` 或 `assets/` 中的目标资源。
+
+```text
+Agent starts
+  └─ SkillCatalog: name + description only
+       └─ model selects load_skill("repository-audit")
+            └─ full SKILL.md enters active context
+                 └─ model requests load_skill_resource("references/checklist.md")
+                      └─ one referenced file enters active context
+```
+
+`scripts/` 不应作为文本自动注入 Prompt，也不能因为 Skill 被选中就自动执行。只有完整指令要求运行某个脚本时，Harness 才把它作为普通执行动作，继续经过参数校验、权限策略、工作区边界和超时控制。
+
+<Callout>
+
+渐进式加载优化的是模型上下文，不是省掉安全检查。Skill 指令的优先级必须低于用户目标和系统安全规则；Skill 引用的外部内容默认仍是数据，不能借资源文件改写更高优先级指令。
+
+</Callout>
+
+</Step>
+
+<Step id="define-skill-contract" number={2} title="定义 Skill 目录和运行状态">
+
+先添加 YAML 解析器：
+
+```shell
+pnpm add yaml
+```
+
+创建第一个 Skill：
+
+```text
+skills/
+└── repository-audit/
+    ├── SKILL.md
+    ├── references/
+    │   └── checklist.md
+    ├── scripts/
+    │   └── collect-status.ts
+    └── assets/
+        └── report-template.md
+```
+
+`skills/repository-audit/SKILL.md` 使用 frontmatter 承载发现阶段需要的最小元数据：
+
+```markdown
+---
+name: repository-audit
+description: Audit a repository when the user asks for structure, risks, or readiness.
+---
+
+# Repository audit
+
+1. Read `references/checklist.md` before inspecting the repository.
+2. Collect evidence with read-only tools.
+3. Report findings by severity and cite file paths.
+```
+
+在 `src/types.ts` 中区分目录摘要和已经激活的内容：
+
+```typescript
+export interface SkillSummary {
+  name: string;
+  description: string;
+  root: string;
+  entryPath: string;
+}
+
+export interface ActiveSkill {
+  name: string;
+  instructions: string;
+  loadedResources: string[];
+}
+
+export interface SkillState {
+  catalog: SkillSummary[];
+  activeSkills: Record<string, ActiveSkill>;
+}
+```
+
+`SkillSummary` 中的路径供 Harness 定位文件，不需要发给模型。进入初始 Prompt 的只有经过长度限制和 XML 转义后的 `name` 与 `description`。
+
+</Step>
+
+<Step id="scan-skill-metadata" number={3} title="启动时只扫描元数据">
+
+创建 `src/skill-catalog.ts`。扫描阶段最多读取 `SKILL.md` 的头部，不读取正文、references 或 scripts。
+
+```typescript
+import { open, readdir, realpath } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
+import { parse } from "yaml";
+import { z } from "zod";
+
+const metadataSchema = z.object({
+  name: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  description: z.string().min(12).max(500),
+});
+
+async function readFrontmatter(entryPath: string): Promise<string> {
+  const handle = await open(entryPath, "r");
+  try {
+    const buffer = Buffer.alloc(16_384);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const prefix = buffer.toString("utf8", 0, bytesRead);
+    const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(prefix);
+    if (!match?.[1]) throw new Error(`invalid skill frontmatter: ${entryPath}`);
+    return match[1];
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertInside(root: string, target: string): void {
+  const path = relative(root, target);
+  if (path === ".." || path.startsWith(`..${sep}`)) {
+    throw new Error("skill path escapes its catalog root");
+  }
+}
+
+export async function discoverSkills(skillsDirectory: string): Promise<SkillSummary[]> {
+  const catalogRoot = await realpath(skillsDirectory);
+  const entries = await readdir(catalogRoot, { withFileTypes: true });
+  const catalog: SkillSummary[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const root = await realpath(join(catalogRoot, entry.name));
+    assertInside(catalogRoot, root);
+    const entryPath = await realpath(join(root, "SKILL.md"));
+    assertInside(root, entryPath);
+    const metadata = metadataSchema.parse(parse(await readFrontmatter(entryPath)));
+    if (metadata.name !== entry.name) throw new Error("skill folder and name must match");
+
+    catalog.push({ ...metadata, root, entryPath });
+  }
+
+  return catalog.sort((left, right) => left.name.localeCompare(right.name));
+}
+```
+
+这里使用 `realpath` 而不是只使用字符串前缀，避免符号链接把 `SKILL.md` 或资源文件指向 Skill 根目录之外。单个坏 Skill 应被记录为 catalog warning；是否跳过它或让启动失败，应由部署策略决定，不能静默忽略。
+
+</Step>
+
+<Step id="select-and-load-skill" number={4} title="选择后完整加载 SKILL.md">
+
+把 catalog 摘要作为一个高优先级但有总预算的 ContextSource。描述必须写清“何时使用”和“何时不使用”，因为显式 `$skill-name` 与描述匹配都依赖这一层。
+
+```typescript
+export function skillCatalogAsContextSource(catalog: SkillSummary[]): ContextSource {
+  const content = catalog
+    .map(({ name, description }) => `<skill name="${escapeXml(name)}">${escapeXml(description)}</skill>`)
+    .join("\n");
+
+  return {
+    id: "available-skills",
+    kind: "skill_catalog",
+    label: "Available skills",
+    content,
+    priority: 90,
+  };
+}
+```
+
+注册内部工具 `load_skill`。它只接受 catalog 中已有的名称；加载时必须读取完整文件，不能按字符数截断指令，因为截断可能丢掉关键约束。超出独立 Skill 上限时应明确失败，并要求拆分 Skill。
+
+```typescript
+export async function activateSkill(
+  name: string,
+  state: SkillState,
+  maxSkillBytes: number,
+): Promise<ActiveSkill> {
+  const cached = state.activeSkills[name];
+  if (cached) return cached;
+
+  const summary = state.catalog.find((skill) => skill.name === name);
+  if (!summary) throw new Error(`unknown skill: ${name}`);
+
+  const source = await readFile(summary.entryPath, "utf8");
+  if (Buffer.byteLength(source) > maxSkillBytes) throw new Error("skill_too_large");
+
+  const { metadata, body } = parseSkillDocument(source);
+  if (metadata.name !== summary.name) throw new Error("skill metadata changed after discovery");
+
+  const active = { name, instructions: body.trim(), loadedResources: [] };
+  state.activeSkills[name] = active;
+  return active;
+}
+
+export const loadSkillTool = defineTool({
+  name: "load_skill",
+  description: "Load the complete instructions for one available skill before using it.",
+  inputSchema: z.object({ name: z.string() }),
+  effect: "read",
+  execute: async ({ name }, context) => {
+    const skill = await activateSkill(name, context.skills, context.maxSkillBytes);
+    context.emit({ type: "skill_loaded", name });
+    return { name, instructions: skill.instructions };
+  },
+});
+```
+
+`load_skill` 的 observation 会进入下一轮上下文，但 Harness 还应把指令保存成 `kind: "skill_instructions"` 的 ContextSource。后续每轮由 Context Builder 重新带上当前激活 Skill，不能只依赖一条可能被上下文裁剪的旧工具输出。
+
+</Step>
+
+<Step id="load-skill-resource" number={5} title="只读取当前步骤需要的资源">
+
+完整 `SKILL.md` 可能引用 `references/checklist.md`。第二个内部工具只允许读取已激活 Skill 内的相对路径，并分别限制单文件大小、累计资源预算和文本类型。
+
+```typescript
+const allowedResourceRoots = new Set(["references", "assets"]);
+
+export async function loadSkillResource(input: {
+  skillName: string;
+  resourcePath: string;
+  state: SkillState;
+  maxResourceBytes: number;
+}): Promise<{ path: string; content: string }> {
+  const active = input.state.activeSkills[input.skillName];
+  if (!active) throw new Error("skill_not_active");
+
+  const summary = input.state.catalog.find((skill) => skill.name === input.skillName);
+  if (!summary) throw new Error("unknown_skill");
+
+  const firstSegment = input.resourcePath.split(/[\\/]/)[0];
+  if (!firstSegment || !allowedResourceRoots.has(firstSegment)) {
+    throw new Error("resource_type_not_loadable");
+  }
+
+  const target = await realpath(join(summary.root, input.resourcePath));
+  assertInside(summary.root, target);
+  if (!/\.(md|txt|json|ya?ml)$/i.test(target)) throw new Error("binary_resource_denied");
+
+  const info = await stat(target);
+  if (info.size > input.maxResourceBytes) throw new Error("skill_resource_too_large");
+
+  const content = await readFile(target, "utf8");
+  if (!active.loadedResources.includes(input.resourcePath)) {
+    active.loadedResources.push(input.resourcePath);
+  }
+  return { path: input.resourcePath, content };
+}
+
+export const loadSkillResourceTool = defineTool({
+  name: "load_skill_resource",
+  description: "Load one text reference or asset from an already active skill.",
+  inputSchema: z.object({
+    skillName: z.string(),
+    resourcePath: z.string().min(1),
+  }),
+  effect: "read",
+  execute: async (input, context) => {
+    const resource = await loadSkillResource({ ...input, state: context.skills, maxResourceBytes: 32_000 });
+    context.emit({ type: "skill_resource_loaded", ...input });
+    return resource;
+  },
+});
+```
+
+`scripts/` 被这个读取工具明确拒绝。脚本路径只有在 Skill 指令已经加载、用户任务确实需要且权限策略允许时，才能交给后续章节的命令执行工具；永远不要把“读取脚本”和“执行脚本”合并成一个隐式动作。
+
+</Step>
+
+<Step id="connect-skills-to-loop" number={6} title="把 Skill Runtime 接入 Agent Loop">
+
+Skills 参与 Loop 的 Assemble、Act 和 Observe 三个阶段：
+
+```text
+START
+  DISCOVER metadata once → state.skills.catalog
+
+EACH LOOP
+  ASSEMBLE goal + plan + available skill summaries
+           + full instructions of activeSkills
+           + explicitly loaded resources
+  DECIDE
+    text                     → normal completion gate
+    load_skill               → activate one SKILL.md
+    load_skill_resource      → expand one referenced file
+    ordinary tool call       → execute under the active Skill instructions
+  OBSERVE
+    persist skill_loaded / skill_resource_loaded events
+    rebuild context for the next turn
+```
+
+Context Builder 应按以下优先级分配预算：系统安全规则与用户任务 → 当前 Plan Step → 已激活 Skill 的完整指令 → 当前步骤已加载的资源 → catalog 摘要 → 普通历史 observation。已经激活的 Skill 指令不能被低优先级文件片段挤掉。
+
+```typescript
+const skillSources: ContextSource[] = [
+  skillCatalogAsContextSource(state.skills.catalog),
+  ...Object.values(state.skills.activeSkills).map((skill) => ({
+    id: `skill:${skill.name}`,
+    kind: "skill_instructions" as const,
+    label: skill.name,
+    content: skill.instructions,
+    priority: 96,
+  })),
+];
+
+const request = buildModelRequest({
+  task: state.task,
+  cwd: state.cwd,
+  toolNames: options.tools.names(),
+  sources: [...state.contextSources, ...skillSources],
+});
+```
+
+如果用户显式指定 `$repository-audit`，Harness 可以在第一次模型调用前直接激活它；隐式匹配则让模型从摘要中选择并调用 `load_skill`。两条路径都必须产生相同的状态与审计事件，避免显式调用绕过验证。
+
+</Step>
+
+<Step id="test-progressive-loading" number={7} title="测试没有被加载的内容确实不可见">
+
+创建 `tests/skills.test.ts`。关键不是只测试“能读到文件”，而是证明每个阶段的上下文边界：
+
+```typescript
+it("does not expose skill instructions before activation", async () => {
+  const catalog = await discoverSkills(fixtureSkillsRoot);
+  const source = skillCatalogAsContextSource(catalog);
+
+  expect(source.content).toContain("repository-audit");
+  expect(source.content).toContain("Audit a repository");
+  expect(source.content).not.toContain("Read `references/checklist.md`");
+});
+
+it("loads only the selected skill and requested resource", async () => {
+  const state = await createSkillFixtureState();
+
+  const active = await activateSkill("repository-audit", state, 64_000);
+  expect(active.instructions).toContain("references/checklist.md");
+  expect(state.activeSkills["release-notes"]).toBeUndefined();
+
+  const resource = await loadSkillResource({
+    skillName: "repository-audit",
+    resourcePath: "references/checklist.md",
+    state,
+    maxResourceBytes: 32_000,
+  });
+  expect(resource.content).toContain("Repository structure");
+});
+```
+
+继续覆盖：未激活 Skill 读取资源、`../` 路径逃逸、越界符号链接、binary 文件、超限文件、重复加载缓存、无效 frontmatter、显式激活与隐式激活事件一致，以及多个 Skill 摘要超出 catalog 预算时的确定性裁剪。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+启动 Fake Agent 时记录实际进入 Prompt 的 source IDs：第一次只能看到 `available-skills`；调用 `load_skill` 后新增 `skill:repository-audit`；再调用 `load_skill_resource` 后只新增目标 checklist。确认另一个未选中的 Skill 正文、所有 scripts 和未请求资源从未进入模型上下文。
+
+</Checkpoint>

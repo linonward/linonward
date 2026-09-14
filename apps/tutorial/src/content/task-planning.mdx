@@ -1,0 +1,292 @@
+<LessonOverview
+  outcome="把用户目标转换成可审计、可执行、可修订的 TaskPlan，并让 Agent Loop 每轮只推进一个明确步骤。"
+  prerequisites="第 03 章已经能够创建 AgentState，并区分消息、运行步骤和上下文来源。"
+  files={["src/plan.ts", "src/planner.ts", "src/types.ts", "src/agent-loop.ts", "tests/plan.test.ts"]}
+/>
+
+一个能调用工具的循环还不等于能完成任务的 Agent。面对“修复登录失败并验证”这样的目标，它必须先明确完成标准，拆出有依赖关系的步骤，再用工具返回的证据推进计划。**规划不是隐藏思维过程，而是 Harness 保存的一份可观察工作清单。**
+
+<Step id="separate-goal-plan-step" number={1} title="区分 Goal、Plan 与 Step">
+
+先固定三个概念，避免模型每一轮都重新解释任务：
+
+1. **Goal**：用户要求和约束，是本次运行的稳定契约，重规划不能偷偷改写它；
+2. **Plan**：为了实现 Goal 而提出的当前执行假设，可以随新证据修订；
+3. **Step**：一次可验证的工作单元，必须说明完成它需要什么证据。
+
+例如，用户说“修复登录失败并运行测试”：Goal 保留原句；Plan 可以是“复现 → 定位 → 修改 → 验证”；当前 Step 则是“运行登录测试并保存失败输出”。不要让模型输出冗长推理，只要求简短步骤、依赖关系和可观察完成条件。
+
+<Callout>
+
+计划服务于执行，不是展示用的待办列表。一个 Step 如果无法通过文件、命令结果、工具 observation 或用户确认判断是否完成，就还不够具体。
+
+</Callout>
+
+</Step>
+
+<Step id="define-plan-state" number={2} title="定义任务与计划状态">
+
+在 `src/types.ts` 中加入计划领域类型，并把 Plan 放进 `AgentState`。状态由 Harness 修改，模型只能提出候选计划。
+
+```typescript
+export interface AcceptanceCriterion {
+  id: string;
+  description: string;
+  status: "unverified" | "passed" | "failed";
+  evidence?: string;
+}
+
+export interface PlanStep {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "completed" | "blocked";
+  dependsOn: string[];
+  completionEvidence: string;
+  evidence: string[];
+}
+
+export interface TaskPlan {
+  version: number;
+  goal: string;
+  acceptanceCriteria: AcceptanceCriterion[];
+  steps: PlanStep[];
+  revisionReason?: string;
+}
+
+export interface AgentState {
+  // 保留上一章的 runId、task、messages、contextSources 等字段
+  plan?: TaskPlan;
+  activeStepId?: string;
+  planHistory: Array<{
+    version: number;
+    reason: string;
+    changedAt: string;
+  }>;
+}
+```
+
+`acceptanceCriteria` 回答“整个任务何时完成”，`completionEvidence` 回答“这个步骤何时完成”。两者不能互相替代：代码写完可能完成了一个 Step，但测试没有通过时 Goal 仍未完成。
+
+</Step>
+
+<Step id="create-initial-plan" number={3} title="生成并校验初始计划">
+
+创建 `src/planner.ts`。Planner 是模型边界，返回结构化候选；`validatePlan` 是确定性边界，拒绝空计划、重复 ID、未知依赖和循环依赖。
+
+```typescript
+export interface PlanDraft {
+  acceptanceCriteria: Array<{ id: string; description: string }>;
+  steps: Array<{
+    id: string;
+    title: string;
+    dependsOn: string[];
+    completionEvidence: string;
+  }>;
+}
+
+export interface Planner {
+  create(input: {
+    goal: string;
+    context: string;
+    availableTools: string[];
+  }): Promise<PlanDraft>;
+  revise(input: {
+    current: TaskPlan;
+    reason: ReplanReason;
+    observations: string[];
+  }): Promise<PlanDraft>;
+  evaluate(input: {
+    step: PlanStep;
+    observations: string[];
+  }): Promise<{
+    completed: boolean;
+    evidence: string[];
+    passedCriteria: string[];
+    replanReason?: ReplanReason;
+  }>;
+}
+
+export async function createInitialPlan(
+  goal: string,
+  context: string,
+  tools: string[],
+  planner: Planner,
+): Promise<TaskPlan> {
+  const draft = await planner.create({ goal, context, availableTools: tools });
+  validatePlan(draft);
+
+  return {
+    version: 1,
+    goal,
+    acceptanceCriteria: draft.acceptanceCriteria.map((criterion) => ({
+      ...criterion,
+      status: "unverified",
+    })),
+    steps: draft.steps.map((step) => ({
+      ...step,
+      status: "pending",
+      evidence: [],
+    })),
+  };
+}
+```
+
+要求 Planner 只使用已声明的工具能力，不要编造“查询数据库”之类无法执行的步骤。模型可通过 Responses API 返回结构化文本或调用自定义工具，但 API 只负责产生响应；候选计划的持久化、校验和状态转换仍属于应用代码。[OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+
+</Step>
+
+<Step id="advance-plan" number={4} title="用确定性规则推进计划">
+
+创建 `src/plan.ts`。选择下一步不需要再问模型：只取依赖全部完成的第一个 `pending` Step，并保证同一时刻最多一个 `in_progress`。
+
+```typescript
+export function selectNextStep(plan: TaskPlan): PlanStep | undefined {
+  const completed = new Set(
+    plan.steps.filter((step) => step.status === "completed").map((step) => step.id),
+  );
+
+  return plan.steps.find(
+    (step) =>
+      step.status === "pending" &&
+      step.dependsOn.every((dependency) => completed.has(dependency)),
+  );
+}
+
+export function startStep(plan: TaskPlan, stepId: string): TaskPlan {
+  if (plan.steps.some((step) => step.status === "in_progress")) {
+    throw new Error("another plan step is already in progress");
+  }
+
+  const selected = selectNextStep(plan);
+  if (selected?.id !== stepId) throw new Error("step is not ready");
+
+  return updateStep(plan, stepId, (step) => ({ ...step, status: "in_progress" }));
+}
+
+export function completeStep(
+  plan: TaskPlan,
+  stepId: string,
+  evidence: string,
+): TaskPlan {
+  if (!evidence.trim()) throw new Error("completion evidence is required");
+
+  return updateStep(plan, stepId, (step) => {
+    if (step.status !== "in_progress") throw new Error("step is not in progress");
+    return { ...step, status: "completed", evidence: [...step.evidence, evidence] };
+  });
+}
+```
+
+工具成功不一定等于 Step 完成。例如 `read_file` 成功只证明文件已读取；是否已经“定位故障原因”还要由一个明确的步骤结果归约器判断，并把所依据的 observation 摘要保存为 evidence。
+
+本教程通过 `Planner.evaluate` 实现这个归约边界：它只能引用本轮已有 observation，Harness 再校验引用、更新 Step 和验收条件。这样模型可以判断语义是否满足，但不能绕过证据直接修改状态。
+
+</Step>
+
+<Step id="replan-from-evidence" number={5} title="只在计划失效时重规划">
+
+每轮都重新生成计划会抖动、浪费 token，还可能遗忘已完成工作。先用确定性信号决定是否需要重规划：
+
+```typescript
+export type ReplanReason =
+  | "new_constraint"
+  | "failed_assumption"
+  | "repeated_tool_failure"
+  | "no_ready_step";
+
+export function shouldReplan(input: {
+  userChangedGoal: boolean;
+  failedAssumption: boolean;
+  consecutiveToolFailures: number;
+  plan: TaskPlan;
+}): ReplanReason | undefined {
+  if (input.userChangedGoal) return "new_constraint";
+  if (input.failedAssumption) return "failed_assumption";
+  if (input.consecutiveToolFailures >= 2) return "repeated_tool_failure";
+
+  const unfinished = input.plan.steps.some(
+    (step) => step.status === "pending" || step.status === "in_progress",
+  );
+  const active = input.plan.steps.some((step) => step.status === "in_progress");
+  if (unfinished && !active && !selectNextStep(input.plan)) return "no_ready_step";
+  return undefined;
+}
+```
+
+Planner 返回修订草案后，`reconcilePlan` 必须执行四条规则：Goal 保持原文；已经完成的 Step 和 evidence 不得删除；Plan `version + 1`；变更原因写入 `planHistory` 并发出 `plan_revised` 事件。新计划仍要通过与初始计划相同的结构和依赖校验。
+
+</Step>
+
+<Step id="connect-plan-to-loop" number={6} title="把 Plan 接入 Agent Loop">
+
+Plan 位于 Assemble 和 Decide 之间：Loop 先选择 ready Step，再把 Goal、完成标准、计划摘要、当前 Step 与最近 observation 一起交给模型。工具结果返回后，Harness 更新 Step，而不是让模型直接覆盖整个 Plan。
+
+```text
+INITIALIZE task state
+CREATE and validate initial plan
+
+WHILE run is active
+  REPLAN only when shouldReplan(...) returns a reason
+  SELECT the next dependency-ready step
+  ASSEMBLE goal + acceptance criteria + plan summary + active step + context
+  DECIDE one model turn
+
+  IF tool calls exist
+    ACT and collect observations
+    REDUCE observations into step progress
+    COMPLETE the step only when its required evidence exists
+    CONTINUE the loop
+
+  IF final text exists
+    COMPLETE only when every acceptance criterion is passed
+    OTHERWISE continue with the first unverified criterion
+
+  STOP on cancellation, budget exhaustion, invalid output, or unrecoverable block
+```
+
+模型请求中的计划摘要可以采用稳定格式：`[✓] completed`、`[→] in progress`、`[ ] pending`、`[!] blocked`。不要把所有历史版本都塞回上下文；当前版本进入 Prompt，旧版本留在审计日志中。
+
+</Step>
+
+<Step id="test-planning" number={7} title="测试计划状态机，而不是计划文案">
+
+创建 `tests/plan.test.ts`，用固定 PlanDraft 覆盖以下行为：
+
+1. 未完成依赖的 Step 不能被选择或启动；
+2. 同一时刻不能有两个 `in_progress` Step；
+3. 没有 evidence 不能完成 Step；
+4. 工具连续失败两次触发 `repeated_tool_failure`；
+5. 重规划保留 Goal、已完成 Step 和 evidence，并递增版本；
+6. 仍有未验证的 acceptance criterion 时，模型文本不能让 Loop 提前完成。
+
+```typescript
+it("advances only to a dependency-ready step", () => {
+  const plan = createPlanFixture();
+
+  expect(selectNextStep(plan)?.id).toBe("reproduce");
+
+  const running = startStep(plan, "reproduce");
+  const completed = completeStep(running, "reproduce", "login.test.ts fails with 401");
+
+  expect(selectNextStep(completed)?.id).toBe("diagnose");
+});
+
+it("requires replanning after repeated tool failures", () => {
+  expect(
+    shouldReplan({
+      userChangedGoal: false,
+      failedAssumption: false,
+      consecutiveToolFailures: 2,
+      plan: createPlanFixture(),
+    }),
+  ).toBe("repeated_tool_failure");
+});
+```
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test">
+
+先打印初始 Plan，确认每个 Step 都有依赖和完成证据。再让 Fake Planner 返回一次修订计划：已完成步骤应保持完成、版本从 1 变为 2，并产生 `plan_revised` 事件。最后模拟模型提前给出答案，确认 acceptance criteria 未全部通过时 Loop 仍继续运行。
+
+</Checkpoint>

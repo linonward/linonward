@@ -1,0 +1,78 @@
+<LessonOverview
+  outcome="Agent 能在工作区内搜索文本和读取文件，但不能通过路径逃逸读取外部内容。"
+  prerequisites="工具注册表和 Agent Loop 已经能够处理一次工具调用。"
+  files={["src/workspace.ts", "src/tools/read-file.ts", "src/tools/search-text.ts", "src/index.ts"]}
+/>
+
+<Step id="safe-path" number={1} title="限制所有路径在工作区内">
+
+创建 `src/workspace.ts`。每个文件工具都必须先经过这个函数。
+
+```typescript
+import { resolve, sep } from "node:path";
+
+export function resolveWorkspacePath(cwd: string, input: string): string {
+  const root = resolve(cwd);
+  const target = resolve(root, input);
+
+  if (target !== root && !target.startsWith(root + sep)) {
+    throw new Error("path_outside_workspace");
+  }
+
+  return target;
+}
+```
+
+</Step>
+
+<Step id="read-file" number={2} title="实现 read_file">
+
+创建 `src/tools/read-file.ts`。限制单次读取长度，并明确告诉模型内容是否被截断。
+
+```typescript
+const inputSchema = z.object({ path: z.string().min(1) });
+
+export const readFileTool: Tool<z.infer<typeof inputSchema>, ReadResult> = {
+  name: "read_file",
+  description: "Read one UTF-8 text file inside the workspace",
+  schema: inputSchema,
+  async execute(input, context) {
+    const path = resolveWorkspacePath(context.cwd, input.path);
+    const content = await readFile(path, "utf8");
+    const limit = 20_000;
+    return { content: content.slice(0, limit), truncated: content.length > limit };
+  },
+};
+```
+
+</Step>
+
+<Step id="search-text" number={3} title="实现 search_text">
+
+创建 `src/tools/search-text.ts`，通过 `spawn("rg", args, { shell: false })` 执行搜索。固定最大结果数并排除 `.git`、`node_modules` 和构建目录。
+
+```typescript
+const inputSchema = z.object({ query: z.string().min(1) });
+const args = ["-n", "--max-count", "50", "--glob", "!node_modules/**", input.query, "."];
+const child = spawn("rg", args, { cwd: context.cwd, shell: false });
+```
+
+</Step>
+
+<Step id="register-read-tools" number={4} title="注册只读工具并收紧提示词">
+
+在 CLI 装配阶段注册两个工具，并告诉模型先搜索、后读取；找不到证据时继续调查，不要猜测仓库内容。
+
+```typescript
+const tools = new ToolRegistry();
+tools.register(searchTextTool);
+tools.register(readFileTool);
+```
+
+</Step>
+
+<Checkpoint command='pnpm dev -- "package.json 中使用了哪个包管理器？"'>
+
+轨迹中应先出现 `search_text` 或 `read_file`，最终答案必须来自真实文件。再请求读取 `../outside.txt`，应得到 `path_outside_workspace`。
+
+</Checkpoint>

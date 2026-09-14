@@ -1,0 +1,137 @@
+<LessonOverview
+  outcome="得到一个具备开发、类型检查和测试命令的 TypeScript CLI 项目，后续每章都在它上面继续修改。"
+  prerequisites="Node.js 24、pnpm 12，以及一个空目录。"
+  files={["package.json", "tsconfig.json", "src/index.ts", "tests/"]}
+/>
+
+<Step id="verify-toolchain" number={1} title="确认本地工具链">
+
+先检查运行时和包管理器版本。教程只使用 pnpm，不混用 npm、Yarn 或 Bun。
+
+```shell
+node --version
+pnpm --version
+```
+
+第一条应输出 `v24.x`，第二条应输出 `12.x`。如果版本不一致，先用你习惯的 Node 版本管理器切换；不要带着不同运行时继续排查后续错误。
+
+</Step>
+
+<Step id="create-project" number={2} title="创建项目并安装开发依赖">
+
+在终端创建目录、初始化包，并安装 TypeScript 执行器、Node 类型与测试框架。教程后面的命令都从这个目录执行。
+
+```shell
+mkdir agent-from-scratch
+cd agent-from-scratch
+pnpm init
+pnpm add -D typescript tsx @types/node vitest
+mkdir src tests
+```
+
+这些工具各自只有一个职责：Node 运行程序，pnpm 管理依赖，TypeScript 检查类型，tsx 在开发阶段直接执行 `.ts`，Vitest 执行快速单元测试。
+
+</Step>
+
+<Step id="configure-project" number={3} title="配置脚本与 TypeScript">
+
+把 `package.json` 改成下面这样。`check` 是贯穿教程的最低本地门禁。
+
+```json
+{
+  "name": "agent-from-scratch",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.4.1",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}
+```
+
+`pnpm init` 和 `pnpm add` 已经写入依赖；这里重点核对脚本，不要求手工覆盖 pnpm 解析出的实际版本。
+
+创建 `tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
+```
+
+`NodeNext` 让 TypeScript 按 Node ESM 规则解析模块，因此本地相对导入在源码中也要写 `.js` 后缀，例如 `import { model } from "./model.js"`。
+
+</Step>
+
+<Step id="accept-first-task" number={4} title="接收第一个任务">
+
+创建 `src/index.ts`。现在它还不是 Agent，只负责证明任务可以从 CLI 进入程序。
+
+```typescript
+const task = process.argv.slice(2).join(" ").trim();
+
+if (!task) {
+  throw new Error("请在命令后提供任务，例如：pnpm dev -- 分析这个仓库");
+}
+
+console.log({ task });
+```
+
+创建 `tests/cli.test.ts`，先验证测试工具链工作：
+
+```typescript
+import { describe, expect, it } from "vitest";
+
+describe("tutorial toolchain", () => {
+  it("runs tests", () => {
+    expect(true).toBe(true);
+  });
+});
+```
+
+</Step>
+
+<Step id="define-finish-line" number={5} title="写下最终完成标准">
+
+在项目根目录创建 `GOAL.md`，固定贯穿教程的验收任务：
+
+```markdown
+# 最终任务
+
+给示例 CLI 增加 --name 参数并补充测试。
+
+Agent 必须能够：
+1. 搜索并读取相关文件；
+2. 修改实现与测试；
+3. 运行最窄相关检查；
+4. 根据失败继续修正；
+5. 汇报改动和验证证据。
+```
+
+</Step>
+
+<Checkpoint command='pnpm check && pnpm dev -- "分析这个仓库"'>
+
+类型检查和测试都应通过，随后终端输出包含任务文本的对象。没有输入任务时，程序应以清晰错误退出。提交到版本控制的文件应包含 `package.json`、`pnpm-lock.yaml`、`tsconfig.json`、`src/` 和 `tests/`。
+
+</Checkpoint>
