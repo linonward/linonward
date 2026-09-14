@@ -1,5 +1,6 @@
 <LessonOverview
-  outcome="实现一个三层 Skill Runtime：启动时只暴露能力摘要，选中后加载完整指令，执行时再按需读取引用、脚本说明或模板。"
+  goal="实现一个三层 Skill Runtime：启动时只暴露能力摘要，选中后加载完整指令，执行时再按需读取引用、脚本说明或模板。"
+  task="为仓库审计任务只激活 repository-audit Skill，并按需加载它的 checklist。"
   prerequisites="第 06 章已经有 ToolRegistry、统一执行入口和 function_call_output 回传链路。"
   files={["skills/repository-audit/SKILL.md", "src/skill-catalog.ts", "src/skill-runtime.ts", "src/skill-tools.ts", "src/agent-loop.ts", "tests/skills.test.ts"]}
 />

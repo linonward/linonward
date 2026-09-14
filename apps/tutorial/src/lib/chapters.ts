@@ -9,11 +9,15 @@ interface ChapterModule {
   default: ComponentType;
 }
 
+export const tutorialGoal =
+  "通过逐章可运行的增量，理解 Agent 的模型、上下文、任务状态、规划、工具、Skills 与 Agent Loop 等关键组件，并从零构建一个由 Harness 约束、不依赖 Agent 框架的可用 Agent。";
+
 export interface Chapter {
   slug: string;
   number: string;
   title: string;
   label: string;
+  minutes: number;
   description: string;
   toc: TableOfContentsItem[];
   load: () => Promise<ChapterModule>;
@@ -25,8 +29,10 @@ export const chapters: Chapter[] = [
     number: "00",
     title: "开始",
     label: "开始",
-    description: "定义最终要交付的 Agent，以及贯穿教程的工程边界。",
+    minutes: 15,
+    description: "理解逐章搭建路径，定义最终要交付的 Agent 与贯穿教程的工程边界。",
     toc: [
+      { id: "understand-learning-path", title: "理解搭建路径" },
       { id: "verify-toolchain", title: "确认本地工具链" },
       { id: "create-project", title: "创建项目与依赖" },
       { id: "configure-project", title: "配置项目" },
@@ -40,12 +46,14 @@ export const chapters: Chapter[] = [
     number: "01",
     title: "最小模型调用",
     label: "最小模型调用",
+    minutes: 20,
     description: "建立可替换的模型接口，完成第一次结构化调用。",
     toc: [
       { id: "install-sdk", title: "安装 SDK" },
       { id: "configure-env", title: "配置本地环境" },
       { id: "call-model", title: "第一次 Responses API 调用" },
       { id: "extract-port", title: "抽出最小 Model 接口" },
+      { id: "run-fake-model", title: "离线验证 Fake Model" },
     ],
     load: () => import("../content/model-call.mdx"),
   },
@@ -54,6 +62,7 @@ export const chapters: Chapter[] = [
     number: "02",
     title: "上下文与系统 Prompt",
     label: "上下文与 Prompt",
+    minutes: 35,
     description: "把规则、任务、环境资料与运行轨迹组装成可控的模型上下文。",
     toc: [
       { id: "separate-context-layers", title: "分清指令与数据" },
@@ -70,11 +79,14 @@ export const chapters: Chapter[] = [
     number: "03",
     title: "任务与状态",
     label: "任务与状态",
+    minutes: 30,
     description: "把一句自然语言请求转换成可以持续推进的任务状态。",
     toc: [
       { id: "define-messages", title: "定义消息" },
       { id: "define-state", title: "定义状态" },
       { id: "initialize-state", title: "从 CLI 初始化状态" },
+      { id: "enforce-transitions", title: "执行合法状态转换" },
+      { id: "test-state-machine", title: "测试状态机路径" },
     ],
     load: () => import("../content/task-state.mdx"),
   },
@@ -83,15 +95,12 @@ export const chapters: Chapter[] = [
     number: "04",
     title: "任务分解与规划",
     label: "任务与规划",
+    minutes: 75,
     description: "把用户目标拆成可执行步骤，用证据推进，并在计划失效时重规划。",
     toc: [
-      { id: "separate-goal-plan-step", title: "区分目标、计划与步骤" },
-      { id: "define-plan-state", title: "定义计划状态" },
-      { id: "create-initial-plan", title: "生成并校验初始计划" },
-      { id: "advance-plan", title: "按依赖推进步骤" },
-      { id: "replan-from-evidence", title: "基于证据重规划" },
-      { id: "connect-plan-to-loop", title: "把计划接入 Loop" },
-      { id: "test-planning", title: "测试计划状态机" },
+      { id: "plan-generation", title: "实验一：生成与校验" },
+      { id: "plan-progress", title: "实验二：推进与重规划" },
+      { id: "plan-verification", title: "实验三：测试与验收" },
     ],
     load: () => import("../content/task-planning.mdx"),
   },
@@ -100,6 +109,7 @@ export const chapters: Chapter[] = [
     number: "05",
     title: "构建 Agent Harness",
     label: "Agent Harness",
+    minutes: 30,
     description: "模型负责决策，Harness 负责让任务安全、可靠地完成。",
     toc: [
       { id: "define-responsibilities", title: "划清 Harness 职责" },
@@ -115,6 +125,7 @@ export const chapters: Chapter[] = [
     number: "06",
     title: "工具系统",
     label: "工具系统",
+    minutes: 50,
     description: "用统一、类型安全的协议把外部能力交给 Agent。",
     toc: [
       { id: "understand-tool-chain", title: "理解工具调用链" },
@@ -132,6 +143,7 @@ export const chapters: Chapter[] = [
     number: "07",
     title: "Skills 渐进式加载",
     label: "Skills 渐进加载",
+    minutes: 60,
     description: "先发现能力，再加载指令，最后按需读取资源，避免上下文被无关内容占满。",
     toc: [
       { id: "define-skill-levels", title: "定义三层加载模型" },
@@ -149,6 +161,7 @@ export const chapters: Chapter[] = [
     number: "08",
     title: "实现 Agent Loop",
     label: "Agent Loop",
+    minutes: 75,
     description: "把上下文、模型、工具和停止策略连接成真正可运行的循环。",
     toc: [
       { id: "define-invariants", title: "定义循环不变量" },
@@ -165,6 +178,7 @@ export const chapters: Chapter[] = [
     number: "09",
     title: "上下文压缩",
     label: "上下文压缩",
+    minutes: 60,
     description: "在不丢失目标、约束和证据的前提下，为长对话释放上下文空间。",
     toc: [
       { id: "define-compaction-contract", title: "定义压缩契约" },
@@ -182,6 +196,7 @@ export const chapters: Chapter[] = [
     number: "10",
     title: "长程任务恢复",
     label: "长程任务恢复",
+    minutes: 65,
     description: "通过事件日志、原子检查点和幂等工具语义，让中断任务安全续跑。",
     toc: [
       { id: "separate-runtime-and-durable-state", title: "区分运行时与持久状态" },
@@ -199,6 +214,7 @@ export const chapters: Chapter[] = [
     number: "11",
     title: "读懂仓库",
     label: "读懂仓库",
+    minutes: 25,
     description: "提供受控的文件搜索与读取能力。",
     toc: [
       { id: "safe-path", title: "限制所有路径在工作区内" },
@@ -213,6 +229,7 @@ export const chapters: Chapter[] = [
     number: "12",
     title: "修改代码",
     label: "修改代码",
+    minutes: 35,
     description: "通过补丁完成可审查、可追踪的文件修改。",
     toc: [
       { id: "write-file", title: "带前置条件的写入工具" },
@@ -226,6 +243,7 @@ export const chapters: Chapter[] = [
     number: "13",
     title: "运行验证",
     label: "运行验证",
+    minutes: 30,
     description: "让 Agent 用真实命令证明工作已经完成。",
     toc: [
       { id: "run-command", title: "无 Shell 的命令工具" },
@@ -239,6 +257,7 @@ export const chapters: Chapter[] = [
     number: "14",
     title: "权限与安全",
     label: "权限与安全",
+    minutes: 35,
     description: "用策略层限制副作用，并在必要时请求人工确认。",
     toc: [
       { id: "risk-levels", title: "给工具标记风险等级" },

@@ -1,10 +1,13 @@
 <LessonOverview
-  outcome="把用户目标转换成可审计、可执行、可修订的 TaskPlan，并让 Agent Loop 每轮只推进一个明确步骤。"
+  goal="把用户目标转换成可审计、可执行、可修订的 TaskPlan，并让 Agent Loop 每轮只推进一个明确步骤。"
+  task="为“给示例 CLI 增加 --name 参数并补充测试”生成并校验 TaskPlan。"
   prerequisites="第 03 章已经能够创建 AgentState，并区分消息、运行步骤和上下文来源。"
   files={["src/plan.ts", "src/planner.ts", "src/types.ts", "src/agent-loop.ts", "tests/plan.test.ts"]}
 />
 
 一个能调用工具的循环还不等于能完成任务的 Agent。面对“修复登录失败并验证”这样的目标，它必须先明确完成标准，拆出有依赖关系的步骤，再用工具返回的证据推进计划。**规划不是隐藏思维过程，而是 Harness 保存的一份可观察工作清单。**
+
+<LessonPart id="plan-generation" title="实验一：生成与校验计划" open>
 
 <Step id="separate-goal-plan-step" number={1} title="区分 Goal、Plan 与 Step">
 
@@ -106,11 +109,88 @@ export interface Planner {
   }>;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAcceptanceCriterion(
+  value: unknown,
+): value is PlanDraft["acceptanceCriteria"][number] {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.description === "string" &&
+    value.description.length > 0
+  );
+}
+
+function isDraftStep(value: unknown): value is PlanDraft["steps"][number] {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.title === "string" &&
+    value.title.length > 0 &&
+    Array.isArray(value.dependsOn) &&
+    value.dependsOn.every((dependency) => typeof dependency === "string") &&
+    typeof value.completionEvidence === "string" &&
+    value.completionEvidence.length > 0
+  );
+}
+
+export function validatePlan(candidate: unknown): asserts candidate is PlanDraft {
+  if (!isRecord(candidate)) throw new Error("plan must be an object");
+
+  const { acceptanceCriteria, steps } = candidate;
+  if (!Array.isArray(acceptanceCriteria) || acceptanceCriteria.length === 0) {
+    throw new Error("plan requires at least one acceptance criterion");
+  }
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw new Error("plan requires at least one step");
+  }
+
+  if (!acceptanceCriteria.every(isAcceptanceCriterion)) {
+    throw new Error("invalid acceptance criterion");
+  }
+  if (!steps.every(isDraftStep)) throw new Error("invalid plan step");
+
+  const criterionIds = acceptanceCriteria.map((criterion) => criterion.id);
+  if (new Set(criterionIds).size !== criterionIds.length) {
+    throw new Error("duplicate acceptance criterion id");
+  }
+
+  const ids = steps.map((step) => step.id);
+  if (new Set(ids).size !== ids.length) throw new Error("duplicate step id");
+
+  const knownIds = new Set(ids);
+  for (const step of steps) {
+    if (step.dependsOn.some((dependency) => !knownIds.has(dependency))) {
+      throw new Error(`unknown dependency in step: ${step.id}`);
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const byId = new Map(steps.map((step) => [step.id, step]));
+
+  const visit = (id: string): void => {
+    if (visiting.has(id)) throw new Error("plan contains a dependency cycle");
+    if (visited.has(id)) return;
+    visiting.add(id);
+    for (const dependency of byId.get(id)?.dependsOn ?? []) visit(dependency);
+    visiting.delete(id);
+    visited.add(id);
+  };
+
+  for (const id of ids) visit(id);
+}
+
 export async function createInitialPlan(
   goal: string,
   context: string,
   tools: string[],
-  planner: Planner,
+  planner: Pick<Planner, "create">,
 ): Promise<TaskPlan> {
   const draft = await planner.create({ goal, context, availableTools: tools });
   validatePlan(draft);
@@ -129,17 +209,66 @@ export async function createInitialPlan(
     })),
   };
 }
+
+export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
+  return {
+    async create(input) {
+      const raw = await model.generate({
+        instructions: [
+          "You create short, executable plans for repository tasks.",
+          "Return one JSON object and no Markdown fences or commentary.",
+          "Use exactly this shape:",
+          '{"acceptanceCriteria":[{"id":"...","description":"..."}],',
+          '"steps":[{"id":"...","title":"...","dependsOn":[],',
+          '"completionEvidence":"..."}]}',
+          "Every step must be possible with the declared tools.",
+          "Every completionEvidence must describe observable evidence.",
+        ].join("\n"),
+        input: [{ role: "user", content: JSON.stringify(input) }],
+      });
+
+      let candidate: unknown;
+      try {
+        candidate = JSON.parse(raw);
+      } catch {
+        throw new Error("planner returned invalid JSON");
+      }
+      validatePlan(candidate);
+      return candidate;
+    },
+  };
+}
 ```
 
 要求 Planner 只使用已声明的工具能力，不要编造“查询数据库”之类无法执行的步骤。模型可通过 Responses API 返回结构化文本或调用自定义工具，但 API 只负责产生响应；候选计划的持久化、校验和状态转换仍属于应用代码。[OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
 
 </Step>
 
+</LessonPart>
+
+<LessonPart id="plan-progress" title="实验二：推进、证据与重规划">
+
 <Step id="advance-plan" number={4} title="用确定性规则推进计划">
 
 创建 `src/plan.ts`。选择下一步不需要再问模型：只取依赖全部完成的第一个 `pending` Step，并保证同一时刻最多一个 `in_progress`。
 
 ```typescript
+function updateStep(
+  plan: TaskPlan,
+  stepId: string,
+  update: (step: PlanStep) => PlanStep,
+): TaskPlan {
+  const step = plan.steps.find((candidate) => candidate.id === stepId);
+  if (!step) throw new Error(`unknown plan step: ${stepId}`);
+
+  return {
+    ...plan,
+    steps: plan.steps.map((candidate) =>
+      candidate.id === stepId ? update(candidate) : candidate,
+    ),
+  };
+}
+
 export function selectNextStep(plan: TaskPlan): PlanStep | undefined {
   const completed = new Set(
     plan.steps.filter((step) => step.status === "completed").map((step) => step.id),
@@ -174,6 +303,10 @@ export function completeStep(
     if (step.status !== "in_progress") throw new Error("step is not in progress");
     return { ...step, status: "completed", evidence: [...step.evidence, evidence] };
   });
+}
+
+export function allCriteriaPassed(plan: TaskPlan): boolean {
+  return plan.acceptanceCriteria.every((criterion) => criterion.status === "passed");
 }
 ```
 
@@ -211,9 +344,60 @@ export function shouldReplan(input: {
   if (unfinished && !active && !selectNextStep(input.plan)) return "no_ready_step";
   return undefined;
 }
+
+export function reconcilePlan(
+  current: TaskPlan,
+  draft: PlanDraft,
+  reason: ReplanReason,
+): TaskPlan {
+  validatePlan(draft);
+
+  const completedSteps = new Map(
+    current.steps
+      .filter((step) => step.status === "completed")
+      .map((step): [string, PlanStep] => [step.id, step]),
+  );
+
+  const arraysEqual = (left: string[], right: string[]): boolean =>
+    left.length === right.length && left.every((value, index) => value === right[index]);
+
+  const sameStepContract = (previous: PlanStep, next: PlanDraft["steps"][number]): boolean =>
+    previous.title === next.title &&
+    previous.completionEvidence === next.completionEvidence &&
+    arraysEqual(previous.dependsOn, next.dependsOn);
+
+  const sameCriterionContract = (
+    previous: AcceptanceCriterion,
+    next: PlanDraft["acceptanceCriteria"][number],
+  ): boolean => previous.description === next.description;
+
+  return {
+    version: current.version + 1,
+    goal: current.goal,
+    revisionReason: reason,
+    acceptanceCriteria: draft.acceptanceCriteria.map((criterion): AcceptanceCriterion => {
+      const previous = current.acceptanceCriteria.find(
+        (candidate) => candidate.id === criterion.id,
+      );
+      const canReuse = previous && sameCriterionContract(previous, criterion);
+
+      return {
+        ...criterion,
+        status: canReuse ? previous.status : "unverified",
+        ...(canReuse && previous.evidence ? { evidence: previous.evidence } : {}),
+      };
+    }),
+    steps: draft.steps.map((step): PlanStep => {
+      const completed = completedSteps.get(step.id);
+      return completed && sameStepContract(completed, step)
+        ? completed
+        : { ...step, status: "pending", evidence: [] };
+    }),
+  };
+}
 ```
 
-Planner 返回修订草案后，`reconcilePlan` 必须执行四条规则：Goal 保持原文；已经完成的 Step 和 evidence 不得删除；Plan `version + 1`；变更原因写入 `planHistory` 并发出 `plan_revised` 事件。新计划仍要通过与初始计划相同的结构和依赖校验。
+Planner 返回修订草案后，`reconcilePlan` 保持 Goal 原文，但只在 ID **和语义契约**都不变时继承状态：Step 要同时匹配标题、依赖与完成证据；验收条件要匹配描述。只复用 ID 会让已经改变含义的新步骤错误继承 completed/passed。Harness 随后把变更原因写入 `planHistory` 并发出 `plan_revised` 事件。新计划仍要通过与初始计划相同的结构和依赖校验。
 
 </Step>
 
@@ -238,7 +422,7 @@ WHILE run is active
     CONTINUE the loop
 
   IF final text exists
-    COMPLETE only when every acceptance criterion is passed
+    COMPLETE only when every step is completed and allCriteriaPassed(plan) is true
     OTHERWISE continue with the first unverified criterion
 
   STOP on cancellation, budget exhaustion, invalid output, or unrecoverable block
@@ -247,6 +431,10 @@ WHILE run is active
 模型请求中的计划摘要可以采用稳定格式：`[✓] completed`、`[→] in progress`、`[ ] pending`、`[!] blocked`。不要把所有历史版本都塞回上下文；当前版本进入 Prompt，旧版本留在审计日志中。
 
 </Step>
+
+</LessonPart>
+
+<LessonPart id="plan-verification" title="实验三：状态机测试与真实任务">
 
 <Step id="test-planning" number={7} title="测试计划状态机，而不是计划文案">
 
@@ -258,35 +446,277 @@ WHILE run is active
 4. 工具连续失败两次触发 `repeated_tool_failure`；
 5. 重规划保留 Goal、已完成 Step 和 evidence，并递增版本；
 6. 仍有未验证的 acceptance criterion 时，模型文本不能让 Loop 提前完成。
+7. Step 的标题、依赖或完成证据变化时，旧 completed 状态失效；
+8. 验收描述变化时，旧 passed 状态失效；
+9. 重复的 acceptance criterion ID 被拒绝。
 
 ```typescript
-it("advances only to a dependency-ready step", () => {
-  const plan = createPlanFixture();
+import { describe, expect, it } from "vitest";
 
-  expect(selectNextStep(plan)?.id).toBe("reproduce");
+import {
+  allCriteriaPassed,
+  completeStep,
+  reconcilePlan,
+  selectNextStep,
+  shouldReplan,
+  startStep,
+} from "../src/plan.js";
+import { validatePlan } from "../src/planner.js";
+import type { AcceptanceCriterion, PlanStep, TaskPlan } from "../src/types.js";
 
-  const running = startStep(plan, "reproduce");
-  const completed = completeStep(running, "reproduce", "login.test.ts fails with 401");
+function createPlanFixture(): TaskPlan {
+  return {
+    version: 1,
+    goal: "修复登录失败并运行测试",
+    acceptanceCriteria: [
+      {
+        id: "login-test-passes",
+        description: "登录测试通过",
+        status: "unverified",
+      },
+    ],
+    steps: [
+      {
+        id: "reproduce",
+        title: "复现登录失败",
+        status: "pending",
+        dependsOn: [],
+        completionEvidence: "保存失败测试输出",
+        evidence: [],
+      },
+      {
+        id: "diagnose",
+        title: "定位失败原因",
+        status: "pending",
+        dependsOn: ["reproduce"],
+        completionEvidence: "记录根因和相关代码位置",
+        evidence: [],
+      },
+    ],
+  };
+}
 
-  expect(selectNextStep(completed)?.id).toBe("diagnose");
-});
+describe("plan state machine", () => {
+  it("rejects a step whose dependency is unfinished", () => {
+    const plan = createPlanFixture();
 
-it("requires replanning after repeated tool failures", () => {
-  expect(
-    shouldReplan({
-      userChangedGoal: false,
-      failedAssumption: false,
-      consecutiveToolFailures: 2,
-      plan: createPlanFixture(),
-    }),
-  ).toBe("repeated_tool_failure");
+    expect(selectNextStep(plan)?.id).toBe("reproduce");
+    expect(() => startStep(plan, "diagnose")).toThrow("step is not ready");
+  });
+
+  it("prevents two steps from running at once", () => {
+    const running = startStep(createPlanFixture(), "reproduce");
+
+    expect(() => startStep(running, "diagnose")).toThrow(
+      "another plan step is already in progress",
+    );
+  });
+
+  it("requires evidence before completing a step", () => {
+    const running = startStep(createPlanFixture(), "reproduce");
+
+    expect(() => completeStep(running, "reproduce", "   ")).toThrow(
+      "completion evidence is required",
+    );
+  });
+
+  it("replans after repeated tool failures", () => {
+    expect(
+      shouldReplan({
+        userChangedGoal: false,
+        failedAssumption: false,
+        consecutiveToolFailures: 2,
+        plan: createPlanFixture(),
+      }),
+    ).toBe("repeated_tool_failure");
+  });
+
+  it("preserves completed work when replanning", () => {
+    const running = startStep(createPlanFixture(), "reproduce");
+    const completed = completeStep(
+      running,
+      "reproduce",
+      "login.test.ts fails with 401",
+    );
+    const revised = reconcilePlan(
+      completed,
+      {
+        acceptanceCriteria: [
+          { id: "login-test-passes", description: "登录测试通过" },
+        ],
+        steps: [
+          {
+            id: "reproduce",
+            title: "复现登录失败",
+            dependsOn: [],
+            completionEvidence: "保存失败测试输出",
+          },
+          {
+            id: "diagnose",
+            title: "检查认证服务返回值",
+            dependsOn: ["reproduce"],
+            completionEvidence: "记录根因和相关代码位置",
+          },
+        ],
+      },
+      "failed_assumption",
+    );
+
+    expect(revised.version).toBe(2);
+    expect(revised.goal).toBe(completed.goal);
+    expect(revised.steps[0]).toMatchObject({
+      id: "reproduce",
+      status: "completed",
+      evidence: ["login.test.ts fails with 401"],
+    });
+  });
+
+  it("invalidates completed work when the step contract changes", () => {
+    const running = startStep(createPlanFixture(), "reproduce");
+    const completed = completeStep(running, "reproduce", "saved failure output");
+    const revised = reconcilePlan(
+      completed,
+      {
+        acceptanceCriteria: [{ id: "login-test-passes", description: "登录测试通过" }],
+        steps: [
+          {
+            id: "reproduce",
+            title: "复现并定位登录失败",
+            dependsOn: [],
+            completionEvidence: "保存失败测试输出与根因",
+          },
+        ],
+      },
+      "failed_assumption",
+    );
+
+    expect(revised.steps[0]).toMatchObject({ status: "pending", evidence: [] });
+  });
+
+  it("invalidates passed criteria when their description changes", () => {
+    const current = createPlanFixture();
+    const criterion = current.acceptanceCriteria[0];
+    if (!criterion) throw new Error("fixture criterion missing");
+    current.acceptanceCriteria[0] = {
+      ...criterion,
+      status: "passed",
+      evidence: "old evidence",
+    };
+    const revised = reconcilePlan(
+      current,
+      {
+        acceptanceCriteria: [
+          { id: "login-test-passes", description: "登录和登出测试都通过" },
+        ],
+        steps: current.steps,
+      },
+      "new_constraint",
+    );
+
+    expect(revised.acceptanceCriteria[0]).toEqual({
+      id: "login-test-passes",
+      description: "登录和登出测试都通过",
+      status: "unverified",
+    });
+  });
+
+  it("rejects duplicate acceptance criterion ids", () => {
+    expect(() =>
+      validatePlan({
+        acceptanceCriteria: [
+          { id: "same", description: "first" },
+          { id: "same", description: "second" },
+        ],
+        steps: [
+          { id: "inspect", title: "Inspect", dependsOn: [], completionEvidence: "output" },
+        ],
+      }),
+    ).toThrow("duplicate acceptance criterion id");
+  });
+
+  it("rejects early completion while criteria remain unverified", () => {
+    const plan = createPlanFixture();
+    const unverified: TaskPlan = {
+      ...plan,
+      steps: plan.steps.map(
+        (step): PlanStep => ({ ...step, status: "completed" }),
+      ),
+    };
+
+    expect(allCriteriaPassed(unverified)).toBe(false);
+
+    const verified: TaskPlan = {
+      ...unverified,
+      acceptanceCriteria: unverified.acceptanceCriteria.map(
+        (criterion): AcceptanceCriterion => ({
+          ...criterion,
+          status: "passed",
+          evidence: "login.test.ts passed",
+        }),
+      ),
+    };
+
+    expect(allCriteriaPassed(verified)).toBe(true);
+  });
 });
 ```
 
+这九个测试分别验证依赖调度、互斥执行、证据门禁、重规划触发、语义状态协调、重复 ID 和任务完成门禁。它们不调用真实模型或真实工具，因此结果稳定，也能在 Agent Loop 接入模型之前定位 Harness 的状态错误。
+
 </Step>
 
-<Checkpoint command="pnpm typecheck && pnpm test">
+<Step id="verify-real-task" number={8} title="用贯穿教程的真实任务验收规划">
 
-先打印初始 Plan，确认每个 Step 都有依赖和完成证据。再让 Fake Planner 返回一次修订计划：已完成步骤应保持完成、版本从 1 变为 2，并产生 `plan_revised` 事件。最后模拟模型提前给出答案，确认 acceptance criteria 未全部通过时 Loop 仍继续运行。
+单元测试通过后，再使用第 00 章写入 `GOAL.md` 的真实工程任务。暂时把规划入口接到 `src/index.ts`：这里会调用真实模型，但只生成并打印计划，不会修改文件或执行命令。
+
+```typescript
+import { model } from "./model.js";
+import { createInitialPlan, createModelPlanCreator } from "./planner.js";
+
+const goal = process.argv.slice(2).join(" ").trim();
+if (!goal) throw new Error("请提供要规划的任务");
+const planner = createModelPlanCreator(model);
+const plan = await createInitialPlan(
+  goal,
+  "当前入口是 src/index.ts，现有测试是 tests/cli.test.ts。",
+  ["read_file", "apply_patch", "run_command"],
+  planner,
+);
+
+console.log(JSON.stringify({ goal, plan }, null, 2));
+```
+
+执行一次真实规划：
+
+```shell
+pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"
+```
+
+不要只检查“输出了 JSON”，要逐项验收输出内容：
+
+1. `plan.goal` 必须与命令中的任务原文完全一致；
+2. acceptance criteria 必须同时覆盖 `--name Lin` 的成功行为、缺少参数值的错误行为和现有 CLI 行为不回归；
+3. 第一个 Step 应先读取 `src/index.ts`、`tests/cli.test.ts` 和 `package.json`，不能直接假设实现；
+4. 修改 Step 必须依赖调查 Step，验证 Step 必须依赖修改和测试 Step；
+5. 每个 `completionEvidence` 都必须能由文件差异或命令输出证明，不能写“看起来正确”；
+6. 输出必须是 `version: 1`，所有 Step 是 `pending`，所有验收条件是 `unverified`。
+
+如果模型生成未知依赖、循环依赖、重复 ID 或空完成证据，`validatePlan` 应让命令失败。修正 Planner Prompt 或解析边界并重新运行，不要手工美化输出后假装通过。
+
+<Callout>
+
+这一步验证的是 Agent 对真实任务的规划能力：目标是否保持、步骤是否可执行、依赖是否合理、证据是否可检查。它还没有验证文件修改和命令执行；教程会在工具系统与 Agent Loop 完成后，用同一个任务做端到端验收。
+
+</Callout>
+
+</Step>
+
+</LessonPart>
+
+<Checkpoint command='pnpm typecheck && pnpm test -- tests/plan.test.ts && pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"'>
+
+在 `agent-from-scratch` 目录运行命令。终端应先显示 `tests/plan.test.ts`、`9 tests passed`，再打印真实任务的 `TaskPlan`，并以退出码 0 结束。用上面六条清单审查实际输出；任何一条不满足，本章都不能算通过。
+
+最后让 Fake Planner 修订计划，观察 `plan_revised` 事件中的版本为 2，并确认模型提前返回文本时，未通过的 acceptance criterion 会让 Loop 继续而不是结束任务。
 
 </Checkpoint>

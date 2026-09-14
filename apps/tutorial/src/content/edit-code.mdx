@@ -1,44 +1,110 @@
 <LessonOverview
-  outcome="Agent 能修改工作区文件，并且不会静默覆盖已经变化的内容。"
+  goal="Agent 能用局部补丁创建、更新或删除工作区文件，并用 hash 与单写者租约避免静默覆盖旧版本。"
+  task="让 Agent 把 README 第一行改成 # Hello Agent，并记录变更文件。"
   prerequisites="Agent 已经能够搜索和读取仓库文件。"
-  files={["src/tools/write-file.ts", "src/types.ts", "src/execute-tool.ts", "src/prompt.ts"]}
+  files={["src/tools/apply-patch.ts", "src/types.ts", "src/execute-tool.ts", "src/prompt.ts"]}
 />
 
-<Step id="write-file" number={1} title="实现带前置条件的写入工具">
+<Step id="write-file" number={1} title="实现带 hash 前置条件的补丁工具">
 
-创建 `src/tools/write-file.ts`。调用方必须同时提交它读取到的旧内容；文件已经变化时，写入会失败并要求重新读取。
+创建 `src/tools/apply-patch.ts`。不要把截断后的读取结果当作完整旧文件，也不要整文件替换；输入显式区分 `create`、`update` 和 `delete`，更新与删除必须携带完整文件的 SHA-256。
 
 ```typescript
-const inputSchema = z.object({
-  path: z.string().min(1),
-  expected: z.string(),
-  content: z.string(),
-});
+const inputSchema = z.discriminatedUnion("operation", [
+  z.object({ operation: z.literal("create"), path: z.string().min(1), content: z.string() }),
+  z.object({
+    operation: z.literal("update"),
+    path: z.string().min(1),
+    expectedSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    edits: z.array(z.object({ search: z.string().min(1), replace: z.string() })).min(1),
+  }),
+  z.object({
+    operation: z.literal("delete"),
+    path: z.string().min(1),
+    expectedSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+]);
 
-export const writeFileTool: Tool<z.infer<typeof inputSchema>, WriteResult> = {
-  name: "write_file",
-  description: "Replace a text file only when its current content matches expected",
+export const applyPatchTool: Tool<z.infer<typeof inputSchema>, PatchResult> = {
+  name: "apply_patch",
+  description: "Create, patch, or delete one workspace file under a hash precondition",
   schema: inputSchema,
   async execute(input, context) {
-    const path = resolveWorkspacePath(context.cwd, input.path);
-    const current = await readFile(path, "utf8");
-    if (current !== input.expected) throw new Error("file_changed");
-    await writeFile(path, input.content, "utf8");
-    return { path: input.path, bytes: Buffer.byteLength(input.content) };
+    return context.writeLease.runExclusive(input.path, async () => {
+      const path = await resolvePatchTarget(context.cwd, input.path, input.operation);
+      if (input.operation === "create") {
+        await writeFile(path, input.content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+        return { operation: "create", path: input.path, sha256: sha256(input.content) };
+      }
+
+      const current = await readFile(path, "utf8"); // never use truncated read_file output
+      if (sha256(current) !== input.expectedSha256) throw new Error("file_changed");
+
+      if (input.operation === "delete") {
+        await unlink(path);
+        return { operation: "delete", path: input.path };
+      }
+
+      const next = applyUniqueTextEdits(current, input.edits);
+      await atomicReplace(path, next, input.expectedSha256);
+      return { operation: "update", path: input.path, sha256: sha256(next) };
+    });
   },
 };
 ```
+
+`resolvePatchTarget` 对已有文件复用第 11 章的 `realpath` 检查；创建文件时真实解析父目录并拒绝符号链接逃逸：
+
+```typescript
+async function resolvePatchTarget(
+  cwd: string,
+  inputPath: string,
+  operation: "create" | "update" | "delete",
+): Promise<string> {
+  if (operation !== "create") return resolveExistingWorkspacePath(cwd, inputPath);
+
+  const root = await realpath(resolve(cwd));
+  const candidate = resolve(root, inputPath);
+  const realParent = await realpath(dirname(candidate));
+  assertInside(root, realParent);
+  return join(realParent, basename(candidate));
+}
+
+async function atomicReplace(path: string, content: string, expectedSha256: string): Promise<void> {
+  const temporary = join(dirname(path), `.agent-patch-${crypto.randomUUID()}.tmp`);
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+
+  if (sha256(await readFile(path, "utf8")) !== expectedSha256) {
+    await unlink(temporary);
+    throw new Error("file_changed");
+  }
+  await rename(temporary, path);
+  await fsyncDirectory(dirname(path));
+}
+```
+
+`applyUniqueTextEdits` 要求每个 `search` 在当前文本中恰好出现一次。`atomicReplace` 写入同目录临时文件、`fsync` 后再次核对目标 hash，再原子 rename。
+
+单写者租约保证所有 Harness 写入遵守同一临界区。普通 POSIX 文件 API 无法对不合作的外部编辑器提供真正的原子 compare-and-swap；若允许人与 Agent 同时编辑，仍需仓库级 lease、平台特定 CAS 或在 rename 前后检测 inode/hash 并把冲突交给人工处理，不能宣称绝对无竞态。
 
 </Step>
 
 <Step id="track-files" number={2} title="记录所有变更文件">
 
-给工具增加 `effect: "read" | "write" | "execute"`。当写入成功时，由 Harness 更新状态，而不是让每个工具自行修改全局状态。
+给工具增加 `effect: "read" | "write" | "execute"`。当补丁成功时，由 Harness 更新变更序号、文件 hash 和状态，而不是让工具自行修改全局状态。
 
 ```typescript
 if (tool.effect === "write" && observation.ok) {
   const path = getChangedPath(observation.output);
   if (!state.changedFiles.includes(path)) state.changedFiles.push(path);
+  state.mutationRevision += 1;
+  state.changedFileHashes[path] = observation.output.sha256 ?? "deleted";
 }
 ```
 
@@ -46,14 +112,14 @@ if (tool.effect === "write" && observation.ok) {
 
 <Step id="update-prompt" number={3} title="要求模型先读再写">
 
-创建 `src/prompt.ts`，加入确定的执行约束：修改前必须读取最新内容；改动保持最小；不编辑生成目录；写入失败后必须重新调查，不能反复提交旧内容。
+创建 `src/prompt.ts`，加入确定的执行约束：修改前读取完整内容与 hash；改动保持最小；不编辑生成目录；补丁冲突后重新调查，不能反复提交旧 hash。
 
 ```typescript
 export const instructions = [
-  "修改文件前先读取最新内容。",
+  "修改文件前读取完整内容并记录 SHA-256，不要用截断内容生成补丁。",
   "只修改完成任务所需的最小范围。",
   "不要编辑 node_modules、dist 或构建产物。",
-  "file_changed 后重新读取，不要重复同一调用。",
+  "file_changed 后重新读取，不要重复同一 hash 的调用。",
 ].join("\n");
 ```
 
@@ -61,6 +127,6 @@ export const instructions = [
 
 <Checkpoint command='pnpm dev -- "把 README 第一行改成 # Hello Agent"'>
 
-README 应发生一次可见变更，`state.changedFiles` 包含 `README.md`。随后手动修改文件再重放旧调用，应得到 `file_changed`，且手动内容仍然存在。
+README 应发生一次局部变更，`state.changedFiles` 包含 `README.md`，`mutationRevision` 增加。继续验证创建与删除各一个临时文件；再手动修改 README 并重放旧 hash，应得到 `file_changed`，且手动内容仍然存在。最后创建指向工作区外的目录符号链接，补丁必须被拒绝。
 
 </Checkpoint>

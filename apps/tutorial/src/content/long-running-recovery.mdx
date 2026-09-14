@@ -1,5 +1,6 @@
 <LessonOverview
-  outcome="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
+  goal="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
+  task="在工具副作用后注入崩溃，恢复同一 runId，并确保副作用只发生一次。"
   prerequisites="第 09 章已经能生成带事件范围与校验和的 CompactionSnapshot，Agent Loop 的每个重要状态转换都有事件。"
   files={["src/run-store.ts", "src/checkpoint.ts", "src/recovery.ts", "src/agent-loop.ts", "src/index.ts", "tests/recovery.test.ts"]}
 />
@@ -90,15 +91,23 @@ export interface RunCheckpoint {
 
 ```typescript
 export interface RunStore {
-  append(runId: string, expectedSequence: number, event: DurableEvent): Promise<EventRecord>;
-  loadCheckpoint(runId: string): Promise<RunCheckpoint | undefined>;
-  saveCheckpoint(checkpoint: RunCheckpoint): Promise<void>;
+  append(input: {
+    runId: string;
+    expectedSequence: number;
+    ownerId: string;
+    epoch: number;
+    event: DurableEvent;
+  }): Promise<EventRecord>;
+  loadCheckpointHistory(runId: string, limit: number): Promise<RunCheckpoint[]>;
+  saveCheckpoint(checkpoint: RunCheckpoint, lease: RunLease): Promise<void>;
   readEvents(runId: string, afterSequence: number): Promise<EventRecord[]>;
   acquireLease(runId: string, ownerId: string, ttlMs: number): Promise<RunLease>;
+  renewLease(lease: RunLease, ttlMs: number): Promise<RunLease>;
+  releaseLease(lease: RunLease): Promise<void>;
 }
 ```
 
-本地文件实现不能直接覆盖 `checkpoint.json`。应写入同目录临时文件、刷新内容、原子 rename，再刷新目录：
+本地文件实现不能只覆盖唯一的 `checkpoint.json`，否则损坏后没有可回退版本。将每版写到 `checkpoints/<throughSequence>.json`，完成 fsync 后原子更新只含 `current` 与 `previous` 的 manifest，并至少保留最后两个已校验版本。单个 checkpoint 的原子写入如下：
 
 ```typescript
 export async function atomicWriteJson(path: string, value: unknown): Promise<void> {
@@ -123,9 +132,9 @@ export async function atomicWriteJson(path: string, value: unknown): Promise<voi
 }
 ```
 
-事件先落盘，状态机再应用事件，最后异步或按边界写 checkpoint。即使 checkpoint 写到一半崩溃，恢复器也能读取上一个完整 checkpoint 并重放后续事件。
+事件先落盘，状态机再应用事件，最后异步或按边界写 checkpoint。即使最新 checkpoint 损坏，`loadCheckpointHistory` 仍能返回上一份完整版本并重放后续事件。
 
-`expectedSequence` 是乐观并发控制。另一个进程已经追加事件时，本次 append 必须失败；不要让两个 Loop 同时推进同一个 run。
+`expectedSequence` 防止事件交错，`ownerId + epoch` 则提供 fencing。Store 的每一次 append 与 checkpoint 保存都必须在事务边界比较当前 lease；旧 worker 即使暂停后重新运行，也会因 epoch 过期被拒绝。外部系统未必理解本地 epoch，因此其副作用仍必须依靠幂等键或事后 verifier，不能把 lease 当成跨系统事务。
 
 </Step>
 
@@ -139,21 +148,25 @@ export async function executeDurably(options: {
   call: PersistedToolCall;
   tool: ToolDefinition;
   store: RunStore;
+  lease: RunLease;
 }): Promise<string> {
   const idempotencyKey = `${options.state.runId}:${options.call.callId}`;
-  await options.store.append(options.state.runId, nextSequence(options.state), {
-    type: "tool_intent",
-    call: options.call,
-    idempotencyKey,
+  await options.store.append({
+    runId: options.state.runId,
+    expectedSequence: nextSequence(options.state),
+    ownerId: options.lease.ownerId,
+    epoch: options.lease.epoch,
+    event: { type: "tool_intent", call: options.call, idempotencyKey },
   });
 
   const output = await options.tool.execute(options.call.arguments, { idempotencyKey });
 
-  await options.store.append(options.state.runId, nextSequence(options.state), {
-    type: "tool_result",
-    callId: options.call.callId,
-    idempotencyKey,
-    output,
+  await options.store.append({
+    runId: options.state.runId,
+    expectedSequence: nextSequence(options.state),
+    ownerId: options.lease.ownerId,
+    epoch: options.lease.epoch,
+    event: { type: "tool_result", callId: options.call.callId, idempotencyKey, output },
   });
   return output;
 }
@@ -175,7 +188,7 @@ export type RecoveryPolicy =
 
 <Step id="restore-and-replay" number={5} title="校验 Checkpoint 并重放后续事件">
 
-恢复器先拿 lease，再加载与验证记录：
+恢复器先拿 lease，再从新到旧选择第一份 checksum 和 schema 都有效的 checkpoint，随后重放事件：
 
 ```typescript
 export async function restoreRun(options: {
@@ -184,11 +197,12 @@ export async function restoreRun(options: {
   store: RunStore;
 }): Promise<{ state: DurableAgentState; lease: RunLease; inFlight: PersistedToolCall[] }> {
   const lease = await options.store.acquireLease(options.runId, options.ownerId, 30_000);
-  const checkpoint = await options.store.loadCheckpoint(options.runId);
-  if (!checkpoint) throw new Error("checkpoint_not_found");
-  verifyCheckpointChecksum(checkpoint);
+  const checkpointHistory = await options.store.loadCheckpointHistory(options.runId, 2);
+  const checkpoint = firstValidCheckpoint(checkpointHistory);
+  if (!checkpoint) throw new Error("no_valid_checkpoint");
 
   let state = migrateCheckpoint(checkpoint).state;
+  const eventsThroughCheckpoint = await options.store.readEvents(options.runId, 0);
   const records = await options.store.readEvents(options.runId, checkpoint.throughSequence);
   assertContiguousSequences(records, checkpoint.throughSequence + 1);
 
@@ -200,12 +214,15 @@ export async function restoreRun(options: {
   return {
     state,
     lease,
-    inFlight: findToolIntentsWithoutResults(records),
+    inFlight: findToolIntentsWithoutResults([
+      ...eventsThroughCheckpoint.filter((record) => record.sequence <= checkpoint.throughSequence),
+      ...records,
+    ]),
   };
 }
 ```
 
-事件 reducer 必须是纯函数；对同一 checkpoint 与事件序列重复执行，结果必须完全一致。遇到 sequence 缺口、重复但内容不同的 event、checksum 错误或未知 schema 时停止恢复并保留原文件供调查。
+事件 reducer 必须是纯函数；对同一 checkpoint 与事件序列重复执行，结果必须完全一致。这里从完整事件历史计算未配对的 `tool_intent`，因此不会漏掉已经包含进 checkpoint、但尚无 `tool_result` 的调用。更高效的实现可以把 open intents 作为 checkpoint 的权威字段，但仍要用事件回放测试它。遇到 sequence 缺口、重复但内容不同的 event、所有 checkpoint 都损坏或未知 schema 时停止恢复并保留原文件供调查。
 
 Checkpoint 的 `cwd` 也需要重新验证：路径存在、仓库身份匹配、关键基线 hash 没有意外漂移。环境漂移不代表一定失败，但必须转成显式 observation，触发重新调查或计划修订。
 

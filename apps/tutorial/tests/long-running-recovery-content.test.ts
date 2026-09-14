@@ -32,6 +32,9 @@ describe("long-running recovery lesson", () => {
       "acquireLease",
       "resumeAgentRun",
       "fsync",
+      "loadCheckpointHistory",
+      "lease.epoch",
+      "eventsThroughCheckpoint",
     ]) {
       expect(source).toContain(marker);
     }
