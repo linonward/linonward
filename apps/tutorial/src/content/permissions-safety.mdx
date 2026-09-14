@@ -23,25 +23,66 @@ export interface Tool<Input, Output> {
 
 </Step>
 
-<Step id="authorize" number={2} title="在执行前应用授权策略">
+<Step id="authorize" number={2} title="按参数与资源应用授权策略">
 
-创建 `src/policy.ts`。首版允许读取和工作区写入，只允许白名单命令，拒绝所有外部副作用。
+创建 `src/policy.ts`。策略输入必须包含已经通过 schema 校验的参数与运行上下文；只看工具名或 `effect` 无法判断实际目标。决策包含允许、拒绝和等待人工批准三种状态。
 
 ```typescript
-export function authorize(tool: Tool<unknown, unknown>): PolicyDecision {
-  if (tool.effect === "external") {
-    return { type: "deny", reason: "external_effect_not_allowed" };
+export type PolicyDecision =
+  | { type: "allow"; scope: string }
+  | { type: "deny"; reason: string }
+  | { type: "ask"; request: ApprovalRequest };
+
+export interface ApprovalRequest {
+  id: string;
+  actionDigest: string;
+  summary: string;
+  risks: string[];
+  expiresAt: string;
+}
+
+export function authorize(tool, input, context): PolicyDecision {
+  if (tool.effect === "read" || tool.effect === "write") {
+    return authorizeWorkspacePath(tool, input, context.realWorkspaceRoot);
   }
 
-  if (tool.effect === "execute" && tool.name !== "run_command") {
-    return { type: "deny", reason: "command_not_allowed" };
+  if (tool.name === "run_command") {
+    const argv = [input.command, ...input.args];
+    const exactMatch = context.allowedArgv.some((allowedArgv) => arraysEqual(argv, allowedArgv));
+    if (!exactMatch) return { type: "deny", reason: "argv_not_allowed" };
+    return {
+      type: "ask",
+      request: createApprovalRequest({ tool, input, cwd: context.cwd, network: false }),
+    };
   }
 
-  return { type: "allow" };
+  if (tool.effect === "external" || context.network !== "disabled") {
+    return { type: "deny", reason: "network_or_external_effect_not_allowed" };
+  }
+
+  return { type: "deny", reason: "no_matching_policy" };
 }
 ```
 
-把 `authorize` 放在参数校验之后、工具执行之前。拒绝结果作为 observation 返回模型，并记录到运行轨迹。
+`pnpm`、`node` 与项目脚本都能执行任意代码并访问网络，所以“程序名在白名单”不是安全边界。示例默认关闭执行进程的 network，并只匹配 Harness 从验证计划生成的完整 `allowedArgv`；即使完全匹配，也进入 `ask`，向操作者显示 cwd、完整参数、影响和风险。`network: "disabled"` 只是策略输入，不会自动隔离进程；Executor 必须在真正禁网的容器或 OS sandbox 中启动命令。若部署环境无法提供该隔离，策略应拒绝运行不可信仓库代码。
+
+把 `authorize(tool, input, context)` 放在参数校验之后、工具执行之前。`deny` 转为 observation；`ask` 则持久化 `ApprovalRequest`、把运行置为 `waiting` 并停止执行。批准凭证必须绑定 `actionDigest = hash(tool + canonical input + cwd + network policy)`、一次性使用且有过期时间；恢复后若参数改变，必须重新请求，不能复用旧批准。
+
+```typescript
+const decision = authorize(tool, input, context);
+if (decision.type === "deny") return observation("policy_denied", decision.reason);
+if (decision.type === "ask") {
+  const grant = await store.consumeApprovalGrant(state.runId, decision.request.actionDigest);
+  if (!grant) {
+    await store.saveApprovalRequest(state.runId, decision.request);
+    return wait(state, "approval_required", decision.request.id);
+  }
+}
+
+return executeInSandbox(tool, input, { network: "disabled" });
+```
+
+`consumeApprovalGrant` 必须在一个事务中检查 digest、过期时间和未使用状态，然后立即标记已消费。CLI 或 UI 收到 `ApprovalRequest` 后由人明确批准或拒绝；Harness 恢复 `waiting` 运行时再次走同一授权入口。
 
 </Step>
 
@@ -53,12 +94,12 @@ export function authorize(tool: Tool<unknown, unknown>): PolicyDecision {
 pnpm dev -- "给 CLI 增加 --name 参数，并补充测试。先调查现有实现，完成后运行最窄相关检查并汇报证据。"
 ```
 
-观察运行轨迹，确认它按顺序完成调查、修改、验证和汇报。最终回答至少列出修改文件、运行命令、退出结果和未解决风险。
+观察运行轨迹，确认它按顺序完成调查、修改、请求命令批准、验证和汇报。批准界面必须展示完整 argv，最终回答至少列出修改文件、运行命令、退出结果和未解决风险。
 
 </Step>
 
 <Checkpoint command="pnpm typecheck && pnpm test">
 
-同时执行三个负向验收：读取工作区外文件必须失败；请求外部副作用必须被拒绝；把 `maxSteps` 设为 `1` 时必须以明确的预算原因停止。三项都满足后，这个 Agent 才达到教程定义的“可用”。
+同时执行五个负向验收：读取工作区外或符号链接逃逸文件必须失败；未列入 `allowedArgv` 的参数必须被拒绝；允许的验证命令在人工批准前不能启动；请求网络或外部副作用必须被拒绝；把 `maxSteps` 设为 `1` 时必须以明确的预算原因停止。五项都满足后，这个 Agent 才达到教程定义的“可用”。
 
 </Checkpoint>

@@ -39,7 +39,16 @@ Harness
 
 <Step id="verify-toolchain" number={2} title="确认本地工具链">
 
-先检查运行时和包管理器版本。教程只使用 pnpm，不混用 npm、Yarn 或 Bun。
+先检查运行时和包管理器版本。教程只使用 pnpm，不混用 npm、Yarn 或 Bun。如果尚未安装，先从 [Node.js 下载页](https://nodejs.org/en/download) 安装 Node 24，或用 fnm、Volta 等版本管理器固定项目版本；随后启用项目声明的 pnpm：
+
+```shell
+fnm install 24
+fnm use 24
+corepack enable
+corepack prepare pnpm@12.4.1 --activate
+```
+
+不使用 fnm 时只需替换前两条，最终版本检查相同。
 
 ```shell
 node --version
@@ -58,7 +67,7 @@ pnpm --version
 mkdir agent-from-scratch
 cd agent-from-scratch
 pnpm init
-pnpm add -D typescript tsx @types/node vitest
+pnpm add -D typescript@6.0.3 tsx@4.21.0 @types/node@24.10.4 vitest@5.0.0
 mkdir src tests
 ```
 
@@ -83,10 +92,10 @@ mkdir src tests
     "check": "pnpm typecheck && pnpm test"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "tsx": "latest",
-    "typescript": "latest",
-    "vitest": "latest"
+    "@types/node": "24.10.4",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3",
+    "vitest": "5.0.0"
   }
 }
 ```

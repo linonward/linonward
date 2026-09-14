@@ -3,7 +3,8 @@ import type { ReactNode } from "react";
 
 import { chapters, getChapterNeighbors, type Chapter, tutorialGoal } from "@/lib/chapters";
 
-import { ArrowIcon, BookIcon, MenuIcon } from "./icons";
+import { ArrowIcon, BookIcon } from "./icons";
+import { MobileNavigation } from "./mobile-navigation";
 
 interface TutorialShellProps {
   chapter: Chapter;
@@ -20,8 +21,11 @@ function ChapterLinks({ activeSlug }: { activeSlug: string }) {
           href={`/${item.slug}`}
           key={item.slug}
         >
-          <span>{item.number}</span>
-          {item.label}
+          <span className="chapter-link__number">{item.number}</span>
+          <span className="chapter-link__text">
+            <strong>{item.label}</strong>
+            <small>{item.minutes} 分钟</small>
+          </span>
         </Link>
       ))}
     </nav>
@@ -36,14 +40,9 @@ export function TutorialShell({ chapter, children }: TutorialShellProps) {
   return (
     <div className="tutorial-shell">
       <header className="tutorial-header">
-        <details className="mobile-menu">
-          <summary aria-label="打开章节导航">
-            <MenuIcon />
-          </summary>
-          <div className="mobile-menu__panel">
-            <ChapterLinks activeSlug={chapter.slug} />
-          </div>
-        </details>
+        <MobileNavigation>
+          <ChapterLinks activeSlug={chapter.slug} />
+        </MobileNavigation>
 
         <Link className="tutorial-brand" href="/start">
           <BookIcon />
@@ -54,16 +53,16 @@ export function TutorialShell({ chapter, children }: TutorialShellProps) {
         </Link>
 
         <div
-          aria-label={`阅读进度：第 ${chapterIndex + 1} 章，共 ${chapters.length} 章`}
-          className="reading-progress"
+          aria-label={`章节位置：第 ${chapterIndex + 1} 章，共 ${chapters.length} 章`}
+          className="chapter-position"
         >
-          <div className="reading-progress__label">
+          <div className="chapter-position__label">
+            <span>章节</span>
             <span>
               {chapterIndex + 1} / {chapters.length}
             </span>
-            <span>{Math.round(progress)}%</span>
           </div>
-          <div className="reading-progress__track">
+          <div aria-hidden="true" className="chapter-position__track">
             <span style={{ width: `${progress}%` }} />
           </div>
         </div>
@@ -75,15 +74,34 @@ export function TutorialShell({ chapter, children }: TutorialShellProps) {
 
       <main className="tutorial-main">
         <article className="tutorial-article">
-          <aside className="tutorial-goal">
-            <span>教程整体目标</span>
-            <p>{tutorialGoal}</p>
-          </aside>
+          {chapter.slug === "start" ? (
+            <aside className="tutorial-goal">
+              <span>教程整体目标</span>
+              <p>{tutorialGoal}</p>
+            </aside>
+          ) : (
+            <details className="tutorial-goal tutorial-goal--compact">
+              <summary>教程整体目标</summary>
+              <p>{tutorialGoal}</p>
+            </details>
+          )}
           <header className="article-header">
             <span className="article-number">{chapter.number}</span>
             <h1>{chapter.title}</h1>
             <p>{chapter.description}</p>
+            <small className="article-meta">预计 {chapter.minutes} 分钟</small>
           </header>
+
+          <details className="mobile-toc">
+            <summary>本页目录</summary>
+            <nav aria-label="移动端本页目录">
+              {chapter.toc.map((item) => (
+                <a href={`#${item.id}`} key={item.id}>
+                  {item.title}
+                </a>
+              ))}
+            </nav>
+          </details>
 
           <div className="mdx-content">{children}</div>
 

@@ -55,6 +55,7 @@ export interface ModelDriver {
   continue(options: {
     previousResponseId: string;
     instructions: string;
+    continuationContext: ModelRequest["input"];
     outputs: FunctionCallOutput[];
     tools: ReturnType<ToolRegistry["definitions"]>;
   }): Promise<ModelTurn>;
@@ -74,7 +75,18 @@ export interface AgentLoopOptions {
 }
 ```
 
-这里选择用 `previous_response_id` 维护模型侧的多轮状态。根据 [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)，续轮的 `instructions` 不会自动继承，所以 `continue` 明确要求再次传入它。如果使用 `store: false` 或零数据保留模式，则要改为在应用侧保存并回传所需的 response output items。
+这里选择用 `previous_response_id` 维护模型侧的历史，但它不能代替本轮 Assemble。根据 [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)，续轮的 `instructions` 不会自动继承，所以 `continue` 明确再次传入它；同时把新组装的 `continuationContext` 作为新的 developer input，与 `function_call_output` 一起发送。
+
+```typescript
+await client.responses.create({
+  previous_response_id: options.previousResponseId,
+  instructions: options.instructions,
+  input: [...options.outputs, ...options.continuationContext],
+  tools: options.tools,
+});
+```
+
+如果使用 `store: false` 或零数据保留模式，则改为在应用侧保存并回传所需的 response output items。无论采用哪种历史传输方式，当前计划、激活 Skill、上下文来源和 Harness feedback 都必须在每轮重新发送。
 
 </Step>
 
@@ -191,6 +203,8 @@ export async function runAgentLoop(
         ? await options.model.continue({
             previousResponseId,
             instructions: request.instructions,
+            // Harness feedback and current plan are sent on every continuation.
+            continuationContext: request.input,
             outputs: pendingOutputs,
             tools: toolDefinitions,
           })
@@ -328,7 +342,7 @@ function stop(
 }
 ```
 
-注意三个细节：`buildModelRequest` 必须在循环内执行，才能带上新的计划状态与 observation；工具失败仍由 `executeToolCall` 编码成 observation，Planner 可以据此修订计划；模型 API 自身失败属于 `model_error`，Loop 直接停止，重试策略应封装在 Model Adapter 内部。
+注意三个细节：`buildModelRequest` 必须在循环内执行，且续轮必须传入 `request.input`，才能真正带上新的计划状态、Skill、Harness feedback 与 observation；当前批次的大型工具输出只通过 `function_call_output` 发送一次，动态上下文保留其索引与摘要，避免重复占用预算；模型 API 自身失败属于 `model_error`，Loop 直接停止，重试策略应封装在 Model Adapter 内部。
 
 </Step>
 
@@ -392,17 +406,18 @@ it("runs model → tool → observation → model → final", async () => {
           call_id: "call-1",
         }),
       ],
+      continuationContext: expect.anything(),
     }),
   );
 });
 ```
 
-继续补充：纯文本提前完成被拒绝、计划无 ready Step、证据不足、计划修订、空输出、模型异常、取消、模型轮次耗尽、工具预算不足、工具错误后恢复，以及一轮多个工具调用。测试断言计划状态、事件和停止原因，不断言模型内部思考。
+再断言 `continuationContext` 包含工具执行后更新的计划、激活 Skill 与 Harness feedback。继续补充：纯文本提前完成被拒绝、计划无 ready Step、证据不足、计划修订、空输出、模型异常、取消、模型轮次耗尽、工具预算不足、工具错误后恢复，以及一轮多个工具调用。测试断言计划状态、事件和停止原因，不断言模型内部思考。
 
 </Step>
 
 <Checkpoint command="pnpm typecheck && pnpm test">
 
-运行 Fake Model 测试，确认成功轨迹严格为 `model → tool → model`，续轮携带原始 `responseId`、重复的系统 Prompt，以及原 `call_id` 对应的 `function_call_output`。把 `maxSteps` 和 `maxToolCalls` 分别设为 0，两个测试应得到不同的停止原因。
+运行 Fake Model 测试，确认成功轨迹严格为 `model → tool → model`，续轮携带原始 `responseId`、重复的系统 Prompt、新 Assemble 的动态上下文，以及原 `call_id` 对应的 `function_call_output`。把 `maxSteps` 和 `maxToolCalls` 分别设为 0，两个测试应得到不同的停止原因。
 
 </Checkpoint>

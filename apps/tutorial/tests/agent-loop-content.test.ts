@@ -25,5 +25,8 @@ describe("agent loop lesson", () => {
     expect(source).toContain("discoverSkills");
     expect(source).toContain("skillCatalogAsContextSource");
     expect(source).toContain("activeSkills");
+    expect(source).toContain("continuationContext");
+    expect(source).toContain("request.input");
+    expect(source).toContain("Harness feedback and current plan are sent on every continuation");
   });
 });

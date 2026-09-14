@@ -24,6 +24,8 @@ const child = spawn(input.command, input.args, {
 
 收集退出码、stdout 和 stderr，并把总输出限制在 20,000 个字符。截断必须显式标记。
 
+这一章只建立“无 Shell 的执行机制”和证据绑定，不宣称 `pnpm` 或 `node` 本身安全；二者都能运行任意代码。暂时不要把该工具暴露给不可信任务，第 14 章会加入参数级策略、人工批准和真正的进程隔离。
+
 </Step>
 
 <Step id="record-validation" number={2} title="把成功命令记为验证证据">
@@ -32,14 +34,33 @@ const child = spawn(input.command, input.args, {
 
 ```typescript
 export interface ValidationRecord {
+  id: string;
   command: string;
+  args: string[];
   exitCode: number;
   durationMs: number;
   status: "passed" | "failed";
+  validatedRevision: number;
+  changedFileHashes: Record<string, string>;
+  criterionIds: string[];
 }
 ```
 
-Harness 在 `run_command` 返回后追加记录；失败结果也要保存，因为模型需要据此修正。
+每次成功补丁都令 `state.mutationRevision += 1`。Harness 只能从计划中的验证规格创建命令，并在命令结束时记录当前 revision、重新计算的文件 hash 和它覆盖的验收条件；模型不能把任意成功命令自行标成证据。失败结果也要保存，因为模型需要据此修正。
+
+```typescript
+const record: ValidationRecord = {
+  id: crypto.randomUUID(),
+  command: spec.command,
+  args: spec.args,
+  exitCode: result.exitCode,
+  durationMs: result.durationMs,
+  status: result.exitCode === 0 ? "passed" : "failed",
+  validatedRevision: state.mutationRevision,
+  changedFileHashes: await hashChangedFiles(state.changedFiles),
+  criterionIds: spec.criterionIds,
+};
+```
 
 </Step>
 
@@ -48,21 +69,35 @@ Harness 在 `run_command` 返回后追加记录；失败结果也要保存，因
 创建 `src/completion.ts`。当模型给出最终回答时先执行检查，不满足条件就把反馈作为 observation 送回循环。
 
 ```typescript
-export function checkCompletion(state: AgentState): string | undefined {
+export async function checkCompletion(state: AgentState): Promise<string | undefined> {
   if (state.changedFiles.length === 0) return undefined;
 
-  const latest = state.validations.at(-1);
-  if (!latest) return "已经修改文件，但还没有运行验证。";
-  if (latest.status === "failed") return "最近一次验证失败，请继续修复。";
+  const required = requiredValidationCriteria(state.plan);
+  const currentHashes = await hashChangedFiles(state.changedFiles);
+  if (!hashesEqual(currentHashes, state.changedFileHashes)) {
+    return "工作区在最后一次受控补丁后发生变化，请重新调查并验证。";
+  }
+  for (const criterionId of required) {
+    const evidence = state.validations.findLast(
+      (record) =>
+        record.status === "passed" &&
+        record.validatedRevision === state.mutationRevision &&
+        record.criterionIds.includes(criterionId) &&
+        hashesEqual(record.changedFileHashes, currentHashes),
+    );
+    if (!evidence) return `当前修改版本缺少验收证据：${criterionId}`;
+  }
 
   return undefined;
 }
 ```
 
+这里校验的是“当前磁盘内容与当前修改版本的相关命令”，不是“历史上最后一条命令成功”。成功测试后再次写文件会推进 `mutationRevision`，旧记录立即失效；受控写入之外的文件漂移也会被重新计算的 hash 拒绝；`node --version` 之类没有绑定 `criterionIds` 的成功命令不能满足门禁。若 Git 可用，可额外记录 `HEAD` 与 dirty diff hash，但不能只记录 `HEAD`，因为未提交修改不会改变 revision。
+
 </Step>
 
 <Checkpoint command='pnpm dev -- "给示例函数补一个失败测试并修复实现"'>
 
-轨迹中必须出现写入、失败验证、再次写入和成功验证。删除最终验证步骤后重跑，Harness 应拒绝模型的完成声明。
+轨迹中必须出现写入、失败验证、再次写入和成功验证。再覆盖两个回归场景：成功验证后再次修改文件，完成声明应被拒绝；运行一个无关但成功的命令，不应满足任何 `requiredValidationCriteria`。只有重新运行绑定当前 revision、当前文件 hash 和对应 criterion ID 的检查后才能完成。
 
 </Checkpoint>

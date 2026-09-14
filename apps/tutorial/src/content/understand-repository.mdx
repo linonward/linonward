@@ -7,22 +7,29 @@
 
 <Step id="safe-path" number={1} title="限制所有路径在工作区内">
 
-创建 `src/workspace.ts`。每个文件工具都必须先经过这个函数。
+创建 `src/workspace.ts`。只比较 `resolve()` 后的字符串挡不住工作区内的符号链接指向外部；读取已有对象时必须比较 `realpath()` 后的真实路径。
 
 ```typescript
-import { resolve, sep } from "node:path";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
-export function resolveWorkspacePath(cwd: string, input: string): string {
-  const root = resolve(cwd);
-  const target = resolve(root, input);
-
-  if (target !== root && !target.startsWith(root + sep)) {
+export function assertInside(root: string, target: string): void {
+  const pathFromRoot = relative(root, target);
+  if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
     throw new Error("path_outside_workspace");
   }
+}
+
+export async function resolveExistingWorkspacePath(cwd: string, input: string): Promise<string> {
+  const root = await realpath(resolve(cwd));
+  const target = await realpath(resolve(root, input));
+  assertInside(root, target);
 
   return target;
 }
 ```
+
+这里先解析目标，再检查它与真实工作区根目录的相对关系。因此 `workspace/link -> /tmp/secret` 会被拒绝。不存在的新文件不能直接 `realpath`；第 12 章会真实解析父目录、拒绝符号链接父级，再创建文件。
 
 </Step>
 
@@ -38,7 +45,7 @@ export const readFileTool: Tool<z.infer<typeof inputSchema>, ReadResult> = {
   description: "Read one UTF-8 text file inside the workspace",
   schema: inputSchema,
   async execute(input, context) {
-    const path = resolveWorkspacePath(context.cwd, input.path);
+    const path = await resolveExistingWorkspacePath(context.cwd, input.path);
     const content = await readFile(path, "utf8");
     const limit = 20_000;
     return { content: content.slice(0, limit), truncated: content.length > limit };
@@ -54,9 +61,31 @@ export const readFileTool: Tool<z.infer<typeof inputSchema>, ReadResult> = {
 
 ```typescript
 const inputSchema = z.object({ query: z.string().min(1) });
-const args = ["-n", "--max-count", "50", "--glob", "!node_modules/**", input.query, "."];
-const child = spawn("rg", args, { cwd: context.cwd, shell: false });
+const args = [
+  "-n",
+  "--fixed-strings",
+  "--max-count",
+  "50",
+  "--glob",
+  "!.git/**",
+  "--glob",
+  "!node_modules/**",
+  "--glob",
+  "!dist/**",
+  "--glob",
+  "!build/**",
+  "--glob",
+  "!.next/**",
+  "--",
+  input.query,
+  ".",
+];
+const cwd = await realpath(context.cwd);
+const child = spawn("rg", args, { cwd, shell: false });
+const matches = await collectLines(child.stdout, 50, () => child.kill("SIGTERM"));
 ```
+
+`--` 明确结束选项解析，所以 `-g`、`--help` 之类的查询不会被当成 ripgrep 参数。`--max-count` 是“每个文件”的上限，不是全局上限，因此 Executor 仍要在收集到 50 行后停止子进程并标记结果被截断。Glob 必须与正文承诺逐项一致；新增构建目录时，同时更新代码与测试。
 
 </Step>
 
@@ -74,6 +103,6 @@ tools.register(readFileTool);
 
 <Checkpoint command='pnpm dev -- "package.json 中使用了哪个包管理器？"'>
 
-轨迹中应先出现 `search_text` 或 `read_file`，最终答案必须来自真实文件。再请求读取 `../outside.txt`，应得到 `path_outside_workspace`。
+轨迹中应先出现 `search_text` 或 `read_file`，最终答案必须来自真实文件。再做三个负向测试：读取 `../outside.txt`；读取工作区内指向外部的符号链接；搜索 `--help`。前两项应得到 `path_outside_workspace`，第三项只能搜索字面文本，且结果不能包含 `.git`、`node_modules`、`dist`、`build` 或 `.next`。
 
 </Checkpoint>

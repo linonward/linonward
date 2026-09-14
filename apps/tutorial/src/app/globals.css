@@ -107,14 +107,14 @@ summary {
   display: none;
 }
 
-.reading-progress {
+.chapter-position {
   width: min(260px, calc(100% - 40px));
   grid-column: 2;
   grid-row: 1;
   justify-self: center;
 }
 
-.reading-progress__label {
+.chapter-position__label {
   display: flex;
   justify-content: center;
   gap: 8px;
@@ -125,14 +125,14 @@ summary {
   line-height: 1;
 }
 
-.reading-progress__track {
+.chapter-position__track {
   height: 4px;
   overflow: hidden;
   border-radius: 999px;
   background: #e6eaf0;
 }
 
-.reading-progress__track span {
+.chapter-position__track span {
   display: block;
   height: 100%;
   border-radius: inherit;
@@ -181,7 +181,7 @@ summary {
     color 140ms ease;
 }
 
-.chapter-link > span {
+.chapter-link__number {
   color: var(--subtle);
   font-family: var(--mono);
   font-size: 12px;
@@ -210,8 +210,27 @@ summary {
   content: "";
 }
 
-.chapter-link[aria-current="page"] > span {
+.chapter-link[aria-current="page"] .chapter-link__number {
   color: var(--accent);
+}
+
+.chapter-link__text {
+  display: grid;
+  min-width: 0;
+}
+
+.chapter-link__text strong {
+  overflow: hidden;
+  font-size: inherit;
+  font-weight: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapter-link__text small {
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 500;
 }
 
 .tutorial-main {
@@ -245,6 +264,22 @@ summary {
   line-height: 1.6;
 }
 
+.tutorial-goal--compact {
+  padding-block: 5px;
+}
+
+.tutorial-goal--compact summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.tutorial-goal--compact p {
+  margin-top: 8px;
+  font-weight: 540;
+}
+
 .article-header {
   padding-bottom: 30px;
   border-bottom: 1px solid var(--line);
@@ -268,6 +303,18 @@ summary {
   color: var(--muted);
   font-size: 19px;
   line-height: 1.7;
+}
+
+.article-meta {
+  display: inline-block;
+  margin-top: 12px;
+  color: var(--subtle);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.mobile-toc {
+  display: none;
 }
 
 .mdx-content {
@@ -374,6 +421,33 @@ summary {
 
 .lesson-step {
   margin-top: 50px;
+}
+
+.lesson-part {
+  margin: 30px 0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+
+.lesson-part > summary {
+  cursor: pointer;
+  padding: 16px 20px;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.lesson-part[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.lesson-part__content {
+  padding: 0 20px 24px;
+}
+
+.lesson-part__content .lesson-step:first-child {
+  margin-top: 30px;
 }
 
 .lesson-step > h2 {
@@ -743,6 +817,41 @@ summary {
   .toc-sidebar {
     display: none;
   }
+
+  .mobile-toc {
+    position: sticky;
+    z-index: 10;
+    top: calc(var(--header-height) + 8px);
+    display: block;
+    margin: 20px 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: color-mix(in srgb, white 96%, transparent);
+    box-shadow: 0 8px 20px rgb(18 35 61 / 6%);
+    backdrop-filter: blur(10px);
+  }
+
+  .mobile-toc summary {
+    cursor: pointer;
+    padding: 10px 14px;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 680;
+  }
+
+  .mobile-toc nav {
+    display: grid;
+    max-height: 52vh;
+    overflow-y: auto;
+    border-top: 1px solid var(--line);
+    padding: 8px;
+  }
+
+  .mobile-toc a {
+    padding: 7px 8px;
+    color: var(--muted);
+    font-size: 13px;
+  }
 }
 
 @media (max-width: 760px) {
@@ -817,18 +926,18 @@ summary {
     font-weight: 760;
   }
 
-  .reading-progress {
+  .chapter-position {
     width: 72px;
     grid-column: 3;
     justify-self: end;
   }
 
-  .reading-progress__label {
+  .chapter-position__label {
     justify-content: flex-start;
     font-size: 11px;
   }
 
-  .reading-progress__label span:last-child {
+  .chapter-position__label span:first-child {
     display: none;
   }
 
@@ -841,6 +950,15 @@ summary {
     width: auto;
     margin: 0;
     padding: 42px 20px 46px;
+  }
+
+  .tutorial-goal--compact {
+    margin-bottom: 18px;
+  }
+
+  .lesson-part__content {
+    padding-right: 14px;
+    padding-left: 14px;
   }
 
   .article-header {

@@ -29,6 +29,10 @@ describe("context compaction lesson", () => {
       "rawTail",
       "sourceEventRange",
       "responses.compact",
+      "snapshot.goal !== state.task",
+      "assertCriteriaEqual",
+      "assertCompletedWorkEqual",
+      "selectRawTailBoundary",
     ]) {
       expect(source).toContain(marker);
     }

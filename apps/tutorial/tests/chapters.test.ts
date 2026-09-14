@@ -29,6 +29,13 @@ describe("chapter catalog", () => {
     ]);
   });
 
+  it("provides unique anchors and an estimated duration for every chapter", () => {
+    for (const chapter of chapters) {
+      expect(chapter.minutes).toBeGreaterThan(0);
+      expect(new Set(chapter.toc.map((item) => item.id)).size).toBe(chapter.toc.length);
+    }
+  });
+
   it("returns the previous and next chapters", () => {
     expect(getChapterNeighbors("agent-loop")).toEqual({
       previous: expect.objectContaining({ slug: "progressive-skills" }),

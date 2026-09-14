@@ -59,6 +59,22 @@ export function Step({ children, id, number, title }: StepProps) {
   );
 }
 
+interface LessonPartProps {
+  children: ReactNode;
+  id: string;
+  open?: boolean;
+  title: string;
+}
+
+export function LessonPart({ children, id, open = false, title }: LessonPartProps) {
+  return (
+    <details className="lesson-part" open={open}>
+      <summary id={id}>{title}</summary>
+      <div className="lesson-part__content">{children}</div>
+    </details>
+  );
+}
+
 interface CheckpointProps {
   children: ReactNode;
   command: string;

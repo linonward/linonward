@@ -156,10 +156,10 @@ export function validateCompaction(
   state: AgentState,
   events: AgentEvent[],
 ): void {
-  const criterionIds = new Set(snapshot.acceptanceCriteria.map((criterion) => criterion.id));
-  for (const criterion of state.plan.acceptanceCriteria) {
-    if (!criterionIds.has(criterion.id)) throw new Error(`missing criterion: ${criterion.id}`);
-  }
+  if (snapshot.goal !== state.task) throw new Error("snapshot goal changed");
+  assertStringSetEqual(snapshot.constraints, state.constraints, "constraints");
+  assertCriteriaEqual(snapshot.acceptanceCriteria, state.plan.acceptanceCriteria);
+  assertCompletedWorkEqual(snapshot.completedWork, state.plan.steps);
 
   const pendingIds = new Set(snapshot.pendingWork.map((step) => step.stepId));
   for (const step of state.plan.steps.filter((step) => step.status !== "completed")) {
@@ -170,9 +170,19 @@ export function validateCompaction(
     if (!snapshot.changedFiles.includes(file)) throw new Error(`missing changed file: ${file}`);
   }
 
+  assertStringSetEqual(snapshot.activeSkills, Object.keys(state.skills.activeSkills), "skills");
+  assertStringSetEqual(snapshot.failedAttempts, state.failedAttempts, "failed attempts");
+
   for (const decision of snapshot.decisions) {
     for (const eventId of decision.evidenceEventIds) {
-      if (!events.some((event) => event.id === eventId)) {
+      if (
+        !events.some(
+          (event) =>
+            event.id === eventId &&
+            event.sequence >= snapshot.sourceEventRange.from &&
+            event.sequence <= snapshot.sourceEventRange.to,
+        )
+      ) {
         throw new Error(`unknown evidence event: ${eventId}`);
       }
     }
@@ -182,7 +192,27 @@ export function validateCompaction(
     throw new Error("empty compaction range");
   }
 }
+
+function assertCriteriaEqual(
+  actual: AcceptanceCriterion[],
+  expected: AcceptanceCriterion[],
+): void {
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error("acceptance criteria changed during compaction");
+  }
+}
+
+function assertCompletedWorkEqual(actual: CompactionSnapshot["completedWork"], steps: PlanStep[]): void {
+  const expected = steps
+    .filter((step) => step.status === "completed")
+    .map((step) => ({ stepId: step.id, evidence: step.evidence }));
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error("completed work changed during compaction");
+  }
+}
 ```
+
+`assertCriteriaEqual` 逐项比较 ID、description、status 与 evidence；`assertCompletedWorkEqual` 要求每个 completed Step 的 ID 和证据完全一致，并拒绝摘要凭空增加完成项。`validationResults`、未解决问题与决定证据也应按同样方式对照权威事件投影。只核对“ID 存在”不等于 verified。
 
 校验失败时保留原上下文并发出 `compaction_rejected`，不能使用一个“差不多”的摘要继续。连续失败时停止并报告原因，让操作者扩大预算、拆分任务或修复 Compactor。
 
@@ -203,13 +233,32 @@ export function projectCompactedContext(options: {
   events: AgentEvent[];
   rawTailSize: number;
 }): CompactedContext {
-  const afterSnapshot = options.events.filter(
-    (event) => event.sequence > options.snapshot.sourceEventRange.to,
+  const rawTailBoundary = selectRawTailBoundary(
+    options.events,
+    options.snapshot,
+    options.rawTailSize,
   );
   return {
     snapshot: options.snapshot,
-    rawTail: afterSnapshot.slice(-options.rawTailSize),
+    rawTail: options.events.filter((event) => event.sequence >= rawTailBoundary),
   };
+}
+
+function selectRawTailBoundary(
+  events: AgentEvent[],
+  snapshot: CompactionSnapshot,
+  rawTailSize: number,
+): number {
+  const lastN = events.at(-rawTailSize)?.sequence ?? snapshot.sourceEventRange.from;
+  const currentStep = events.findLast((event) => event.type === "step_started")?.sequence;
+  const lastUserInput = events.findLast((event) => event.type === "user_input")?.sequence;
+  const lastToolBatch = events.findLast((event) => event.type === "tool_batch_started")?.sequence;
+  return Math.min(
+    lastN,
+    ...[currentStep, lastUserInput, lastToolBatch].filter(
+      (sequence): sequence is number => sequence !== undefined,
+    ),
+  );
 }
 
 export function compactionAsContextSources(context: CompactedContext): ContextSource[] {
@@ -226,7 +275,7 @@ export function compactionAsContextSources(context: CompactedContext): ContextSo
 }
 ```
 
-`rawTail` 不是固定取“最后 N 条消息”就结束：至少要覆盖当前 Step 开始后的事件、最近一个完整工具批次和最后一次用户输入。体积仍过大时，优先把大型工具输出存成 artifact，只在上下文里保留路径、hash、截取范围和结论。
+`selectRawTailBoundary` 从“最近 N 条”“当前 Step 开始”“最后一次用户输入”“最近完整工具批次开始”四个边界中选择最早者。因此即使快照覆盖到最新事件，`rawTail` 仍会与快照末尾有一小段有意重叠，而不是错误地变成空数组。体积仍过大时，优先把大型工具输出存成 artifact，只在上下文里保留路径、hash、截取范围和结论。
 
 </Step>
 

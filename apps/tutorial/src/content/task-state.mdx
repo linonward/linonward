@@ -1,8 +1,8 @@
 <LessonOverview
-  goal="把一次模型请求升级成具有明确状态、上下文来源和停止原因的任务运行。"
-  task="运行“检查 package.json”，为它生成唯一 runId 和可审计 AgentState。"
+  goal="把一次模型请求升级成具有合法状态转换、不变量、事件序号和停止原因的可审计任务运行。"
+  task="运行“检查 package.json”，并分别验证任务完成、失败与阻塞的状态路径。"
   prerequisites="第 02 章已经能够组装系统 Prompt 与动态上下文。"
-  files={["src/types.ts", "src/state.ts", "src/index.ts"]}
+  files={["src/types.ts", "src/state.ts", "src/index.ts", "tests/state.test.ts"]}
 />
 
 <Step id="define-messages" number={1} title="定义消息与步骤">
@@ -19,6 +19,13 @@ export interface AgentStep {
   number: number;
   kind: "model" | "tool";
   summary: string;
+}
+
+export interface AgentEvent {
+  sequence: number;
+  recordedAt: string;
+  type: "run_started" | "status_changed" | "model_completed" | "tool_completed";
+  detail: string;
 }
 ```
 
@@ -41,6 +48,9 @@ export interface AgentState {
   steps: AgentStep[];
   changedFiles: string[];
   validations: string[];
+  events: AgentEvent[];
+  nextEventSequence: number;
+  stopReason: string | undefined;
 }
 ```
 
@@ -65,6 +75,11 @@ export function createInitialState(task: string, cwd: string): AgentState {
     steps: [],
     changedFiles: [],
     validations: [],
+    events: [
+      { sequence: 1, recordedAt: new Date().toISOString(), type: "run_started", detail: task },
+    ],
+    nextEventSequence: 2,
+    stopReason: undefined,
   };
 }
 ```
@@ -73,8 +88,73 @@ export function createInitialState(task: string, cwd: string): AgentState {
 
 </Step>
 
-<Checkpoint command='pnpm dev -- "检查 package.json"'>
+<Step id="enforce-transitions" number={4} title="用状态机执行合法转换">
 
-终端应先输出唯一的 `runId`，随后打印模型回复。连续运行两次时，两个 `runId` 必须不同。
+不要在各处分散写 `state.status = ...`。创建唯一转换入口，明确哪些边可以走，并在同一操作中追加带单调序号和时间戳的事件。
+
+```typescript
+const allowedTransitions: Record<AgentState["status"], AgentState["status"][]> = {
+  running: ["completed", "failed", "blocked"],
+  blocked: ["running", "failed"],
+  completed: [],
+  failed: [],
+};
+
+export function transitionState(
+  state: AgentState,
+  next: AgentState["status"],
+  reason: string,
+  now = new Date(),
+): AgentState {
+  if (!allowedTransitions[state.status].includes(next)) {
+    throw new Error(`invalid state transition: ${state.status} -> ${next}`);
+  }
+  if ((next === "completed" || next === "failed" || next === "blocked") && !reason.trim()) {
+    throw new Error("terminal transition requires a reason");
+  }
+
+  return {
+    ...state,
+    status: next,
+    stopReason: next === "running" ? undefined : reason,
+    events: [
+      ...state.events,
+      {
+        sequence: state.nextEventSequence,
+        recordedAt: now.toISOString(),
+        type: "status_changed",
+        detail: `${state.status} -> ${next}: ${reason}`,
+      },
+    ],
+    nextEventSequence: state.nextEventSequence + 1,
+  };
+}
+```
+
+本章的状态机只管理运行生命周期；第 04 章把 `TaskPlan` 嵌入同一个 `AgentState`，计划步骤状态不能反向覆盖运行状态。最终完成还要在后续章节加入验收证据门禁。
+
+</Step>
+
+<Step id="test-state-machine" number={5} title="测试成功、失败和阻塞路径">
+
+创建 `tests/state.test.ts`，固定时间并验证：`running → completed`、`running → failed`、`running → blocked → running`；终态不能恢复；空停止原因被拒绝；每次转换的 sequence 严格递增且 `recordedAt` 可解析。测试的是公开状态转换，不是 UUID 实现。
+
+```typescript
+it("records a blocked and resumed run without losing audit order", () => {
+  const initial = createInitialState("检查 package.json", "/workspace");
+  const blocked = transitionState(initial, "blocked", "approval_required", fixedTime);
+  const resumed = transitionState(blocked, "running", "approval_granted", laterTime);
+
+  expect(resumed.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+  expect(resumed.status).toBe("running");
+  expect(resumed.stopReason).toBeUndefined();
+});
+```
+
+</Step>
+
+<Checkpoint command='pnpm test -- tests/state.test.ts && pnpm dev -- "检查 package.json"'>
+
+状态机测试应覆盖完成、失败、阻塞、恢复与非法转换；终端随后输出唯一 `runId` 和模型回复。连续运行两次时 `runId` 不同，但每次运行内部的事件 sequence 都从 1 开始并连续递增。
 
 </Checkpoint>

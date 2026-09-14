@@ -39,7 +39,7 @@ export interface AcceptanceCriterion {
     expect(source).toContain("expect(revised.version).toBe(2)");
     expect(source).toContain("expect(allCriteriaPassed(unverified)).toBe(false)");
     expect(source).toContain("pnpm typecheck && pnpm test -- tests/plan.test.ts");
-    expect(source).toContain("6 tests passed");
+    expect(source).toContain("9 tests passed");
   });
 
   it("verifies planning with the tutorial's real engineering task", () => {
@@ -50,5 +50,12 @@ export interface AcceptanceCriterion {
     expect(source).toContain("`plan.goal` 必须与命令中的任务原文完全一致");
     expect(source).toContain("这一步验证的是 Agent 对真实任务的规划能力");
     expect(source).toContain("还没有验证文件修改和命令执行");
+  });
+
+  it("invalidates changed plan semantics and rejects duplicate ids", () => {
+    expect(source).toContain("duplicate acceptance criterion id");
+    expect(source).toContain("sameStepContract");
+    expect(source).toContain("sameCriterionContract");
+    expect(source).toContain("<LessonPart");
   });
 });

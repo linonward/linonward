@@ -1,14 +1,14 @@
 <LessonOverview
-  goal="CLI 会把用户任务发送给模型，并打印真实回复。"
-  task="让 CLI 把“只回复：模型已连接”发送给真实模型并打印回复。"
-  prerequisites="已经完成第 00 章，并准备好可用的 OpenAI API Key 与模型 ID。"
-  files={["package.json", ".env", ".gitignore", "src/model.ts", "src/index.ts"]}
+  goal="CLI 能通过同一 Model 接口运行确定性的离线 Fake Model，并可选择连接真实模型。"
+  task="先离线验证“只回复：模型已连接”，再选择是否用真实 API 重跑。"
+  prerequisites="已经完成第 00 章；真实 API Key 仅用于可选的在线验证。"
+  files={["package.json", ".env", ".gitignore", "src/model.ts", "src/fake-model.ts", "src/index.ts", "tests/model.test.ts"]}
 />
 
 <Step id="install-sdk" number={1} title="安装 OpenAI SDK">
 
 ```shell
-pnpm add openai
+pnpm add openai@7.15.0
 ```
 
 SDK 只存在于模型适配器中。Harness 不会直接依赖它。
@@ -17,7 +17,9 @@ SDK 只存在于模型适配器中。Harness 不会直接依赖它。
 
 <Step id="configure-env" number={2} title="配置本地环境">
 
-创建 `.env`，填写你账号可用的模型 ID。不要把 API Key 写进源码或提交到 Git。
+真实调用按 token 计费，具体价格和可用模型会随账号与时间变化；运行前查看 [OpenAI API Pricing](https://openai.com/api/pricing/)，设置项目预算与用量告警。模型能力要求是：支持文本生成、结构化输出和 function calling，并有足够的上下文窗口。本教程不要求某个固定模型 ID，学习阶段优先选择支持这些能力的低成本模型。
+
+如果要进行在线验证，创建 `.env` 并填写账号可用的模型 ID。不要把 API Key 写进源码或提交到 Git。
 
 ```dotenv
 OPENAI_API_KEY=your-local-key
@@ -81,8 +83,30 @@ export const model: Model = {
 
 </Step>
 
-<Checkpoint command='pnpm dev -- "只回复：模型已连接"'>
+<Step id="run-fake-model" number={5} title="先用 Fake Model 离线验证">
 
-应看到模型返回的文本，且 `pnpm typecheck` 通过。若返回鉴权错误，先检查本地 `.env`，不要绕过错误继续下一章。
+创建 `src/fake-model.ts`。Fake Model 是确定性的系统边界替身，不读取 API Key、不访问网络，也不产生费用。
+
+```typescript
+import type { Model } from "./model.js";
+
+export class FakeModel implements Model {
+  constructor(private readonly replies: string[]) {}
+
+  async generate(_input: string): Promise<string> {
+    const reply = this.replies.shift();
+    if (!reply) throw new Error("fake_model_has_no_reply");
+    return reply;
+  }
+}
+```
+
+在 `tests/model.test.ts` 注入 `new FakeModel(["模型已连接"])`，断言输入经过相同 Model 接口并得到固定回复。CLI 可用 `MODEL_MODE=fake` 选择它；只有显式设置 `MODEL_MODE=openai` 时才创建 SDK Client。这样没有 Key、网络不稳定或控制成本时，也能完成本章并继续学习 Harness。
+
+</Step>
+
+<Checkpoint command='pnpm test -- tests/model.test.ts && MODEL_MODE=fake pnpm dev -- "只回复：模型已连接"'>
+
+离线路径必须稳定输出“模型已连接”并通过类型检查。若你配置了 Key，再执行 `MODEL_MODE=openai pnpm dev -- "只回复：模型已连接"` 做可选在线检查；记录所用模型和 usage，不把在线调用成功作为进入下一章的硬门槛。
 
 </Checkpoint>

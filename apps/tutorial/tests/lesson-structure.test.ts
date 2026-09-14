@@ -47,5 +47,15 @@ describe("step-by-step lessons", () => {
     expect(source).toContain("权限");
     expect(source).toContain("证据");
     expect(source).toContain("停止条件");
+    expect(source).not.toContain('"latest"');
+  });
+
+  it("provides a reproducible offline path before requiring a paid model call", () => {
+    const source = readFileSync(`${contentDirectory}/model-call.mdx`, "utf8");
+
+    expect(source).toContain("FakeModel");
+    expect(source).toContain("离线");
+    expect(source).toContain("费用");
+    expect(source).toContain("能力要求");
   });
 });
