@@ -24,15 +24,23 @@ const child = spawn(input.command, input.args, {
 
 收集退出码、stdout 和 stderr，并把总输出限制在 20,000 个字符。截断必须显式标记。
 
-这一章只建立“无 Shell 的执行机制”和证据绑定，不宣称 `pnpm` 或 `node` 本身安全；二者都能运行任意代码。暂时不要把该工具暴露给不可信任务，第 14 章会加入参数级策略、人工批准和真正的进程隔离。
+这一章只建立“无 Shell 的执行机制”和证据绑定，不宣称 `pnpm` 或 `node` 本身安全；二者都能运行任意代码。暂时不要把该工具暴露给不可信任务；完成任务状态升级后，权限章会加入参数级策略、人工批准和真正的进程隔离。
 
 </Step>
 
 <Step id="record-validation" number={2} title="把成功命令记为验证证据">
 
-给状态增加结构化验证记录。只有退出码为 `0` 的命令才能成为成功证据。
+完整任务状态会在下一章统一建模；本章先在 Harness 内维护一个最小 `RunLedger`，只记录变更版本、文件 hash 和验证结果。只有退出码为 `0` 的命令才能成为成功证据。
 
 ```typescript
+export interface RunLedger {
+  changedFiles: string[];
+  changedFileHashes: Record<string, string>;
+  mutationRevision: number;
+  validations: ValidationRecord[];
+  requiredCriterionIds: string[];
+}
+
 export interface ValidationRecord {
   id: string;
   command: string;
@@ -46,7 +54,7 @@ export interface ValidationRecord {
 }
 ```
 
-每次成功补丁都令 `state.mutationRevision += 1`。Harness 只能从计划中的验证规格创建命令，并在命令结束时记录当前 revision、重新计算的文件 hash 和它覆盖的验收条件；模型不能把任意成功命令自行标成证据。失败结果也要保存，因为模型需要据此修正。
+每次成功补丁都令 `ledger.mutationRevision += 1`。Harness 只能从验证规格创建命令，并在命令结束时记录当前 revision、重新计算的文件 hash 和它覆盖的验收条件；模型不能把任意成功命令自行标成证据。失败结果也要保存，因为模型需要据此修正。下一章会把 `RunLedger` 字段合并进 `AgentState`，而不是维护两份事实源。
 
 ```typescript
 const record: ValidationRecord = {
@@ -56,8 +64,8 @@ const record: ValidationRecord = {
   exitCode: result.exitCode,
   durationMs: result.durationMs,
   status: result.exitCode === 0 ? "passed" : "failed",
-  validatedRevision: state.mutationRevision,
-  changedFileHashes: await hashChangedFiles(state.changedFiles),
+  validatedRevision: ledger.mutationRevision,
+  changedFileHashes: await hashChangedFiles(ledger.changedFiles),
   criterionIds: spec.criterionIds,
 };
 ```
@@ -69,15 +77,14 @@ const record: ValidationRecord = {
 创建 `src/completion.ts`。当模型给出最终回答时先执行检查，不满足条件就把反馈作为 observation 送回循环。
 
 ```typescript
-export async function checkCompletion(state: AgentState): Promise<string | undefined> {
+export async function checkCompletion(state: RunLedger): Promise<string | undefined> {
   if (state.changedFiles.length === 0) return undefined;
 
-  const required = requiredValidationCriteria(state.plan);
   const currentHashes = await hashChangedFiles(state.changedFiles);
   if (!hashesEqual(currentHashes, state.changedFileHashes)) {
     return "工作区在最后一次受控补丁后发生变化，请重新调查并验证。";
   }
-  for (const criterionId of required) {
+  for (const criterionId of state.requiredCriterionIds) {
     const evidence = state.validations.findLast(
       (record) =>
         record.status === "passed" &&
@@ -91,6 +98,8 @@ export async function checkCompletion(state: AgentState): Promise<string | undef
   return undefined;
 }
 ```
+
+此时 `requiredCriterionIds` 由 CLI 根据本章任务显式给出，例如 `tests` 与 `typecheck`。规划章会把它升级为从验收条件生成，但验证门禁本身不依赖尚未实现的 Planner。
 
 这里校验的是“当前磁盘内容与当前修改版本的相关命令”，不是“历史上最后一条命令成功”。成功测试后再次写文件会推进 `mutationRevision`，旧记录立即失效；受控写入之外的文件漂移也会被重新计算的 hash 拒绝；`node --version` 之类没有绑定 `criterionIds` 的成功命令不能满足门禁。若 Git 可用，可额外记录 `HEAD` 与 dirty diff hash，但不能只记录 `HEAD`，因为未提交修改不会改变 revision。
 

@@ -1,7 +1,7 @@
 <LessonOverview
   goal="实现一条可验证的上下文压缩链路：在安全边界生成结构化快照，保留最近原始事件，并让 Agent Loop 在上下文耗尽前继续工作。"
   task="压缩包含 200 条 observation 的运行，并证明目标、计划和证据没有丢失。"
-  prerequisites="第 08 章已经有完整 Agent Loop，能够在每轮重新组装 ContextSource 并记录模型、工具、计划与 Skill 事件。"
+  prerequisites="完整 Agent Loop 已经接入 Trace 与评测，能够在每轮重新组装 ContextSource 并记录模型、工具、计划与 Skill 事件。"
   files={["src/compaction.ts", "src/context.ts", "src/types.ts", "src/agent-loop.ts", "tests/compaction.test.ts"]}
 />
 
@@ -26,7 +26,7 @@ export interface CompactionSnapshot {
   acceptanceCriteria: AcceptanceCriterion[];
   activeSkills: string[];
   changedFiles: string[];
-  validationResults: string[];
+  validationResults: ValidationRecord[];
   unresolvedQuestions: string[];
   failedAttempts: string[];
   checksum: string;
@@ -42,7 +42,13 @@ export interface AgentState {
   // 保留 runId、task、plan、messages、contextSources、skills、steps 等字段
   compaction: CompactionState;
 }
+
+export interface ContextKindMap {
+  compaction_snapshot: true;
+}
 ```
+
+把 `compaction` 加到 `src/types.ts` 的状态，在 `createInitialState` 中初始化为 `{ snapshots: [], compactedThroughEvent: 0 }`；把来源种类加到 `src/context.ts`。不要让完整 Loop 在第一次读取 `state.compaction` 时才发现字段不存在。
 
 以下内容必须从权威状态重新注入，不能交给摘要模型自由改写：系统安全规则、用户原始目标、当前 `TaskPlan`、验收条件状态、权限决定、未完成工具调用以及 Harness 的预算与停止规则。
 
@@ -71,10 +77,20 @@ export function shouldCompact(usage: ContextUsage): boolean {
   return usage.estimatedInputTokens >= trigger;
 }
 
-export function isSafeCompactionBoundary(state: AgentState): boolean {
-  return state.pendingToolCalls.length === 0 && state.pendingOutputs.length === 0;
+export function isSafeCompactionBoundary(input: {
+  status: AgentState["status"];
+  pendingToolCallCount: number;
+  pendingOutputCount: number;
+}): boolean {
+  return (
+    input.status === "running" &&
+    input.pendingToolCallCount === 0 &&
+    input.pendingOutputCount === 0
+  );
 }
 ```
+
+`pendingToolCallCount` 与 `pendingOutputCount` 由 Loop 当前批次显式传入；它们不是前面从未加入 `AgentState` 的隐含字段。恢复章会用 durable tool intent 记录跨进程的 in-flight 状态。
 
 `0.8` 是 Harness 的保守策略，不是模型的固定限制。生产环境应使用模型暴露的上下文窗口和真实 token counter；没有精确 tokenizer 时，估算器必须倾向高估，并记录估算值与实际 usage 的偏差。
 
@@ -104,6 +120,7 @@ export async function buildCompactionSnapshot(options: {
   events: AgentEvent[];
   compactor: Compactor;
 }): Promise<CompactionSnapshot> {
+  if (!options.state.plan) throw new Error("cannot compact before plan initialization");
   const from = options.state.compaction.compactedThroughEvent + 1;
   const to = options.events.at(-1)?.sequence ?? from - 1;
   const draft = await options.compactor.compact({
@@ -157,6 +174,7 @@ export function validateCompaction(
   events: AgentEvent[],
 ): void {
   if (snapshot.goal !== state.task) throw new Error("snapshot goal changed");
+  if (!state.plan) throw new Error("cannot validate compaction without a plan");
   assertStringSetEqual(snapshot.constraints, state.constraints, "constraints");
   assertCriteriaEqual(snapshot.acceptanceCriteria, state.plan.acceptanceCriteria);
   assertCompletedWorkEqual(snapshot.completedWork, state.plan.steps);
@@ -172,13 +190,18 @@ export function validateCompaction(
 
   assertStringSetEqual(snapshot.activeSkills, Object.keys(state.skills.activeSkills), "skills");
   assertStringSetEqual(snapshot.failedAttempts, state.failedAttempts, "failed attempts");
+  if (canonicalJson(snapshot.validationResults) !== canonicalJson(state.validations)) {
+    throw new Error("validation evidence changed during compaction");
+  }
+  const unresolvedQuestions = state.pendingUserInput ? [state.pendingUserInput.question] : [];
+  assertStringSetEqual(snapshot.unresolvedQuestions, unresolvedQuestions, "unresolved questions");
 
   for (const decision of snapshot.decisions) {
     for (const eventId of decision.evidenceEventIds) {
       if (
         !events.some(
           (event) =>
-            event.id === eventId &&
+            event.eventId === eventId &&
             event.sequence >= snapshot.sourceEventRange.from &&
             event.sequence <= snapshot.sourceEventRange.to,
         )
@@ -288,11 +311,21 @@ export async function maybeCompactContext(options: {
   state: AgentState;
   events: AgentEvent[];
   usage: ContextUsage;
+  pendingToolCallCount: number;
+  pendingOutputCount: number;
   compactor: Compactor;
   emit: (event: AgentEventInput) => Promise<void>;
 }): Promise<void> {
   if (!shouldCompact(options.usage)) return;
-  if (!isSafeCompactionBoundary(options.state)) return;
+  if (
+    !isSafeCompactionBoundary({
+      status: options.state.status,
+      pendingToolCallCount: options.pendingToolCallCount,
+      pendingOutputCount: options.pendingOutputCount,
+    })
+  ) {
+    return;
+  }
 
   await options.emit({ type: "compaction_started", through: options.events.at(-1)?.sequence ?? 0 });
   const snapshot = await buildCompactionSnapshot(options);

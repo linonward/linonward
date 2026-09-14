@@ -2,7 +2,7 @@
   goal="CLI 能通过同一 Model 接口运行确定性的离线 Fake Model，并可选择连接真实模型。"
   task="先离线验证“只回复：模型已连接”，再选择是否用真实 API 重跑。"
   prerequisites="已经完成第 00 章；真实 API Key 仅用于可选的在线验证。"
-  files={["package.json", ".env", ".gitignore", "src/model.ts", "src/fake-model.ts", "src/index.ts", "tests/model.test.ts"]}
+  files={["package.json", ".env", ".gitignore", "src/model.ts", "src/fake-model.ts", "src/model-factory.ts", "src/index.ts", "tests/model.test.ts"]}
 />
 
 <Step id="install-sdk" number={1} title="安装 OpenAI SDK">
@@ -69,16 +69,26 @@ console.log(await askModel(task));
 
 <Step id="extract-port" number={4} title="抽出最小 Model 接口">
 
-把函数包装成接口，为后面的假模型测试和提供商替换留下边界。
+用下面内容替换 `src/model.ts` 的临时实现，为后面的假模型测试和提供商替换留下边界。Client 只能在选择真实模式后创建，不能留在模块顶层，否则 Fake 模式仅仅 import 工厂也可能要求 API Key。
 
 ```typescript
+import OpenAI from "openai";
+
 export interface Model {
   generate(input: string): Promise<string>;
 }
 
-export const model: Model = {
-  generate: askModel,
-};
+export function createOpenAIModel(): Model {
+  const client = new OpenAI();
+  return {
+    async generate(input) {
+      const model = process.env.OPENAI_MODEL;
+      if (!model) throw new Error("缺少 OPENAI_MODEL");
+      const response = await client.responses.create({ model, input });
+      return response.output_text;
+    },
+  };
+}
 ```
 
 </Step>
@@ -101,7 +111,21 @@ export class FakeModel implements Model {
 }
 ```
 
-在 `tests/model.test.ts` 注入 `new FakeModel(["模型已连接"])`，断言输入经过相同 Model 接口并得到固定回复。CLI 可用 `MODEL_MODE=fake` 选择它；只有显式设置 `MODEL_MODE=openai` 时才创建 SDK Client。这样没有 Key、网络不稳定或控制成本时，也能完成本章并继续学习 Harness。
+最后在 `src/model-factory.ts` 建立唯一装配入口，避免 CLI 只描述 `MODEL_MODE` 却没有真正实现分支：
+
+```typescript
+import { FakeModel } from "./fake-model.js";
+import { createOpenAIModel, type Model } from "./model.js";
+
+export function createModel(fakeReplies: string[] = ["模型已连接"]): Model {
+  const mode = process.env.MODEL_MODE ?? "fake";
+  if (mode === "fake") return new FakeModel(fakeReplies);
+  if (mode === "openai") return createOpenAIModel();
+  throw new Error(`不支持的 MODEL_MODE: ${mode}`);
+}
+```
+
+`src/index.ts` 调用 `createModel()`，再把任务交给返回的接口。只有 `MODEL_MODE=openai` 才走真实适配器；默认离线路径不读取 Key、不访问网络。在 `tests/model.test.ts` 注入 `new FakeModel(["模型已连接"])`，断言输入经过相同 Model 接口并得到固定回复。
 
 </Step>
 

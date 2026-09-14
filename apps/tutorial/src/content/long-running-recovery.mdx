@@ -1,7 +1,7 @@
 <LessonOverview
   goal="让 Agent 在进程崩溃、机器重启或部署切换后，从最后一个一致状态恢复，并避免重复执行有副作用的工具。"
   task="在工具副作用后注入崩溃，恢复同一 runId，并确保副作用只发生一次。"
-  prerequisites="第 09 章已经能生成带事件范围与校验和的 CompactionSnapshot，Agent Loop 的每个重要状态转换都有事件。"
+  prerequisites="上一章已经能生成带事件范围与校验和的 CompactionSnapshot，Agent Loop 的每个重要状态转换都有事件；下一章将用故障注入统一验收恢复链路。"
   files={["src/run-store.ts", "src/checkpoint.ts", "src/recovery.ts", "src/agent-loop.ts", "src/index.ts", "tests/recovery.test.ts"]}
 />
 
@@ -18,29 +18,48 @@ export interface DurableAgentState {
   runId: string;
   task: string;
   cwd: string;
-  status: "running" | "waiting" | "completed" | "failed";
+  status: AgentState["status"];
   plan: TaskPlan;
-  activeStepId?: string;
+  activeStepId?: string | undefined;
+  planHistory: AgentState["planHistory"];
   messages: AgentMessage[];
   contextSources: PersistedContextSource[];
   skills: PersistedSkillState;
   compaction: CompactionState;
   changedFiles: string[];
-  counters: { modelSteps: number; toolCalls: number };
-  providerCursor?: { provider: string; model: string; previousResponseId: string };
+  changedFileHashes: Record<string, string>;
+  mutationRevision: number;
+  validations: ValidationRecord[];
+  requiredCriterionIds: string[];
+  budget: AgentBudget;
+  pendingUserInput?: UserInputRequest | undefined;
+  goalVersion: number;
+  constraints: string[];
+  failedAttempts: string[];
+  events: AgentEvent[];
+  nextEventSequence: number;
+  stopReason: string | undefined;
+  providerCursor?:
+    | { provider: string; model: string; previousResponseId: string }
+    | undefined;
 }
 
 export interface AgentRuntime {
-  model: ModelDriver;
+  model: ModelDriver & {
+    canResume?(cursor: DurableAgentState["providerCursor"]): Promise<boolean>;
+  };
   planner: Planner;
   tools: ToolRegistry;
+  trace: TraceSink;
   store: RunStore;
   clock: Clock;
+  skillsDirectory: string;
+  toolTimeoutMs: number;
   signal?: AbortSignal;
 }
 ```
 
-持久化 `providerCursor` 只是优化提示。恢复时必须确认 Provider、模型、保留策略和游标仍兼容；否则从应用快照、权威任务状态与原始尾部启动一个新 response。`previous_response_id` 不能替代事件日志，因为它不保存你的本地文件状态、计划事务和工具副作用。
+`budget` 保存上限和已消费计数，恢复时不能重置；验证记录必须和 `mutationRevision`、文件 hash 一起恢复，不能只保留文件名。`pendingUserInput` 与 waiting 状态也必须成对存在。持久化 `providerCursor` 只是优化提示。恢复时必须确认 Provider、模型、保留策略和游标仍兼容；否则从应用快照、权威任务状态与原始尾部启动一个新 response。`previous_response_id` 不能替代事件日志，因为它不保存你的本地文件状态、计划事务和工具副作用。
 
 Secret 永远只保存引用，例如 `credentialRef: "openai/default"`，不把真实值写进事件或 checkpoint。
 

@@ -1,7 +1,7 @@
 <LessonOverview
   goal="把用户目标转换成可审计、可执行、可修订的 TaskPlan，并让 Agent Loop 每轮只推进一个明确步骤。"
   task="为“给示例 CLI 增加 --name 参数并补充测试”生成并校验 TaskPlan。"
-  prerequisites="第 03 章已经能够创建 AgentState，并区分消息、运行步骤和上下文来源。"
+  prerequisites="最小 Agent 已经能够调查、修改、验证并在权限策略下执行仓库任务。"
   files={["src/plan.ts", "src/planner.ts", "src/types.ts", "src/agent-loop.ts", "tests/plan.test.ts"]}
 />
 
@@ -58,17 +58,21 @@ export interface TaskPlan {
 
 export interface AgentState {
   // 保留上一章的 runId、task、messages、contextSources 等字段
-  plan?: TaskPlan;
-  activeStepId?: string;
+  plan?: TaskPlan | undefined;
+  activeStepId?: string | undefined;
   planHistory: Array<{
     version: number;
     reason: string;
     changedAt: string;
   }>;
 }
+
+export interface ContextKindMap {
+  task_plan: true;
+}
 ```
 
-`acceptanceCriteria` 回答“整个任务何时完成”，`completionEvidence` 回答“这个步骤何时完成”。两者不能互相替代：代码写完可能完成了一个 Step，但测试没有通过时 Goal 仍未完成。
+把 `AgentState` 扩展放在 `src/types.ts`，并在 `createInitialState` 中加入 `plan: undefined`、`activeStepId: undefined` 与 `planHistory: []`；把 `task_plan` 加在 `src/context.ts` 的 `ContextKindMap`。`acceptanceCriteria` 回答“整个任务何时完成”，`completionEvidence` 回答“这个步骤何时完成”。两者不能互相替代：代码写完可能完成了一个 Step，但测试没有通过时 Goal 仍未完成。
 
 </Step>
 
@@ -239,6 +243,8 @@ export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
   };
 }
 ```
+
+初始计划写入状态时，同步设置 `state.requiredCriterionIds = plan.acceptanceCriteria.map(({ id }) => id)`；验证规格只能引用这个集合中的 ID。重规划若改变验收条件，也要同时更新该字段并使不再匹配的旧验证证据失效，避免规划章和验证章各维护一套完成标准。
 
 要求 Planner 只使用已声明的工具能力，不要编造“查询数据库”之类无法执行的步骤。模型可通过 Responses API 返回结构化文本或调用自定义工具，但 API 只负责产生响应；候选计划的持久化、校验和状态转换仍属于应用代码。[OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
 
@@ -429,6 +435,63 @@ WHILE run is active
 ```
 
 模型请求中的计划摘要可以采用稳定格式：`[✓] completed`、`[→] in progress`、`[ ] pending`、`[!] blocked`。不要把所有历史版本都塞回上下文；当前版本进入 Prompt，旧版本留在审计日志中。
+
+在 `src/plan.ts` 导出 Context Builder 后面会直接使用的适配器，不要等到完整 Loop 章再调用一个未定义函数：
+
+```typescript
+export function planAsContextSource(
+  plan: TaskPlan,
+  activeStep: PlanStep | undefined,
+): ContextSource {
+  return {
+    id: `plan:${plan.version}`,
+    kind: "task_plan",
+    label: activeStep ? `active step: ${activeStep.id}` : "current plan",
+    content: JSON.stringify({
+      goal: plan.goal,
+      acceptanceCriteria: plan.acceptanceCriteria,
+      steps: plan.steps,
+      activeStepId: activeStep?.id,
+    }),
+    priority: 99,
+  };
+}
+```
+
+同一文件还要导出完整 Loop 使用的证据归并函数。示例先采用严格的“证据必须等于本轮 observation”规则，防止模型伪造来源；后续可升级成 observation ID：
+
+```typescript
+export function assertEvidenceComesFromObservations(
+  evidence: string[],
+  observations: string[],
+): void {
+  if (evidence.some((item) => !observations.includes(item))) {
+    throw new Error("planner returned evidence outside current observations");
+  }
+}
+
+export function applyCriterionEvidence(
+  plan: TaskPlan,
+  passedCriterionIds: string[],
+  observations: string[],
+): TaskPlan {
+  const passed = new Set(passedCriterionIds);
+  for (const id of passed) {
+    if (!plan.acceptanceCriteria.some((criterion) => criterion.id === id)) {
+      throw new Error(`unknown acceptance criterion: ${id}`);
+    }
+  }
+
+  return {
+    ...plan,
+    acceptanceCriteria: plan.acceptanceCriteria.map((criterion) =>
+      passed.has(criterion.id)
+        ? { ...criterion, status: "passed", evidence: observations.join("\n") }
+        : criterion,
+    ),
+  };
+}
+```
 
 </Step>
 
@@ -667,14 +730,42 @@ describe("plan state machine", () => {
 
 <Step id="verify-real-task" number={8} title="用贯穿教程的真实任务验收规划">
 
-单元测试通过后，再使用第 00 章写入 `GOAL.md` 的真实工程任务。暂时把规划入口接到 `src/index.ts`：这里会调用真实模型，但只生成并打印计划，不会修改文件或执行命令。
+单元测试通过后，再使用第 00 章写入 `GOAL.md` 的真实工程任务。暂时把规划入口接到 `src/index.ts`：默认使用固定离线计划验收装配；显式设置 `MODEL_MODE=openai` 时才调用真实模型。两条路径都只生成并打印计划，不修改文件或执行命令。
 
 ```typescript
-import { model } from "./model.js";
+import { createModel } from "./model-factory.js";
 import { createInitialPlan, createModelPlanCreator } from "./planner.js";
 
 const goal = process.argv.slice(2).join(" ").trim();
 if (!goal) throw new Error("请提供要规划的任务");
+const offlineDraft = {
+  acceptanceCriteria: [
+    { id: "name-success", description: "--name Lin 输出 Lin" },
+    { id: "name-missing", description: "缺少参数值时清晰失败" },
+    { id: "cli-regression", description: "现有 CLI 行为保持通过" },
+  ],
+  steps: [
+    {
+      id: "inspect",
+      title: "读取 CLI、测试和 package.json",
+      dependsOn: [],
+      completionEvidence: "取得三个文件的 read_file observation",
+    },
+    {
+      id: "implement",
+      title: "修改 CLI 并补充成功与错误测试",
+      dependsOn: ["inspect"],
+      completionEvidence: "实现与测试文件产生受控补丁",
+    },
+    {
+      id: "validate",
+      title: "运行最窄相关测试",
+      dependsOn: ["implement"],
+      completionEvidence: "当前 revision 的 CLI 测试通过",
+    },
+  ],
+};
+const model = createModel([JSON.stringify(offlineDraft)]);
 const planner = createModelPlanCreator(model);
 const plan = await createInitialPlan(
   goal,
@@ -686,10 +777,11 @@ const plan = await createInitialPlan(
 console.log(JSON.stringify({ goal, plan }, null, 2));
 ```
 
-执行一次真实规划：
+先执行可复现的离线规划；配置了 Key 时再选择执行一次真实规划：
 
 ```shell
 pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"
+MODEL_MODE=openai pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"
 ```
 
 不要只检查“输出了 JSON”，要逐项验收输出内容：
@@ -697,7 +789,7 @@ pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"
 1. `plan.goal` 必须与命令中的任务原文完全一致；
 2. acceptance criteria 必须同时覆盖 `--name Lin` 的成功行为、缺少参数值的错误行为和现有 CLI 行为不回归；
 3. 第一个 Step 应先读取 `src/index.ts`、`tests/cli.test.ts` 和 `package.json`，不能直接假设实现；
-4. 修改 Step 必须依赖调查 Step，验证 Step 必须依赖修改和测试 Step；
+4. 修改与补测试的 Step 必须依赖调查 Step，验证 Step 必须依赖该实现 Step；
 5. 每个 `completionEvidence` 都必须能由文件差异或命令输出证明，不能写“看起来正确”；
 6. 输出必须是 `version: 1`，所有 Step 是 `pending`，所有验收条件是 `unverified`。
 
@@ -705,7 +797,7 @@ pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"
 
 <Callout>
 
-这一步验证的是 Agent 对真实任务的规划能力：目标是否保持、步骤是否可执行、依赖是否合理、证据是否可检查。它还没有验证文件修改和命令执行；教程会在工具系统与 Agent Loop 完成后，用同一个任务做端到端验收。
+这一步验证的是 Agent 对任务的规划能力：目标是否保持、步骤是否可执行、依赖是否合理、证据是否可检查。前面章节已经分别验证文件修改和命令执行；后面的完整 Agent Loop 与 Capstone 会把它们和计划连接起来做端到端验收。
 
 </Callout>
 

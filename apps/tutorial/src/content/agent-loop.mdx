@@ -1,7 +1,7 @@
 <LessonOverview
   goal="把此前的上下文、模型适配器、工具注册表和状态机连接成一个完整、可测试、能够多轮工作的 Agent Loop。"
-  task="让 Agent 用两轮模型调用完成“读取 package.json 并解释 scripts”。"
-  prerequisites="第 07 章已经能发现 Skill、按需加载完整指令与资源，并通过工具链返回 observation。"
+  task="用 Fake Model 连接计划、Skills、权限、仓库工具与完成门禁，并追踪一次完整运行。"
+  prerequisites="前面的章节已经完成仓库工具、权限策略、任务规划、用户交互、Skills 与 Trace。"
   files={["src/agent-loop.ts", "src/types.ts", "src/index.ts", "tests/agent-loop.test.ts"]}
 />
 
@@ -35,11 +35,36 @@ Loop 记录的是可观察事件和结果，不记录或要求模型暴露隐藏
 <Step id="define-loop-contract" number={2} title="定义 Loop 依赖与续轮输入">
 
 Loop 依赖领域接口，不直接依赖 OpenAI SDK。这样 Fake Model 可以完整测试控制流。
+先把 `harness_feedback` 追加到 `src/context.ts` 的 `ContextKindMap`，把 `blocked_plan` 追加到 `src/types.ts` 的 `StopReasonMap`：
+
+```typescript
+// src/context.ts
+export interface ContextKindMap {
+  harness_feedback: true;
+}
+
+// src/types.ts
+export interface StopReasonMap {
+  blocked_plan: true;
+}
+```
+
+然后在 `src/agent-loop.ts` 定义 Loop 自身的契约：
 
 ```typescript
 import type { ModelRequest } from "./context.js";
 import type { ModelTurn } from "./model.js";
+import type { Planner } from "./planner.js";
+import type { TraceSink } from "./trace.js";
 import type { ToolRegistry } from "./tool-registry.js";
+import type { StopReason } from "./types.js";
+
+export type AgentLoopEvent =
+  | { type: "run_started"; runId: string }
+  | { type: "model_started"; step: number }
+  | { type: "model_completed"; step: number }
+  | { type: "plan_revised"; version: number; reason: string }
+  | { type: "run_stopped"; reason: StopReason };
 
 export interface FunctionCallOutput {
   type: "function_call_output";
@@ -70,8 +95,9 @@ export interface AgentLoopOptions {
   model: ModelDriver;
   planner: Planner;
   tools: ToolRegistry;
+  trace: TraceSink;
   signal?: AbortSignal;
-  onEvent?: (event: AgentEvent) => void;
+  onEvent?: (event: AgentLoopEvent) => void;
 }
 ```
 
@@ -125,17 +151,22 @@ WHILE status is running
 创建 `src/agent-loop.ts`。下面是完整控制流，不再省略工具分支或停止分支。
 
 ```typescript
-import { buildModelRequest } from "./context.js";
+import { buildModelRequest, summarizeSources } from "./context.js";
+import { checkCompletion } from "./completion.js";
 import { executeToolCall } from "./execute-tool.js";
 import {
   allCriteriaPassed,
+  applyCriterionEvidence,
+  assertEvidenceComesFromObservations,
   completeStep,
   createInitialPlan,
+  planAsContextSource,
   reconcilePlan,
   selectNextStep,
   startStep,
 } from "./plan.js";
-import { createInitialState } from "./state.js";
+import { createInitialState, transitionState } from "./state.js";
+import { waitForUserInput } from "./interaction.js";
 import { discoverSkills, skillCatalogAsContextSource } from "./skill-catalog.js";
 import type { AgentResult, AgentState, StopReason } from "./types.js";
 
@@ -143,7 +174,10 @@ export async function runAgentLoop(
   task: string,
   options: AgentLoopOptions,
 ): Promise<AgentResult> {
-  const state = createInitialState(task, options.cwd);
+  let state = createInitialState(task, options.cwd, {
+    maxSteps: options.maxSteps,
+    maxToolCalls: options.maxToolCalls,
+  });
   state.skills.catalog = await discoverSkills(options.skillsDirectory);
   const toolDefinitions = options.tools.definitions();
   state.plan = await createInitialPlan(
@@ -153,16 +187,16 @@ export async function runAgentLoop(
     options.planner,
   );
 
-  let modelStepCount = 0;
-  let toolCallCount = 0;
   let previousResponseId: string | undefined;
   let pendingOutputs: FunctionCallOutput[] = [];
 
-  options.onEvent?.({ type: "run_started", runId: state.runId });
+  emitLoopEvent(options, state, { type: "run_started", runId: state.runId });
 
   while (state.status === "running") {
     if (options.signal?.aborted) return stop(state, "cancelled", options);
-    if (modelStepCount >= options.maxSteps) return stop(state, "max_steps", options);
+    if (state.budget.modelSteps >= state.budget.maxSteps) {
+      return stop(state, "max_steps", options);
+    }
 
     let activeStep = state.plan.steps.find((step) => step.id === state.activeStepId);
     if (!activeStep) {
@@ -191,11 +225,21 @@ export async function runAgentLoop(
           content: skill.instructions,
           priority: 96,
         })),
+        ...Object.values(state.skills.activeSkills).flatMap((skill) =>
+          Object.entries(skill.loadedResources).map(([path, content]) => ({
+            id: `skill-resource:${skill.name}:${path}`,
+            kind: "skill_resource" as const,
+            label: `${skill.name}/${path}`,
+            content,
+            priority: 94,
+          })),
+        ),
       ],
     });
 
-    modelStepCount += 1;
-    options.onEvent?.({ type: "model_started", step: modelStepCount });
+    state.budget.modelSteps += 1;
+    const modelStepCount = state.budget.modelSteps;
+    emitLoopEvent(options, state, { type: "model_started", step: modelStepCount });
 
     let turn: ModelTurn;
     try {
@@ -223,19 +267,31 @@ export async function runAgentLoop(
       kind: "model",
       summary: turn.toolCalls.length > 0 ? "模型请求工具" : "模型返回文本",
     });
-    options.onEvent?.({ type: "model_completed", step: modelStepCount });
+    emitLoopEvent(options, state, { type: "model_completed", step: modelStepCount });
+
+    if (turn.userInputRequest) {
+      state = waitForUserInput(state, turn.userInputRequest);
+      emitLoopEvent(options, state, { type: "run_stopped", reason: "user_input_required" });
+      return {
+        status: "waiting",
+        answer: "",
+        stopReason: "user_input_required",
+        state,
+      };
+    }
 
     if (turn.toolCalls.length === 0) {
       const answer = turn.finalText.trim();
       if (!answer) return stop(state, "invalid_model_output", options);
 
       const planCompleted = state.plan.steps.every((step) => step.status === "completed");
-      if (!planCompleted || !allCriteriaPassed(state.plan)) {
+      const completionError = await checkCompletion(state);
+      if (!planCompleted || !allCriteriaPassed(state.plan) || completionError) {
         state.contextSources.push({
           id: "completion-rejected-" + modelStepCount,
           kind: "harness_feedback",
           label: "completion rejected",
-          content: "继续执行：计划或验收条件尚未完成。",
+          content: completionError ?? "继续执行：计划或验收条件尚未完成。",
           priority: 100,
         });
         previousResponseId = undefined;
@@ -244,8 +300,8 @@ export async function runAgentLoop(
       }
 
       state.messages.push({ role: "assistant", content: answer });
-      state.status = "completed";
-      options.onEvent?.({ type: "run_stopped", reason: "final_answer" });
+      state = transitionState(state, "completed", "final_answer");
+      emitLoopEvent(options, state, { type: "run_stopped", reason: "final_answer" });
       return {
         status: "completed",
         answer,
@@ -254,7 +310,7 @@ export async function runAgentLoop(
       };
     }
 
-    if (toolCallCount + turn.toolCalls.length > options.maxToolCalls) {
+    if (state.budget.toolCalls + turn.toolCalls.length > state.budget.maxToolCalls) {
       return stop(state, "max_tool_calls", options);
     }
     if (!activeStep) return stop(state, "blocked_plan", options);
@@ -270,7 +326,18 @@ export async function runAgentLoop(
         cwd: state.cwd,
         timeoutMs: options.toolTimeoutMs,
       });
-      toolCallCount += 1;
+      state.budget.toolCalls += 1;
+
+      if (result.type === "waiting") {
+        state = transitionState(state, "waiting", result.reason);
+        emitLoopEvent(options, state, { type: "run_stopped", reason: result.reason });
+        return {
+          status: "waiting",
+          answer: "",
+          stopReason: result.reason,
+          state,
+        };
+      }
 
       state.steps.push({
         number: state.steps.length + 1,
@@ -316,7 +383,7 @@ export async function runAgentLoop(
         reason: progress.replanReason,
         changedAt: new Date().toISOString(),
       });
-      options.onEvent?.({
+      emitLoopEvent(options, state, {
         type: "plan_revised",
         version: state.plan.version,
         reason: progress.replanReason,
@@ -336,9 +403,37 @@ function stop(
   reason: StopReason,
   options: AgentLoopOptions,
 ): AgentResult {
-  state.status = reason === "cancelled" ? "blocked" : "failed";
-  options.onEvent?.({ type: "run_stopped", reason });
-  return { status: state.status, answer: "", stopReason: reason, state };
+  const status = reason === "cancelled" ? "cancelled" : reason === "blocked_plan" ? "blocked" : "failed";
+  const stopped = transitionState(state, status, reason);
+  emitLoopEvent(options, stopped, { type: "run_stopped", reason });
+  return { status: stopped.status, answer: "", stopReason: reason, state: stopped };
+}
+
+function emitLoopEvent(
+  options: AgentLoopOptions,
+  state: AgentState,
+  event: AgentLoopEvent,
+): void {
+  const failedStop = event.type === "run_stopped" && event.reason !== "final_answer";
+  const blockedStop =
+    event.type === "run_stopped" &&
+    ["approval_required", "user_input_required", "blocked_plan", "cancelled"].includes(
+      event.reason,
+    );
+  options.trace.record({
+    runId: state.runId,
+    type: event.type,
+    startedAt: new Date().toISOString(),
+    outcome: event.type.endsWith("started")
+      ? "started"
+      : blockedStop
+        ? "blocked"
+        : failedStop
+          ? "failed"
+          : "passed",
+    ...(failedStop ? { errorCode: event.reason } : {}),
+  });
+  options.onEvent?.(event);
 }
 ```
 
@@ -346,20 +441,20 @@ function stop(
 
 </Step>
 
-<Step id="trace-one-run" number={5} title="追踪一次真实运行">
+<Step id="trace-one-run" number={5} title="追踪一次完整运行">
 
 以“读取 `package.json` 并解释 scripts”为例，外部可观察轨迹应类似：
 
 1. **初始化任务与计划**：创建 Goal、验收标准和 `inspect-package` Step；
 2. **选择 Step**：`inspect-package` 从 `pending` 进入 `in_progress`；
-3. **Model 请求 `read_file`**：`modelStepCount=1`，保存 `responseId`；
-4. **Executor 读取文件**：`toolCallCount=1`，记录 observation 与 `call_id`；
+3. **Model 请求 `read_file`**：保存 `responseId` 并增加模型计数；
+4. **Executor 读取文件**：记录 observation、`call_id` 和 Trace；
 5. **评估步骤**：observation 满足完成证据，Step 进入 `completed`；
-6. **Model 收到 `function_call_output`**：`modelStepCount=2`；
+6. **Model 收到 `function_call_output`**：重新注入当前状态；
 7. **Model 返回解释文本**：Harness 确认计划和验收条件全部通过；
-8. **Harness 完成**：`status=completed`，`stopReason=final_answer`。
+8. **Harness 完成**：记录 usage、`status=completed` 与 `stopReason=final_answer`。
 
-如果第 1 步返回未知工具，Executor 不抛出未处理异常，而是生成 `unknown_tool` observation；第 3 步模型可以换用已有工具。如果连续耗尽预算，Harness 才以确定的停止原因结束。
+如果模型请求未知工具，Executor 不抛出未处理异常，而是生成 `unknown_tool` observation，模型可以换用已有工具。如果计划或验收条件没有完成，即使模型提前输出总结也会被 Harness 拒绝。综合工程任务留到最后的 Capstone，用任务矩阵而不是单条轨迹验收。
 
 </Step>
 
@@ -370,6 +465,7 @@ function stop(
 ```typescript
 import { describe, expect, it, vi } from "vitest";
 import { runAgentLoop } from "../src/agent-loop.js";
+import { InMemoryTraceSink } from "../src/trace.js";
 
 it("runs model → tool → observation → model → final", async () => {
   const start = vi.fn().mockResolvedValue({
@@ -392,7 +488,9 @@ it("runs model → tool → observation → model → final", async () => {
     maxToolCalls: 4,
     toolTimeoutMs: 1_000,
     model: { start, continue: continueTurn },
+    planner: createFakePlanner(),
     tools: createFakeRegistry(),
+    trace: new InMemoryTraceSink(),
   });
 
   expect(result.stopReason).toBe("final_answer");

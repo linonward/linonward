@@ -33,7 +33,9 @@ Harness
 
 这里的“无框架”指不使用 LangChain 等 Agent 框架替你实现控制流。模型 SDK 只负责与模型通信；上下文组装、状态机、规划、工具调度、循环、恢复和安全策略都由你亲手实现，因此每个关键边界都是可见、可测试、可替换的。
 
-教程的增量路线是：先建立 CLI 与模型边界，再加入上下文、任务状态和规划；随后构建 Harness、工具系统、Skills 与完整 Agent Loop；最后补上上下文压缩、长程恢复、仓库读写、验证和权限安全。走到最后时，你会用同一个最终任务验证整条链路。
+教程的增量路线分成三段。第一段建立 CLI、模型、上下文、最小 Agent Loop 与工具协议，并立即赋予它搜索、读取、修改和验证仓库任务的能力；第二段把这个可用闭环升级成具有持久状态、预算、权限、规划、用户转向、Skills 与质量评测的工程系统；第三段再加入完整编排、上下文压缩、长程恢复和综合 Capstone。这样读者先看到 Agent 真正完成任务，再逐步理解可靠运行所需的控制层。
+
+主线刻意停在一个可用、可审计、可恢复的单 Agent。多 Agent、MCP、RAG、浏览器操作、语音和复杂并行调度统一放入**扩展篇**，它们复用主线建立的 Model、Context、Tool、Policy、State、Trace 与 Eval 边界，但不是主线 Capstone 的前置条件。这样既避免在读者尚未掌握单 Agent 闭环时引入分布式复杂度，也为后续专题保留清晰接口。
 
 </Step>
 
@@ -121,7 +123,7 @@ mkdir src tests
 }
 ```
 
-`NodeNext` 让 TypeScript 按 Node ESM 规则解析模块，因此本地相对导入在源码中也要写 `.js` 后缀，例如 `import { model } from "./model.js"`。
+`NodeNext` 让 TypeScript 按 Node ESM 规则解析模块，因此本地相对导入在源码中也要写 `.js` 后缀，例如 `import { createModel } from "./model-factory.js"`。
 
 </Step>
 

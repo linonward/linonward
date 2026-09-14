@@ -1,7 +1,7 @@
 <LessonOverview
   goal="模型可以发起严格的函数调用；Harness 会校验、执行、限制输出，并把结果送回同一次推理链，直到得到最终答案。"
   task="完成一次模型调用、工具执行、observation 回传的受控工具链。"
-  prerequisites="第 05 章的 Harness 已具备状态、停止条件、取消和错误边界。"
+  prerequisites="第 03 章的最小 Agent Loop 已具备停止条件、取消和错误边界。"
   files={["src/tool.ts", "src/tool-registry.ts", "src/model.ts", "src/execute-tool.ts", "src/harness.ts"]}
 />
 
@@ -126,13 +126,19 @@ export class ToolRegistry {
 
 <Step id="parse-model-turn" number={4} title="解析 Responses API 的 function_call">
 
-把 OpenAI SDK 隔离在 `src/model.ts`。不要假设 `response.output[0]` 是文本；输出数组的顺序和长度取决于模型。本教程把函数参数保留为 JSON 字符串，交给 Executor 统一解析。
+继续扩展 `src/model.ts`，保留前面已有的 `Model`、`createOpenAIModel` 和 Fake 路径。不要假设 `response.output[0]` 是文本；输出数组的顺序和长度取决于模型。本教程把函数参数保留为 JSON 字符串，交给 Executor 统一解析。SDK Client 仍然延迟创建，import 模块不能破坏离线测试。
 
 ```typescript
 import OpenAI from "openai";
 import type { ModelRequest } from "./context.js";
+import type { ToolRegistry } from "./tool-registry.js";
 
-const client = new OpenAI();
+let client: OpenAI | undefined;
+
+function getClient(): OpenAI {
+  client ??= new OpenAI();
+  return client;
+}
 
 export interface ToolCall {
   callId: string;
@@ -146,7 +152,9 @@ export interface ModelTurn {
   toolCalls: ToolCall[];
 }
 
-function toModelTurn(response: Awaited<ReturnType<typeof client.responses.create>>): ModelTurn {
+type ResponseResult = Awaited<ReturnType<OpenAI["responses"]["create"]>>;
+
+function toModelTurn(response: ResponseResult): ModelTurn {
   const toolCalls: ToolCall[] = [];
 
   for (const item of response.output) {
@@ -174,7 +182,7 @@ export async function startModelTurn(
   request: ModelRequest,
   tools: ReturnType<ToolRegistry["definitions"]>,
 ): Promise<ModelTurn> {
-  const response = await client.responses.create({
+  const response = await getClient().responses.create({
     model,
     instructions: request.instructions,
     input: request.input,
@@ -203,7 +211,7 @@ export async function executeToolCall(options: {
   registry: ToolRegistry;
   cwd: string;
   timeoutMs: number;
-}): Promise<{ callId: string; output: string }> {
+}): Promise<{ type: "observation"; callId: string; output: string }> {
   const tool = options.registry.get(options.call.name);
   if (!tool) return observation(options.call.callId, { ok: false, error: "unknown_tool" });
 
@@ -239,7 +247,7 @@ function observation(callId: string, value: unknown) {
           error: "output_too_large",
           preview: serialized.slice(0, MAX_OBSERVATION_CHARACTERS),
         });
-  return { callId, output };
+  return { type: "observation" as const, callId, output };
 }
 ```
 
@@ -256,18 +264,22 @@ export async function continueModelTurn(options: {
   model: string;
   previousResponseId: string;
   instructions: string;
+  continuationContext: ModelRequest["input"];
   outputs: { callId: string; output: string }[];
   tools: ReturnType<ToolRegistry["definitions"]>;
 }): Promise<ModelTurn> {
-  const response = await client.responses.create({
+  const response = await getClient().responses.create({
     model: options.model,
     previous_response_id: options.previousResponseId,
     instructions: options.instructions,
-    input: options.outputs.map((item) => ({
-      type: "function_call_output" as const,
-      call_id: item.callId,
-      output: item.output,
-    })),
+    input: [
+      ...options.outputs.map((item) => ({
+        type: "function_call_output" as const,
+        call_id: item.callId,
+        output: item.output,
+      })),
+      ...options.continuationContext,
+    ],
     tools: options.tools,
     parallel_tool_calls: false,
   });
@@ -276,13 +288,13 @@ export async function continueModelTurn(options: {
 }
 ```
 
-至此，模型适配器已经能完成“首轮”和“续轮”两个原子操作。下一章会把它们放进真正的 Agent Loop，并统一处理计数器、状态写入、工具批次和全部停止分支。
+至此，模型适配器已经能完成“首轮”和“续轮”两个原子操作。续轮同时携带 `function_call_output` 和本轮重新 Assemble 的动态上下文，不能只依赖旧 response 的历史。接下来先实现一组真实仓库工具，让读者看到工具协议如何约束具体能力；后面的完整 Agent Loop 章再统一连接计数器、状态写入、工具批次和全部停止分支。
 
 </Step>
 
 <Step id="test-tool-chain" number={7} title="验证模型与工具边界">
 
-分别测试两个原子边界：Model Adapter 能从混合 `output` 中提取全部 `function_call`；Executor 能处理未知工具、坏 JSON、Schema 不匹配、工具抛错、超时和超大输出。此处不测试循环，下一章用 Fake Model 验证完整状态机。
+分别测试两个原子边界：Model Adapter 能从混合 `output` 中提取全部 `function_call`；Executor 能处理未知工具、坏 JSON、Schema 不匹配、工具抛错、超时和超大输出。此处不测试完整循环；仓库工具完成后，再用 Fake Model 验证端到端状态机。
 
 </Step>
 

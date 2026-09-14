@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { chapters, getChapter, getChapterNeighbors, tutorialGoal } from "../src/lib/chapters";
+import {
+  chapters,
+  getChapter,
+  getChapterNeighbors,
+  tutorialExtensions,
+  tutorialGoal,
+} from "../src/lib/chapters";
 
 describe("chapter catalog", () => {
   it("declares the tutorial-wide goal separately from chapter goals", () => {
@@ -14,19 +20,54 @@ describe("chapter catalog", () => {
       "start",
       "model-call",
       "context-and-prompt",
-      "task-state",
-      "task-planning",
       "agent-harness",
       "tool-system",
-      "progressive-skills",
-      "agent-loop",
-      "context-compaction",
-      "long-running-recovery",
       "understand-repository",
       "edit-code",
       "run-validation",
+      "task-state",
       "permissions-safety",
+      "task-planning",
+      "user-interaction",
+      "progressive-skills",
+      "observability-evaluation",
+      "agent-loop",
+      "context-compaction",
+      "long-running-recovery",
+      "capstone",
     ]);
+  });
+
+  it("keeps framework integrations and distributed orchestration outside the core path", () => {
+    expect(tutorialExtensions.map((extension) => extension.id)).toEqual([
+      "multi-agent",
+      "mcp",
+      "rag",
+      "browser-automation",
+      "voice",
+      "parallel-orchestration",
+    ]);
+    expect(chapters.every((chapter) => chapter.track === "core")).toBe(true);
+    expect(chapters.at(-1)).toEqual(expect.objectContaining({ slug: "capstone" }));
+  });
+
+  it("delivers a useful repository agent before advanced orchestration topics", () => {
+    const slugs = chapters.map((chapter) => chapter.slug);
+    const repositoryReadingIndex = slugs.indexOf("understand-repository");
+    const minutesBeforeRepositoryReading = chapters
+      .slice(0, repositoryReadingIndex)
+      .reduce((total, chapter) => total + chapter.minutes, 0);
+
+    expect(repositoryReadingIndex).toBeLessThan(slugs.indexOf("task-planning"));
+    expect(repositoryReadingIndex).toBeLessThan(slugs.indexOf("progressive-skills"));
+    expect(repositoryReadingIndex).toBeLessThan(slugs.indexOf("context-compaction"));
+    expect(slugs.indexOf("task-state")).toBeGreaterThan(slugs.indexOf("run-validation"));
+    expect(slugs.indexOf("user-interaction")).toBeLessThan(slugs.indexOf("progressive-skills"));
+    expect(slugs.indexOf("observability-evaluation")).toBeLessThan(
+      slugs.indexOf("context-compaction"),
+    );
+    expect(slugs.at(-1)).toBe("capstone");
+    expect(minutesBeforeRepositoryReading).toBeLessThanOrEqual(150);
   });
 
   it("provides unique anchors and an estimated duration for every chapter", () => {
@@ -38,7 +79,7 @@ describe("chapter catalog", () => {
 
   it("returns the previous and next chapters", () => {
     expect(getChapterNeighbors("agent-loop")).toEqual({
-      previous: expect.objectContaining({ slug: "progressive-skills" }),
+      previous: expect.objectContaining({ slug: "observability-evaluation" }),
       next: expect.objectContaining({ slug: "context-compaction" }),
     });
     expect(getChapterNeighbors("context-compaction")).toEqual({
@@ -54,8 +95,8 @@ describe("chapter catalog", () => {
   it("looks up a chapter by slug", () => {
     expect(getChapter("agent-harness")).toEqual(
       expect.objectContaining({
-        number: "05",
-        title: "构建 Agent Harness",
+        number: "03",
+        title: "最小 Agent Loop",
       }),
     );
   });
