@@ -8,7 +8,7 @@ const lessonFiles = readdirSync(contentDirectory).filter((file) => file.endsWith
 
 describe("step-by-step lessons", () => {
   it("gives every chapter an outcome, numbered steps, and a checkpoint", () => {
-    expect(lessonFiles).toHaveLength(13);
+    expect(lessonFiles).toHaveLength(15);
 
     for (const file of lessonFiles) {
       const source = readFileSync(`${contentDirectory}/${file}`, "utf8");

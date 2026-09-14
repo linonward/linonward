@@ -14,6 +14,8 @@ describe("chapter catalog", () => {
       "tool-system",
       "progressive-skills",
       "agent-loop",
+      "context-compaction",
+      "long-running-recovery",
       "understand-repository",
       "edit-code",
       "run-validation",
@@ -24,7 +26,11 @@ describe("chapter catalog", () => {
   it("returns the previous and next chapters", () => {
     expect(getChapterNeighbors("agent-loop")).toEqual({
       previous: expect.objectContaining({ slug: "progressive-skills" }),
-      next: expect.objectContaining({ slug: "understand-repository" }),
+      next: expect.objectContaining({ slug: "context-compaction" }),
+    });
+    expect(getChapterNeighbors("context-compaction")).toEqual({
+      previous: expect.objectContaining({ slug: "agent-loop" }),
+      next: expect.objectContaining({ slug: "long-running-recovery" }),
     });
   });
 
