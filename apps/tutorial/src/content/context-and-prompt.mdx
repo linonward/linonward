@@ -86,11 +86,14 @@ export function buildSystemPrompt(options: PromptOptions): string {
 创建 `src/context.ts`。来源和优先级要跟内容一起保存，否则压缩时无法判断什么可以丢弃。
 
 ```typescript
-export type ContextKind =
-  | "workspace_rule"
-  | "file_excerpt"
-  | "tool_observation"
-  | "conversation_summary";
+export interface ContextKindMap {
+  workspace_rule: true;
+  file_excerpt: true;
+  tool_observation: true;
+  conversation_summary: true;
+}
+
+export type ContextKind = keyof ContextKindMap;
 
 export interface ContextSource {
   id: string;
@@ -111,7 +114,7 @@ export interface ModelRequest {
 }
 ```
 
-`label` 应包含路径、命令或来源名称。Agent 后续引用结论时，才能知道证据来自哪里。
+`label` 应包含路径、命令或来源名称。Agent 后续引用结论时，才能知道证据来自哪里。这里使用可声明合并的 `ContextKindMap`，后续章节可以为计划、用户输入、Skill 与压缩快照增加来源种类，而不必复制并覆盖整个联合类型。
 
 </Step>
 
@@ -191,6 +194,20 @@ export function buildModelRequest(options: {
 }
 ```
 
+同时导出供 Planner 使用的有界摘要函数，避免完整 Loop 章再引用一个未定义 helper：
+
+```typescript
+export function summarizeSources(sources: ContextSource[]): string {
+  return sources
+    .toSorted((left, right) => right.priority - left.priority)
+    .slice(0, 20)
+    .map((source) => `${source.kind}:${source.label}`)
+    .join("\n");
+}
+```
+
+这里只暴露来源种类与标签，不把可能很大的原始内容复制进规划请求；Planner 若需要细节，应通过当前选中的 ContextSource 获取。
+
 同时把第 01 章的 Model 接口从纯字符串升级成完整请求，OpenAI 适配器负责映射到 [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)：
 
 ```typescript
@@ -198,17 +215,41 @@ export interface Model {
   generate(request: ModelRequest): Promise<string>;
 }
 
-export const model: Model = {
-  async generate(request) {
-    const response = await client.responses.create({
-      model: requireModelName(),
-      instructions: request.instructions,
-      input: request.input,
-    });
-    return response.output_text;
-  },
-};
+export function createOpenAIModel(): Model {
+  const client = new OpenAI();
+  return {
+    async generate(request) {
+      const model = process.env.OPENAI_MODEL;
+      if (!model) throw new Error("缺少 OPENAI_MODEL");
+      const response = await client.responses.create({
+        model,
+        instructions: request.instructions,
+        input: request.input,
+      });
+      return response.output_text;
+    },
+  };
+}
 ```
+
+同时更新 `src/fake-model.ts`；否则上一章仍接收字符串的 Fake Model 会在本章第一次类型检查时失败：
+
+```typescript
+import type { ModelRequest } from "./context.js";
+import type { Model } from "./model.js";
+
+export class FakeModel implements Model {
+  constructor(private readonly replies: string[]) {}
+
+  async generate(_request: ModelRequest): Promise<string> {
+    const reply = this.replies.shift();
+    if (!reply) throw new Error("fake_model_has_no_reply");
+    return reply;
+  }
+}
+```
+
+`model-factory.ts` 不需要改变：它返回的真实适配器和 Fake Model 现在都实现新的 `ModelRequest` 契约。
 
 </Step>
 

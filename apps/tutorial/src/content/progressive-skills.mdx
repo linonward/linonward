@@ -1,7 +1,7 @@
 <LessonOverview
   goal="实现一个三层 Skill Runtime：启动时只暴露能力摘要，选中后加载完整指令，执行时再按需读取引用、脚本说明或模板。"
   task="为仓库审计任务只激活 repository-audit Skill，并按需加载它的 checklist。"
-  prerequisites="第 06 章已经有 ToolRegistry、统一执行入口和 function_call_output 回传链路。"
+  prerequisites="工具系统和权限策略已经就绪，并且规划章已经定义当前可执行步骤。"
   files={["skills/repository-audit/SKILL.md", "src/skill-catalog.ts", "src/skill-runtime.ts", "src/skill-tools.ts", "src/agent-loop.ts", "tests/skills.test.ts"]}
 />
 
@@ -86,16 +86,32 @@ export interface SkillSummary {
 export interface ActiveSkill {
   name: string;
   instructions: string;
-  loadedResources: string[];
+  loadedResources: Record<string, string>;
 }
 
 export interface SkillState {
   catalog: SkillSummary[];
   activeSkills: Record<string, ActiveSkill>;
 }
+
+export interface AgentState {
+  skills: SkillState;
+}
+
+export interface ContextKindMap {
+  skill_catalog: true;
+  skill_instructions: true;
+  skill_resource: true;
+}
+
+export interface ToolContext {
+  skills: SkillState;
+  maxSkillBytes: number;
+  emit(event: { type: string; [key: string]: unknown }): void;
+}
 ```
 
-`SkillSummary` 中的路径供 Harness 定位文件，不需要发给模型。进入初始 Prompt 的只有经过长度限制和 XML 转义后的 `name` 与 `description`。
+把 `skills` 加到 `src/types.ts` 的 `AgentState`，并在 `createInitialState` 中初始化 `{ catalog: [], activeSkills: {} }`；把三个新来源种类加到 `src/context.ts` 的 `ContextKindMap`；把 Skill 运行时依赖加到 `src/tool.ts` 的 `ToolContext`，并由 Executor 显式注入。`SkillSummary` 中的路径供 Harness 定位文件，不需要发给模型。进入初始 Prompt 的只有经过长度限制和 XML 转义后的 `name` 与 `description`。
 
 </Step>
 
@@ -201,7 +217,7 @@ export async function activateSkill(
   const { metadata, body } = parseSkillDocument(source);
   if (metadata.name !== summary.name) throw new Error("skill metadata changed after discovery");
 
-  const active = { name, instructions: body.trim(), loadedResources: [] };
+  const active = { name, instructions: body.trim(), loadedResources: {} };
   state.activeSkills[name] = active;
   return active;
 }
@@ -209,7 +225,7 @@ export async function activateSkill(
 export const loadSkillTool = defineTool({
   name: "load_skill",
   description: "Load the complete instructions for one available skill before using it.",
-  inputSchema: z.object({ name: z.string() }),
+  schema: z.object({ name: z.string() }),
   effect: "read",
   execute: async ({ name }, context) => {
     const skill = await activateSkill(name, context.skills, context.maxSkillBytes);
@@ -255,16 +271,14 @@ export async function loadSkillResource(input: {
   if (info.size > input.maxResourceBytes) throw new Error("skill_resource_too_large");
 
   const content = await readFile(target, "utf8");
-  if (!active.loadedResources.includes(input.resourcePath)) {
-    active.loadedResources.push(input.resourcePath);
-  }
+  active.loadedResources[input.resourcePath] = content;
   return { path: input.resourcePath, content };
 }
 
 export const loadSkillResourceTool = defineTool({
   name: "load_skill_resource",
   description: "Load one text reference or asset from an already active skill.",
-  inputSchema: z.object({
+  schema: z.object({
     skillName: z.string(),
     resourcePath: z.string().min(1),
   }),
@@ -277,7 +291,7 @@ export const loadSkillResourceTool = defineTool({
 });
 ```
 
-`scripts/` 被这个读取工具明确拒绝。脚本路径只有在 Skill 指令已经加载、用户任务确实需要且权限策略允许时，才能交给后续章节的命令执行工具；永远不要把“读取脚本”和“执行脚本”合并成一个隐式动作。
+`scripts/` 被这个读取工具明确拒绝。脚本路径只有在 Skill 指令已经加载、用户任务确实需要且权限策略允许时，才能交给前面已经实现的命令执行工具；永远不要把“读取脚本”和“执行脚本”合并成一个隐式动作。
 
 </Step>
 
@@ -315,6 +329,15 @@ const skillSources: ContextSource[] = [
     content: skill.instructions,
     priority: 96,
   })),
+  ...Object.values(state.skills.activeSkills).flatMap((skill) =>
+    Object.entries(skill.loadedResources).map(([path, content]) => ({
+      id: `skill-resource:${skill.name}:${path}`,
+      kind: "skill_resource" as const,
+      label: `${skill.name}/${path}`,
+      content,
+      priority: 94,
+    })),
+  ),
 ];
 
 const request = buildModelRequest({

@@ -14,8 +14,9 @@ describe("task state lesson", () => {
     expect(source).toContain("transitionState");
     expect(source).toContain("nextEventSequence");
     expect(source).toContain("recordedAt");
-    expect(source).toContain('running: ["completed", "failed", "blocked"]');
-    expect(source).toContain('blocked: ["running", "failed"]');
+    expect(source).toContain('running: ["waiting", "completed", "failed", "blocked", "cancelled"]');
+    expect(source).toContain('waiting: ["running", "failed", "cancelled"]');
+    expect(source).toContain("blocked: []");
     expect(source).toContain("invalid state transition");
     expect(source).toContain("tests/state.test.ts");
   });

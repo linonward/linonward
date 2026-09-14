@@ -8,7 +8,7 @@ const lessonFiles = readdirSync(contentDirectory).filter((file) => file.endsWith
 
 describe("step-by-step lessons", () => {
   it("gives every chapter a goal, task, numbered steps, and checkpoint", () => {
-    expect(lessonFiles).toHaveLength(15);
+    expect(lessonFiles).toHaveLength(18);
 
     for (const file of lessonFiles) {
       const source = readFileSync(`${contentDirectory}/${file}`, "utf8");
@@ -47,6 +47,14 @@ describe("step-by-step lessons", () => {
     expect(source).toContain("权限");
     expect(source).toContain("证据");
     expect(source).toContain("停止条件");
+    expect(source).toContain("扩展篇");
+    expect(source).toContain("多 Agent");
+    expect(source).toContain("MCP");
+    expect(source).toContain("RAG");
+    expect(source).toContain("浏览器操作");
+    expect(source).toContain("语音");
+    expect(source).toContain("复杂并行调度");
+    expect(source).toContain("不是主线 Capstone 的前置条件");
     expect(source).not.toContain('"latest"');
   });
 
@@ -57,5 +65,14 @@ describe("step-by-step lessons", () => {
     expect(source).toContain("离线");
     expect(source).toContain("费用");
     expect(source).toContain("能力要求");
+  });
+
+  it("places the capstone after repository tools, policy, planning, and skills", () => {
+    const permissions = readFileSync(`${contentDirectory}/permissions-safety.mdx`, "utf8");
+    const capstone = readFileSync(`${contentDirectory}/capstone.mdx`, "utf8");
+
+    expect(permissions).not.toContain('title="完成贯穿教程的真实任务"');
+    expect(capstone).toContain('title="完成贯穿教程的真实任务"');
+    expect(capstone).toContain("给 CLI 增加 --name 参数，并补充测试");
   });
 });

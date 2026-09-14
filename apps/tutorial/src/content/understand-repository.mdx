@@ -1,7 +1,7 @@
 <LessonOverview
   goal="Agent 能在工作区内搜索文本和读取文件，但不能通过路径逃逸读取外部内容。"
   task="让 Agent 读取 package.json，回答项目使用的包管理器，并拒绝工作区外路径。"
-  prerequisites="工具注册表和 Agent Loop 已经能够处理一次工具调用。"
+  prerequisites="第 04 章已经建立 ToolRegistry、Executor 与 function_call_output 回传协议。"
   files={["src/workspace.ts", "src/tools/read-file.ts", "src/tools/search-text.ts", "src/index.ts"]}
 />
 
@@ -29,7 +29,7 @@ export async function resolveExistingWorkspacePath(cwd: string, input: string): 
 }
 ```
 
-这里先解析目标，再检查它与真实工作区根目录的相对关系。因此 `workspace/link -> /tmp/secret` 会被拒绝。不存在的新文件不能直接 `realpath`；第 12 章会真实解析父目录、拒绝符号链接父级，再创建文件。
+这里先解析目标，再检查它与真实工作区根目录的相对关系。因此 `workspace/link -> /tmp/secret` 会被拒绝。不存在的新文件不能直接 `realpath`；下一章会真实解析父目录、拒绝符号链接父级，再创建文件。
 
 </Step>
 
@@ -40,7 +40,7 @@ export async function resolveExistingWorkspacePath(cwd: string, input: string): 
 ```typescript
 const inputSchema = z.object({ path: z.string().min(1) });
 
-export const readFileTool: Tool<z.infer<typeof inputSchema>, ReadResult> = {
+export const readFileTool = defineTool({
   name: "read_file",
   description: "Read one UTF-8 text file inside the workspace",
   schema: inputSchema,
@@ -50,7 +50,7 @@ export const readFileTool: Tool<z.infer<typeof inputSchema>, ReadResult> = {
     const limit = 20_000;
     return { content: content.slice(0, limit), truncated: content.length > limit };
   },
-};
+});
 ```
 
 </Step>

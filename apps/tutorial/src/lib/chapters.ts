@@ -15,6 +15,7 @@ export const tutorialGoal =
 export interface Chapter {
   slug: string;
   number: string;
+  track: "core";
   title: string;
   label: string;
   minutes: number;
@@ -23,10 +24,48 @@ export interface Chapter {
   load: () => Promise<ChapterModule>;
 }
 
-export const chapters: Chapter[] = [
+export interface TutorialExtension {
+  id: string;
+  title: string;
+  description: string;
+}
+
+export const tutorialExtensions: TutorialExtension[] = [
+  {
+    id: "multi-agent",
+    title: "多 Agent 协作",
+    description: "在单 Agent 边界稳定后，增加角色分工、任务交接和结果归并。",
+  },
+  {
+    id: "mcp",
+    title: "MCP 集成",
+    description: "把外部 MCP Server 适配到已有的工具、资源、权限和审计边界。",
+  },
+  {
+    id: "rag",
+    title: "RAG 与知识库",
+    description: "增加切分、索引、检索、引用和检索质量评测。",
+  },
+  {
+    id: "browser-automation",
+    title: "浏览器操作",
+    description: "把页面观测、交互、会话和高风险动作并入 Harness 约束。",
+  },
+  {
+    id: "voice",
+    title: "语音 Agent",
+    description: "处理实时输入输出、打断、转录、延迟和会话状态。",
+  },
+  {
+    id: "parallel-orchestration",
+    title: "复杂并行调度",
+    description: "在可证明独立的工作上引入并行、背压、取消、部分失败和确定性归并。",
+  },
+];
+
+const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
   {
     slug: "start",
-    number: "00",
     title: "开始",
     label: "开始",
     minutes: 15,
@@ -43,7 +82,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "model-call",
-    number: "01",
     title: "最小模型调用",
     label: "最小模型调用",
     minutes: 20,
@@ -59,7 +97,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "context-and-prompt",
-    number: "02",
     title: "上下文与系统 Prompt",
     label: "上下文与 Prompt",
     minutes: 35,
@@ -76,7 +113,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "task-state",
-    number: "03",
     title: "任务与状态",
     label: "任务与状态",
     minutes: 30,
@@ -92,7 +128,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "task-planning",
-    number: "04",
     title: "任务分解与规划",
     label: "任务与规划",
     minutes: 75,
@@ -106,11 +141,10 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "agent-harness",
-    number: "05",
-    title: "构建 Agent Harness",
-    label: "Agent Harness",
+    title: "最小 Agent Loop",
+    label: "最小 Agent Loop",
     minutes: 30,
-    description: "模型负责决策，Harness 负责让任务安全、可靠地完成。",
+    description: "先用最少状态和停止条件完成可观察、可取消的模型循环。",
     toc: [
       { id: "define-responsibilities", title: "划清 Harness 职责" },
       { id: "define-options", title: "定义 Harness 输入输出" },
@@ -122,7 +156,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "tool-system",
-    number: "06",
     title: "工具系统",
     label: "工具系统",
     minutes: 50,
@@ -140,7 +173,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "progressive-skills",
-    number: "07",
     title: "Skills 渐进式加载",
     label: "Skills 渐进加载",
     minutes: 60,
@@ -158,7 +190,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "agent-loop",
-    number: "08",
     title: "实现 Agent Loop",
     label: "Agent Loop",
     minutes: 75,
@@ -168,14 +199,13 @@ export const chapters: Chapter[] = [
       { id: "define-loop-contract", title: "定义循环契约" },
       { id: "read-one-iteration", title: "读懂单轮状态转换" },
       { id: "implement-complete-loop", title: "实现完整 Agent Loop" },
-      { id: "trace-one-run", title: "追踪一次真实运行" },
+      { id: "trace-one-run", title: "追踪完整运行" },
       { id: "test-loop", title: "测试循环而非模型" },
     ],
     load: () => import("../content/agent-loop.mdx"),
   },
   {
     slug: "context-compaction",
-    number: "09",
     title: "上下文压缩",
     label: "上下文压缩",
     minutes: 60,
@@ -193,7 +223,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "long-running-recovery",
-    number: "10",
     title: "长程任务恢复",
     label: "长程任务恢复",
     minutes: 65,
@@ -211,7 +240,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "understand-repository",
-    number: "11",
     title: "读懂仓库",
     label: "读懂仓库",
     minutes: 25,
@@ -226,7 +254,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "edit-code",
-    number: "12",
     title: "修改代码",
     label: "修改代码",
     minutes: 35,
@@ -240,7 +267,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "run-validation",
-    number: "13",
     title: "运行验证",
     label: "运行验证",
     minutes: 30,
@@ -254,7 +280,6 @@ export const chapters: Chapter[] = [
   },
   {
     slug: "permissions-safety",
-    number: "14",
     title: "权限与安全",
     label: "权限与安全",
     minutes: 35,
@@ -262,11 +287,83 @@ export const chapters: Chapter[] = [
     toc: [
       { id: "risk-levels", title: "给工具标记风险等级" },
       { id: "authorize", title: "执行前应用授权策略" },
-      { id: "final-run", title: "完成真实任务" },
+      { id: "final-run", title: "验收权限策略" },
     ],
     load: () => import("../content/permissions-safety.mdx"),
   },
+  {
+    slug: "user-interaction",
+    title: "用户澄清与中途转向",
+    label: "用户交互与转向",
+    minutes: 40,
+    description: "让 Agent 能提出问题、等待回答，并在用户改变目标时安全修订运行。",
+    toc: [
+      { id: "clarify-contract", title: "定义澄清契约" },
+      { id: "persist-user-request", title: "持久化等待请求" },
+      { id: "resume-with-input", title: "用用户输入恢复" },
+      { id: "steer-active-run", title: "处理中途转向" },
+      { id: "test-interaction", title: "测试交互状态机" },
+    ],
+    load: () => import("../content/user-interaction.mdx"),
+  },
+  {
+    slug: "observability-evaluation",
+    title: "可观测性与评测",
+    label: "可观测性与评测",
+    minutes: 55,
+    description: "用结构化 Trace、任务数据集和回归门禁衡量 Agent 是否真的变好。",
+    toc: [
+      { id: "define-trace", title: "定义 Trace 契约" },
+      { id: "record-usage", title: "记录用量与延迟" },
+      { id: "build-eval-suite", title: "建立任务评测集" },
+      { id: "grade-outcomes", title: "分层判定结果" },
+      { id: "regression-gate", title: "建立回归门禁" },
+    ],
+    load: () => import("../content/observability-evaluation.mdx"),
+  },
+  {
+    slug: "capstone",
+    title: "综合 Capstone",
+    label: "综合 Capstone",
+    minutes: 75,
+    description: "用任务矩阵和故障注入验收完整 Agent，而不是只跑一条成功路径。",
+    toc: [
+      { id: "define-matrix", title: "定义任务矩阵" },
+      { id: "run-capstone", title: "完成真实工程任务" },
+      { id: "inject-failures", title: "执行故障注入" },
+      { id: "review-evidence", title: "审查完成证据" },
+    ],
+    load: () => import("../content/capstone.mdx"),
+  },
 ];
+
+const chapterOrder = [
+  "start",
+  "model-call",
+  "context-and-prompt",
+  "agent-harness",
+  "tool-system",
+  "understand-repository",
+  "edit-code",
+  "run-validation",
+  "task-state",
+  "permissions-safety",
+  "task-planning",
+  "user-interaction",
+  "progressive-skills",
+  "observability-evaluation",
+  "agent-loop",
+  "context-compaction",
+  "long-running-recovery",
+  "capstone",
+] as const;
+
+export const chapters: Chapter[] = chapterOrder.map((slug, index) => {
+  const chapter = chapterDefinitions.find((candidate) => candidate.slug === slug);
+  if (!chapter) throw new Error(`Missing tutorial chapter: ${slug}`);
+
+  return { ...chapter, number: index.toString().padStart(2, "0"), track: "core" };
+});
 
 export function getChapter(slug: string): Chapter | undefined {
   return chapters.find((chapter) => chapter.slug === slug);

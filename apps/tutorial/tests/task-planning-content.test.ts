@@ -48,8 +48,8 @@ export interface AcceptanceCriterion {
     expect(source).toContain('const goal = process.argv.slice(2).join(" ").trim()');
     expect(source).toContain('pnpm dev -- "给示例 CLI 增加 --name 参数并补充测试"');
     expect(source).toContain("`plan.goal` 必须与命令中的任务原文完全一致");
-    expect(source).toContain("这一步验证的是 Agent 对真实任务的规划能力");
-    expect(source).toContain("还没有验证文件修改和命令执行");
+    expect(source).toContain("这一步验证的是 Agent 对任务的规划能力");
+    expect(source).toContain("前面章节已经分别验证文件修改和命令执行");
   });
 
   it("invalidates changed plan semantics and rejects duplicate ids", () => {

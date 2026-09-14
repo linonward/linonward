@@ -1,11 +1,11 @@
 <LessonOverview
-  goal="任务统一进入一个有状态、有停止条件、有错误边界且可测试的 Agent Harness。"
+  goal="用最少状态实现第一个可观察、可取消、有停止条件且可测试的 Agent Loop。"
   task="让受控 Harness 在预算内完成“解释 package.json 的作用”，并返回明确停止原因。"
-  prerequisites="已经有 ModelRequest、Model 接口、可初始化的 AgentState 和经过校验的 TaskPlan。"
-  files={["src/types.ts", "src/harness.ts", "src/index.ts"]}
+  prerequisites="已经有 ModelRequest 和可替换的 Model 接口。"
+  files={["src/types.ts", "src/harness.ts", "src/index.ts", "tests/harness.test.ts"]}
 />
 
-Harness 是 Agent 的确定性控制层。模型只提出下一步意图；是否继续、允许多少步、如何记录状态以及何时停止，都由 Harness 决定。
+这是教程的第一个最小 Agent Loop。它暂时只有内存状态和文本出口；模型只提出下一步意图，是否继续、允许多少步、如何记录结果以及何时停止，都由 Harness 决定。后面的状态章会在基础仓库闭环完成后，把这份最小记录升级成可恢复、可审计的状态机。
 
 <Step id="define-responsibilities" number={1} title="划清 Harness 的职责">
 
@@ -14,7 +14,7 @@ Harness 是 Agent 的确定性控制层。模型只提出下一步意图；是�
 - **CLI**：解析参数、装配依赖、设置退出码；
 - **Context Builder**：从状态生成本轮 `ModelRequest`；
 - **Model Adapter**：调用模型并把厂商响应转成领域对象；
-- **Planner**：提出初始计划、评估步骤证据，并在计划失效时给出修订草案；
+- **Planner**：进阶阶段再加入；最小 Loop 不要求先构造复杂计划；
 - **Harness**：推进状态机、执行停止策略、调度工具；
 - **Tool Executor**：校验、授权、超时、执行与序列化；
 - **Reporter**：输出最终答案和验证证据。
@@ -33,35 +33,44 @@ import type { Model } from "./model.js";
 export interface HarnessOptions {
   cwd: string;
   maxSteps: number;
-  maxToolCalls: number;
   model: Model;
   signal?: AbortSignal;
-  onEvent?: (event: AgentEvent) => void;
+  onEvent?: (event: RuntimeEvent) => void;
 }
 
-export type StopReason =
-  | "final_answer"
-  | "max_steps"
-  | "max_tool_calls"
-  | "cancelled"
-  | "model_error"
-  | "invalid_model_output";
+export interface MinimalAgentState {
+  runId: string;
+  task: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  modelSteps: number;
+}
+
+export interface StopReasonMap {
+  final_answer: true;
+  max_steps: true;
+  max_tool_calls: true;
+  cancelled: true;
+  model_error: true;
+  invalid_model_output: true;
+}
+
+export type StopReason = keyof StopReasonMap;
 
 export interface AgentResult {
-  status: "completed" | "failed" | "blocked";
+  status: MinimalAgentState["status"];
   answer: string;
   stopReason: StopReason;
-  state: AgentState;
+  state: MinimalAgentState;
 }
 
-export type AgentEvent =
+export type RuntimeEvent =
   | { type: "run_started"; runId: string }
   | { type: "model_started"; step: number }
   | { type: "model_completed"; step: number }
   | { type: "run_stopped"; reason: StopReason };
 ```
 
-事件回调不应改变运行语义。它只负责日志、UI 流式更新或 tracing。
+这里暂时命名为 `RuntimeEvent`，避免与状态章将要持久化的审计事件混为一谈。事件回调不应改变运行语义；它只负责日志、UI 流式更新或 tracing。
 
 </Step>
 
@@ -69,18 +78,22 @@ export type AgentEvent =
 
 创建 `src/harness.ts`。本章尚未接入工具，所以模型必须给出非空最终文本；下一章会在同一循环中加入工具分支。
 
-<AgentFlow />
-
 ```typescript
+import { randomUUID } from "node:crypto";
+
 import { buildModelRequest } from "./context.js";
-import { createInitialState } from "./state.js";
-import type { AgentResult, AgentState, HarnessOptions, StopReason } from "./types.js";
+import type { AgentResult, HarnessOptions, MinimalAgentState, StopReason } from "./types.js";
 
 export async function runAgent(
   task: string,
   options: HarnessOptions,
 ): Promise<AgentResult> {
-  const state = createInitialState(task, options.cwd);
+  const state: MinimalAgentState = {
+    runId: randomUUID(),
+    task,
+    status: "running",
+    modelSteps: 0,
+  };
   options.onEvent?.({ type: "run_started", runId: state.runId });
 
   try {
@@ -89,37 +102,31 @@ export async function runAgent(
 
       const request = buildModelRequest({
         task: state.task,
-        cwd: state.cwd,
+        cwd: options.cwd,
         toolNames: [],
-        sources: state.contextSources,
+        sources: [],
       });
 
       options.onEvent?.({ type: "model_started", step });
       const answer = (await options.model.generate(request)).trim();
       options.onEvent?.({ type: "model_completed", step });
 
-      state.steps.push({ number: step, kind: "model", summary: "模型返回最终回答" });
+      state.modelSteps = step;
       if (!answer) return stop(state, "invalid_model_output");
 
-      state.messages.push({ role: "assistant", content: answer });
       state.status = "completed";
       return { status: "completed", answer, stopReason: "final_answer", state };
     }
 
     return stop(state, "max_steps");
-  } catch (error) {
+  } catch {
     const reason = options.signal?.aborted ? "cancelled" : "model_error";
-    state.steps.push({
-      number: state.steps.length + 1,
-      kind: "model",
-      summary: error instanceof Error ? error.message : String(error),
-    });
     return stop(state, reason);
   }
 }
 
-function stop(state: AgentState, reason: StopReason): AgentResult {
-  state.status = reason === "cancelled" ? "blocked" : "failed";
+function stop(state: MinimalAgentState, reason: StopReason): AgentResult {
+  state.status = reason === "cancelled" ? "cancelled" : "failed";
   return { status: state.status, answer: "", stopReason: reason, state };
 }
 ```
@@ -140,18 +147,18 @@ function stop(state: AgentState, reason: StopReason): AgentResult {
 
 ```typescript
 import { runAgent } from "./harness.js";
-import { model } from "./model.js";
+import { createModel } from "./model-factory.js";
 
 const task = process.argv.slice(2).join(" ").trim();
 if (!task) throw new Error("请提供任务");
 
 const controller = new AbortController();
 process.once("SIGINT", () => controller.abort());
+const model = createModel();
 
 const result = await runAgent(task, {
   cwd: process.cwd(),
   maxSteps: 12,
-  maxToolCalls: 24,
   model,
   signal: controller.signal,
   onEvent: (event) => console.error(JSON.stringify(event)),

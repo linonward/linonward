@@ -7,7 +7,38 @@
 
 <Step id="write-file" number={1} title="实现带 hash 前置条件的补丁工具">
 
-创建 `src/tools/apply-patch.ts`。不要把截断后的读取结果当作完整旧文件，也不要整文件替换；输入显式区分 `create`、`update` 和 `delete`，更新与删除必须携带完整文件的 SHA-256。
+先扩展 `src/tool.ts`。写入租约是 Executor 注入的运行时依赖，不能在工具中凭空读取一个尚未定义的字段：
+
+```typescript
+export type ToolEffect = "read" | "write" | "execute";
+
+export interface WriteLease {
+  runExclusive<Result>(key: string, operation: () => Promise<Result>): Promise<Result>;
+}
+
+export class InMemoryWriteLease implements WriteLease {
+  private queue: Promise<void> = Promise.resolve();
+
+  runExclusive<Result>(_key: string, operation: () => Promise<Result>): Promise<Result> {
+    const result = this.queue.then(operation, operation);
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+}
+
+export interface ToolContext {
+  cwd: string;
+  signal: AbortSignal;
+  writeLease: WriteLease;
+}
+```
+
+同时给 `RegisteredTool` 和 `defineTool` 的定义参数加入 `effect: ToolEffect`，并在返回对象中保留它；现有 `read_file`、`search_text` 都补上 `effect: "read"`。然后让 `execute-tool.ts` 创建一个进程内共享的 `InMemoryWriteLease`，在调用 `tool.run` 时连同 `cwd`、`signal` 一起传入。此处先串行化所有写入，语义正确后再优化成按规范化路径分组。
+
+接着创建 `src/tools/apply-patch.ts`。不要把截断后的读取结果当作完整旧文件，也不要整文件替换；输入显式区分 `create`、`update` 和 `delete`，更新与删除必须携带完整文件的 SHA-256。
 
 ```typescript
 const inputSchema = z.discriminatedUnion("operation", [
@@ -25,9 +56,16 @@ const inputSchema = z.discriminatedUnion("operation", [
   }),
 ]);
 
-export const applyPatchTool: Tool<z.infer<typeof inputSchema>, PatchResult> = {
+export interface PatchResult {
+  operation: "create" | "update" | "delete";
+  path: string;
+  sha256?: string;
+}
+
+export const applyPatchTool = defineTool({
   name: "apply_patch",
   description: "Create, patch, or delete one workspace file under a hash precondition",
+  effect: "write",
   schema: inputSchema,
   async execute(input, context) {
     return context.writeLease.runExclusive(input.path, async () => {
@@ -50,10 +88,10 @@ export const applyPatchTool: Tool<z.infer<typeof inputSchema>, PatchResult> = {
       return { operation: "update", path: input.path, sha256: sha256(next) };
     });
   },
-};
+});
 ```
 
-`resolvePatchTarget` 对已有文件复用第 11 章的 `realpath` 检查；创建文件时真实解析父目录并拒绝符号链接逃逸：
+`resolvePatchTarget` 对已有文件复用上一章的 `realpath` 检查；创建文件时真实解析父目录并拒绝符号链接逃逸：
 
 ```typescript
 async function resolvePatchTarget(
@@ -97,7 +135,7 @@ async function atomicReplace(path: string, content: string, expectedSha256: stri
 
 <Step id="track-files" number={2} title="记录所有变更文件">
 
-给工具增加 `effect: "read" | "write" | "execute"`。当补丁成功时，由 Harness 更新变更序号、文件 hash 和状态，而不是让工具自行修改全局状态。
+前一步已经给工具增加 `effect`。当补丁成功时，由 Harness 更新最小 `RunLedger` 的变更序号、文件 hash 和文件集合，而不是让工具自行修改全局状态。
 
 ```typescript
 if (tool.effect === "write" && observation.ok) {

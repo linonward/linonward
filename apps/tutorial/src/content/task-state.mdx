@@ -1,13 +1,13 @@
 <LessonOverview
-  goal="把一次模型请求升级成具有合法状态转换、不变量、事件序号和停止原因的可审计任务运行。"
+  goal="把已经能读写和验证仓库的最小 Agent，升级成具有合法转换、事件序号和停止原因的可审计任务运行。"
   task="运行“检查 package.json”，并分别验证任务完成、失败与阻塞的状态路径。"
-  prerequisites="第 02 章已经能够组装系统 Prompt 与动态上下文。"
+  prerequisites="最小 Agent 已经能够搜索、修改并验证一个仓库任务。"
   files={["src/types.ts", "src/state.ts", "src/index.ts", "tests/state.test.ts"]}
 />
 
 <Step id="define-messages" number={1} title="定义消息与步骤">
 
-创建 `src/types.ts`。聊天消息用于模型上下文，步骤用于 Harness 控制与审计，两者不要混在一个数组里。
+扩展 `src/types.ts`。前面最小 Loop 的内存计数只证明控制流可以工作；现在把聊天消息、Harness 步骤和审计事件分开保存，为权限等待、用户输入和崩溃恢复建立稳定状态。
 
 ```typescript
 export interface AgentMessage {
@@ -22,10 +22,18 @@ export interface AgentStep {
 }
 
 export interface AgentEvent {
+  eventId: string;
   sequence: number;
   recordedAt: string;
-  type: "run_started" | "status_changed" | "model_completed" | "tool_completed";
+  type: string;
   detail: string;
+}
+
+export interface AgentBudget {
+  maxSteps: number;
+  maxToolCalls: number;
+  modelSteps: number;
+  toolCalls: number;
 }
 ```
 
@@ -42,17 +50,31 @@ export interface AgentState {
   runId: string;
   task: string;
   cwd: string;
-  status: "running" | "completed" | "failed" | "blocked";
+  status: "running" | "waiting" | "completed" | "failed" | "blocked" | "cancelled";
   messages: AgentMessage[];
   contextSources: ContextSource[];
   steps: AgentStep[];
   changedFiles: string[];
-  validations: string[];
+  changedFileHashes: Record<string, string>;
+  mutationRevision: number;
+  validations: ValidationRecord[];
+  requiredCriterionIds: string[];
+  failedAttempts: string[];
+  budget: AgentBudget;
   events: AgentEvent[];
   nextEventSequence: number;
   stopReason: string | undefined;
 }
+
+export interface AgentResult {
+  status: AgentState["status"];
+  answer: string;
+  stopReason: StopReason;
+  state: AgentState;
+}
 ```
+
+这个 `AgentResult` 替换最小 Loop 中绑定 `MinimalAgentState` 的版本；随后删除 `MinimalAgentState`。否则状态已经升级，返回类型却仍要求旧状态，Harness 会立刻类型错误。
 
 </Step>
 
@@ -64,7 +86,11 @@ export interface AgentState {
 import { randomUUID } from "node:crypto";
 import type { AgentState } from "./types.js";
 
-export function createInitialState(task: string, cwd: string): AgentState {
+export function createInitialState(
+  task: string,
+  cwd: string,
+  limits = { maxSteps: 12, maxToolCalls: 24 },
+): AgentState {
   return {
     runId: randomUUID(),
     task,
@@ -74,9 +100,24 @@ export function createInitialState(task: string, cwd: string): AgentState {
     contextSources: [],
     steps: [],
     changedFiles: [],
+    changedFileHashes: {},
+    mutationRevision: 0,
     validations: [],
+    requiredCriterionIds: [],
+    failedAttempts: [],
+    budget: {
+      ...limits,
+      modelSteps: 0,
+      toolCalls: 0,
+    },
     events: [
-      { sequence: 1, recordedAt: new Date().toISOString(), type: "run_started", detail: task },
+      {
+        eventId: randomUUID(),
+        sequence: 1,
+        recordedAt: new Date().toISOString(),
+        type: "run_started",
+        detail: task,
+      },
     ],
     nextEventSequence: 2,
     stopReason: undefined,
@@ -84,20 +125,22 @@ export function createInitialState(task: string, cwd: string): AgentState {
 }
 ```
 
-在 `src/index.ts` 中创建状态，再把 `state.task` 发送给模型。先打印 `runId`，后续日志都使用它关联同一次运行。
+用 `createInitialState` 替换最小 Loop 中临时构造的 `MinimalAgentState`，并把验证章的 `RunLedger` 字段合并进来；这是迁移，不是重新创建一份账本。Harness 的 `maxSteps`、工具章加入的调用上限和当前计数都写入 `budget`，恢复运行时不能清零。先打印 `runId`，后续日志都使用它关联同一次运行。
 
 </Step>
 
 <Step id="enforce-transitions" number={4} title="用状态机执行合法转换">
 
-不要在各处分散写 `state.status = ...`。创建唯一转换入口，明确哪些边可以走，并在同一操作中追加带单调序号和时间戳的事件。
+不要在各处分散写 `state.status = ...`。先创建通用事件追加函数，后续批准、用户输入、规划和恢复章节都复用它；事件 `type` 使用受测试约束的稳定字符串注册表，而不是每章重新声明一个不兼容的联合类型。
 
 ```typescript
 const allowedTransitions: Record<AgentState["status"], AgentState["status"][]> = {
-  running: ["completed", "failed", "blocked"],
-  blocked: ["running", "failed"],
+  running: ["waiting", "completed", "failed", "blocked", "cancelled"],
+  waiting: ["running", "failed", "cancelled"],
+  blocked: [],
   completed: [],
   failed: [],
+  cancelled: [],
 };
 
 export function transitionState(
@@ -109,21 +152,38 @@ export function transitionState(
   if (!allowedTransitions[state.status].includes(next)) {
     throw new Error(`invalid state transition: ${state.status} -> ${next}`);
   }
-  if ((next === "completed" || next === "failed" || next === "blocked") && !reason.trim()) {
-    throw new Error("terminal transition requires a reason");
+  if (next !== "running" && !reason.trim()) {
+    throw new Error("state transition requires a reason");
   }
 
+  return appendEvent(
+    {
+      ...state,
+      status: next,
+      stopReason: next === "running" ? undefined : reason,
+    },
+    "status_changed",
+    `${state.status} -> ${next}: ${reason}`,
+    now,
+  );
+}
+
+export function appendEvent(
+  state: AgentState,
+  type: string,
+  detail: string,
+  now = new Date(),
+): AgentState {
   return {
     ...state,
-    status: next,
-    stopReason: next === "running" ? undefined : reason,
     events: [
       ...state.events,
       {
+        eventId: randomUUID(),
         sequence: state.nextEventSequence,
         recordedAt: now.toISOString(),
-        type: "status_changed",
-        detail: `${state.status} -> ${next}: ${reason}`,
+        type,
+        detail,
       },
     ],
     nextEventSequence: state.nextEventSequence + 1,
@@ -131,19 +191,19 @@ export function transitionState(
 }
 ```
 
-本章的状态机只管理运行生命周期；第 04 章把 `TaskPlan` 嵌入同一个 `AgentState`，计划步骤状态不能反向覆盖运行状态。最终完成还要在后续章节加入验收证据门禁。
+本章的状态机只管理运行生命周期；前一章已经建立的验证证据门禁继续读取同一份状态，后面的规划章会再把 `TaskPlan` 嵌入其中。计划步骤状态不能反向覆盖运行状态。`waiting` 表示可由批准或用户回答恢复，`blocked` 表示策略或环境已确定拒绝、不能直接恢复，两者不要混用。
 
 </Step>
 
 <Step id="test-state-machine" number={5} title="测试成功、失败和阻塞路径">
 
-创建 `tests/state.test.ts`，固定时间并验证：`running → completed`、`running → failed`、`running → blocked → running`；终态不能恢复；空停止原因被拒绝；每次转换的 sequence 严格递增且 `recordedAt` 可解析。测试的是公开状态转换，不是 UUID 实现。
+创建 `tests/state.test.ts`，固定时间并验证：`running → completed`、`running → failed`、`running → waiting → running`、`running → cancelled` 与 `running → blocked`；终态不能恢复；空停止原因被拒绝；每次转换的 sequence 严格递增且 `recordedAt` 可解析。测试的是公开状态转换，不是 UUID 实现。
 
 ```typescript
-it("records a blocked and resumed run without losing audit order", () => {
+it("records a waiting and resumed run without losing audit order", () => {
   const initial = createInitialState("检查 package.json", "/workspace");
-  const blocked = transitionState(initial, "blocked", "approval_required", fixedTime);
-  const resumed = transitionState(blocked, "running", "approval_granted", laterTime);
+  const waiting = transitionState(initial, "waiting", "approval_required", fixedTime);
+  const resumed = transitionState(waiting, "running", "approval_granted", laterTime);
 
   expect(resumed.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
   expect(resumed.status).toBe("running");
@@ -155,6 +215,6 @@ it("records a blocked and resumed run without losing audit order", () => {
 
 <Checkpoint command='pnpm test -- tests/state.test.ts && pnpm dev -- "检查 package.json"'>
 
-状态机测试应覆盖完成、失败、阻塞、恢复与非法转换；终端随后输出唯一 `runId` 和模型回复。连续运行两次时 `runId` 不同，但每次运行内部的事件 sequence 都从 1 开始并连续递增。
+状态机测试应覆盖完成、失败、等待、恢复、取消、阻塞与非法转换，并断言验证账本和预算在等待恢复后没有丢失；终端随后输出唯一 `runId` 和模型回复。连续运行两次时 `runId` 不同，但每次运行内部的事件 sequence 都从 1 开始并连续递增。
 
 </Checkpoint>

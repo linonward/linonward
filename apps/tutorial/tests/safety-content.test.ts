@@ -47,7 +47,8 @@ describe("safe repository agent lessons", () => {
 
     expect(source).toContain('type: "ask"');
     expect(source).toContain("ApprovalRequest");
-    expect(source).toContain("authorize(tool, input, context)");
+    expect(source).toContain("authorize(tool, prepared.input, policyContext)");
+    expect(source).toContain("tool.prepare(rawInput)");
     expect(source).toContain("network");
     expect(source).toContain("allowedArgv");
   });

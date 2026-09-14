@@ -1,0 +1,166 @@
+<LessonOverview
+  goal="让 Agent 在信息不足时提出可回答的问题，持久化等待状态，并在用户补充或修改要求后安全继续。"
+  task="让 Agent 在 --name 的默认值不明确时请求澄清，并在用户回答后从原计划继续。"
+  prerequisites="Agent 已有权限策略、持久等待状态、可审计任务状态，以及能够根据证据修订的 TaskPlan。"
+  files={["src/interaction.ts", "src/types.ts", "src/agent-loop.ts", "src/index.ts", "tests/interaction.test.ts"]}
+/>
+
+一次性 CLI 输入不足以承载真实 Agent 工作。缺少关键产品选择时继续猜测会造成错误修改；每遇到小歧义都提问，又会让 Agent 失去自主性。本章把“什么时候问、问什么、回答后怎样继续”变成 Harness 的显式协议。
+
+<Step id="clarify-contract" number={1} title="定义澄清契约">
+
+只有答案会改变实现、权限或验收结果时才阻塞提问。模型可以提出候选问题，但 Harness 负责校验问题是否具体、是否真的缺少答案，以及当前是否已有同类未决请求。
+
+```typescript
+export interface UserInputRequest {
+  id: string;
+  kind: "clarification" | "approval" | "manual_reconciliation";
+  question: string;
+  reason: string;
+  relatedStepId?: string;
+  createdAt: string;
+  expiresAt?: string;
+}
+
+export interface UserInputAnswer {
+  requestId: string;
+  content: string;
+  receivedAt: string;
+}
+
+export interface AgentState {
+  pendingUserInput?: UserInputRequest | undefined;
+  goalVersion: number;
+  constraints: string[];
+}
+
+export interface ContextKindMap {
+  user_input: true;
+}
+
+export interface StopReasonMap {
+  approval_required: true;
+  user_input_required: true;
+}
+
+export interface ModelTurn {
+  userInputRequest?: UserInputRequest | undefined;
+}
+```
+
+把 `AgentState` 和 `StopReasonMap` 字段加在 `src/types.ts`，把 `ContextKindMap` 字段加在 `src/context.ts`，把 `ModelTurn` 字段加在 `src/model.ts`；这里利用同一模块内的 TypeScript interface merging 扩展既有契约。同时在 `createInitialState` 中初始化 `pendingUserInput: undefined`、`goalVersion: 1` 与 `constraints: []`。不能只在交互函数中使用这些字段而不声明。
+
+模型适配器把保留的 `request_user_input` function call 用 Zod 校验后转成 `userInputRequest`，并从普通 `toolCalls` 中移除；一次 turn 同时出现用户请求和副作用工具时应拒绝为 `invalid_model_output`。这样澄清不会误走普通工具权限，也不会在等待前产生其他副作用。
+
+在 `src/interaction.ts` 实现答案到上下文来源的确定映射：
+
+```typescript
+function answerAsContextSource(
+  request: UserInputRequest,
+  answer: UserInputAnswer,
+): ContextSource {
+  return {
+    id: `user-input:${answer.requestId}`,
+    kind: "user_input",
+    label: request.question,
+    content: answer.content,
+    priority: 98,
+  };
+}
+```
+
+不要询问可以通过只读工具查明的事实。问题应一次只解决一个决策，并解释该答案会影响什么；禁止把隐藏推理、整份计划或笼统的“接下来怎么办”包装成澄清请求。
+
+</Step>
+
+<Step id="persist-user-request" number={2} title="持久化等待请求">
+
+等待必须是持久状态，而不是一个悬空的 Promise。发出问题前先保存请求和事件，再将运行从 `running` 转成 `waiting`。
+
+```typescript
+export function waitForUserInput(
+  state: AgentState,
+  request: UserInputRequest,
+): AgentState {
+  if (state.pendingUserInput) throw new Error("user_input_already_pending");
+
+  const recorded = appendEvent(
+    { ...state, pendingUserInput: request },
+    "user_input_requested",
+    JSON.stringify(request),
+  );
+  return transitionState(
+    recorded,
+    "waiting",
+    request.kind,
+  );
+}
+```
+
+CLI 应输出稳定的 `runId`、`requestId` 和问题文本，然后退出。进程退出不能丢失问题，也不能把等待误报成失败。
+
+</Step>
+
+<Step id="resume-with-input" number={3} title="用用户输入恢复运行">
+
+新增明确的回答入口，回答必须绑定当前未决请求。未知、过期、重复或属于另一个 run 的 `requestId` 都应拒绝。
+
+```shell
+agent answer <run-id> <request-id> "默认使用当前用户名"
+```
+
+```typescript
+export function applyUserAnswer(state: AgentState, answer: UserInputAnswer): AgentState {
+  const pending = state.pendingUserInput;
+  if (!pending || pending.id !== answer.requestId) throw new Error("unexpected_user_input");
+  if (!answer.content.trim()) throw new Error("empty_user_input");
+
+  const recorded = appendEvent(
+    {
+      ...state,
+      pendingUserInput: undefined,
+      contextSources: [...state.contextSources, answerAsContextSource(pending, answer)],
+    },
+    "user_input_received",
+    JSON.stringify(answer),
+  );
+  return transitionState(
+    recorded,
+    "running",
+    "user_input_received",
+  );
+}
+```
+
+用户回答是高价值输入，但仍不能绕过系统权限。恢复后重新 Assemble 当前 Goal、计划、问题和答案；不要重新创建 run、清零预算或丢弃已经完成的步骤。
+
+</Step>
+
+<Step id="steer-active-run" number={4} title="处理中途转向">
+
+用户可能在 Agent 运行时补充约束、取消任务或改变目标。把每条输入分类为 `answer`、`constraint`、`goal_change` 或 `cancel`：
+
+```text
+answer       → 解决当前请求并继续
+constraint   → 保留原 Goal，追加约束并触发重规划
+goal_change  → 保存新 Goal 版本，失效不再适用的计划与批准
+cancel       → 取消模型和工具，保存停止原因
+```
+
+目标改变后，旧批准只有在 action digest 仍完全相同时才能复用；旧验证证据只有在文件 revision 和验收条件都不变时才有效。已经发生的副作用不能从历史中删除，应在新计划中明确保留、撤销或交给人工处理。
+
+</Step>
+
+<Step id="test-interaction" number={5} title="测试交互状态机">
+
+创建 `tests/interaction.test.ts`，覆盖：缺少关键选择时进入 waiting；问题先落盘再停止；正确回答恢复同一 run；重复回答被拒绝；约束触发重规划；目标变化使不匹配的批准失效；取消信号传播到当前模型与工具；可由仓库证据回答的问题不会打扰用户。
+
+测试断言状态、事件、计划版本和权限凭证，不断言模型生成问题的具体措辞。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test -- tests/interaction.test.ts">
+
+运行一个 Fake Agent：它先请求 `--name` 默认值，Harness 保存问题并以 `waiting` 返回；随后通过 `agent answer` 提交答案，确认同一 `runId` 从原计划和原预算继续。再发送一次目标变更，确认计划版本递增、旧批准失效且已发生的文件变更仍保留在审计记录中。
+
+</Checkpoint>
