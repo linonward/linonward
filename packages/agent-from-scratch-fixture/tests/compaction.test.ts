@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
+import {
+  runAgentLoop,
+  type AgentLoopOptions,
+  type LoopCompactionOptions,
+} from "../src/agent-loop.js";
 import {
   buildCompactionSnapshot,
   compactionAsContextSources,
@@ -11,9 +17,22 @@ import {
   validateCompaction,
   type Compactor,
 } from "../src/compaction.js";
+import { defineTool } from "../src/tool.js";
+import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
 import { createInitialState } from "../src/state.js";
+import { InMemoryTraceSink } from "../src/trace.js";
 import type { AgentEvent, AgentState, CompactionSnapshot } from "../src/types.js";
-import { criterion, makeTaskPlan, planStep } from "./support.js";
+import {
+  ScriptedPlanner,
+  completeWith,
+  createRegistry,
+  criterion,
+  makeDraft,
+  makeTaskPlan,
+  makeTempDir,
+  planStep,
+  removeTempDir,
+} from "./support.js";
 
 type Draft = Omit<CompactionSnapshot, "id" | "createdAt" | "checksum">;
 
@@ -25,7 +44,6 @@ function createFakeCompactor(overrides: Partial<Draft> = {}): Compactor {
       return {
         sourceEventRange: { from: 0, to: 0 },
         goal: input.task,
-        constraints: [],
         decisions: [],
         completedWork: input.plan.steps
           .filter((step) => step.status === "completed")
@@ -36,9 +54,10 @@ function createFakeCompactor(overrides: Partial<Draft> = {}): Compactor {
         acceptanceCriteria: input.plan.acceptanceCriteria,
         activeSkills: input.activeSkillNames,
         changedFiles: input.changedFiles,
-        validationResults: [],
-        unresolvedQuestions: [],
-        failedAttempts: [],
+        constraints: [...input.constraints],
+        failedAttempts: [...input.failedAttempts],
+        validationResults: input.validationResults,
+        unresolvedQuestions: [...input.unresolvedQuestions],
         ...overrides,
       };
     },
@@ -290,3 +309,200 @@ function createStateSafeSnapshot(): CompactionSnapshot {
     checksum: "checksum",
   };
 }
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => removeTempDir(directory)));
+});
+
+async function tempDir(): Promise<string> {
+  const directory = await makeTempDir("agent-compaction-loop-");
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+const historyTool = defineTool({
+  name: "read_history",
+  description: "Return a large observation so the context crosses the compaction threshold.",
+  effect: "read",
+  schema: z.object({ blob: z.string().min(1) }).strict(),
+  async execute(input) {
+    return { blob: input.blob };
+  },
+});
+
+function historyCall(callId: string, blobText: string) {
+  return { callId, name: "read_history", argumentsJson: JSON.stringify({ blob: blobText }) };
+}
+
+/** Executor 会把工具返回值包成 `{ ok, data }`，证据必须与 observation 完全一致。 */
+function historyObservation(blobText: string): string {
+  return JSON.stringify({ ok: true, data: { blob: blobText } });
+}
+
+/** 只统计字符数的确定性估算器，避免测试依赖 tokenizer。 */
+function charactersEstimator(multiplier = 1) {
+  return (input: { sources: Array<{ content: string }>; instructions: string }): number =>
+    input.sources.reduce((total, source) => total + source.content.length, 0) * multiplier;
+}
+
+function compactionOptions(
+  compactor: Compactor,
+  contextWindowTokens: number,
+  estimateInputTokens = charactersEstimator(),
+): LoopCompactionOptions {
+  return {
+    compactor,
+    contextWindowTokens,
+    reservedOutputTokens: 0,
+    rawTailSize: 2,
+    estimateInputTokens,
+  };
+}
+
+function loopOptions(
+  cwd: string,
+  input: {
+    driver: FakeModelDriver;
+    planner: ScriptedPlanner;
+    compaction: LoopCompactionOptions;
+  },
+): AgentLoopOptions {
+  return {
+    cwd,
+    skillsDirectory: cwd,
+    maxSteps: 8,
+    maxToolCalls: 8,
+    toolTimeoutMs: 2_000,
+    model: input.driver,
+    planner: input.planner,
+    tools: createRegistry(historyTool),
+    trace: new InMemoryTraceSink(),
+    compaction: input.compaction,
+  };
+}
+
+const blob = "x".repeat(1_200);
+
+describe("agent loop compaction wiring", () => {
+  it("compacts inside the loop and projects snapshot plus raw tail into the next request", async () => {
+    const cwd = await tempDir();
+    const driver = new FakeModelDriver([
+      turnWithTools(
+        historyCall("call-1", blob),
+        historyCall("call-2", blob),
+        historyCall("call-3", blob),
+      ),
+      turnWithTools(historyCall("call-4", blob)),
+      textTurn("已经完成。", "response-final"),
+    ]);
+    const planner = new ScriptedPlanner(
+      makeDraft({
+        steps: [
+          { id: "inspect", title: "读取历史" },
+          { id: "summarize", title: "总结并完成" },
+        ],
+      }),
+      [
+        completeWith([historyObservation(blob)], ["criterion-1"]),
+        completeWith([historyObservation(blob)], []),
+      ],
+    );
+
+    const result = await runAgentLoop(
+      "压缩长运行",
+      loopOptions(cwd, {
+        driver,
+        planner,
+        compaction: compactionOptions(createFakeCompactor(), 400),
+      }),
+    );
+
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.state.compaction.snapshots.length).toBeGreaterThanOrEqual(1);
+
+    // 第二轮请求是被压缩后组装的：既有快照来源，也有 rawTail 里的原始观察。
+    const compactedRequest = driver.turns[1]?.request;
+    if (compactedRequest === undefined) throw new Error("second model request missing");
+    const rendered = JSON.stringify(compactedRequest);
+    expect(rendered).toContain("compaction_snapshot");
+    expect(rendered).toContain(blob);
+
+    // 被快照覆盖的 call-1 ~ call-3 不再是独立 context source，避免与 rawTail 重复。
+    expect(
+      result.state.contextSources.filter((source) => source.kind === "tool_observation"),
+    ).toEqual([]);
+    expect(
+      result.state.contextSources.some((source) => source.kind === "compaction_snapshot"),
+    ).toBe(false);
+  });
+
+  it("does not compact below the threshold and keeps observations in context", async () => {
+    const cwd = await tempDir();
+    const driver = new FakeModelDriver([
+      turnWithTools(historyCall("call-1", blob), historyCall("call-2", blob)),
+      textTurn("已完成。", "response-final"),
+    ]);
+    const planner = new ScriptedPlanner(
+      makeDraft({ steps: [{ id: "inspect", title: "读取历史" }] }),
+      [completeWith([historyObservation(blob)], ["criterion-1"])],
+    );
+
+    const result = await runAgentLoop(
+      "短运行",
+      loopOptions(cwd, {
+        driver,
+        planner,
+        compaction: compactionOptions(createFakeCompactor(), 1_000_000),
+      }),
+    );
+
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.state.compaction.snapshots).toHaveLength(0);
+    expect(
+      result.state.contextSources.filter((source) => source.kind === "tool_observation"),
+    ).toHaveLength(2);
+  });
+
+  it("stops with compaction_failed after two consecutive rejected snapshots", async () => {
+    const cwd = await tempDir();
+    const driver = new FakeModelDriver([
+      turnWithTools(historyCall("call-1", blob), historyCall("call-2", blob)),
+      textTurn("不应该到达这里。", "response-final"),
+    ]);
+    const planner = new ScriptedPlanner(
+      makeDraft({
+        steps: [
+          { id: "inspect", title: "读取历史" },
+          { id: "verify", title: "验证结果" },
+        ],
+      }),
+      [completeWith([historyObservation(blob)], ["criterion-1"])],
+    );
+
+    const result = await runAgentLoop(
+      "坏压缩器",
+      loopOptions(cwd, {
+        driver,
+        planner,
+        // 漏掉 pending step，validateCompaction 必须拒绝。
+        compaction: compactionOptions(createFakeCompactor({ pendingWork: [] }), 400),
+      }),
+    );
+
+    expect(result.stopReason).toBe("compaction_failed");
+    expect(result.status).toBe("failed");
+    expect(result.state.compaction.snapshots).toHaveLength(0);
+    // 原上下文与观察都还在，没有换用"差不多"的摘要。
+    const rejected = result.state.events.filter((event) => event.type === "compaction_rejected");
+    expect(rejected.map((event) => event.detail).join(" ")).toContain(
+      "missing pending step: verify",
+    );
+    // 压缩失败不是工具失败：不能污染 failedAttempts（它是 shouldReplan 与快照投影的输入）。
+    expect(result.state.failedAttempts).toEqual([]);
+    expect(
+      result.state.contextSources.filter((source) => source.kind === "tool_observation"),
+    ).toHaveLength(2);
+  });
+});
