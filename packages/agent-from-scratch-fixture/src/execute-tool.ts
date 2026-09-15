@@ -178,13 +178,16 @@ export async function executeToolCall(
   if (decision.type === "ask") {
     const approvals = options.approvals ?? new InMemoryApprovalLedger();
     const runId = options.runId ?? "anonymous-run";
+
+    // 先落盘请求、再判定是否已有凭证：审计不会因为"已经批准过"而丢掉这次请求，
+    // 账本也可以在保存时发放凭证（例如"策略已放行即批准"的无人值守实现）。
+    await approvals.saveApprovalRequest(runId, decision.request);
     const grant = await approvals.consumeApprovalGrant(
       runId,
       decision.request.actionDigest,
       options.now,
     );
     if (!grant) {
-      await approvals.saveApprovalRequest(runId, decision.request);
       return {
         type: "waiting",
         requestId: decision.request.id,
