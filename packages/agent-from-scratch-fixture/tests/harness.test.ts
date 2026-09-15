@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -50,6 +51,9 @@ function data(output: string): Record<string, unknown> {
   if (!isRecord(value)) throw new Error("observation has no data object");
   return value;
 }
+
+/** `search_text` 依赖外部 ripgrep；CI 会安装它，本地可能没有。 */
+const hasRipgrep = spawnSync("rg", ["--version"], { stdio: "ignore" }).status === 0;
 
 describe("minimal agent loop", () => {
   it("emits run_started → model_started → model_completed → run_stopped and stops with final_answer", async () => {
@@ -254,12 +258,10 @@ describe("workspace boundaries", () => {
     expect(parse(result.output)["error"]).toBe("path_outside_workspace");
   });
 
-  it("reads files and searches literal text without leaking excluded directories", async () => {
+  it("reads files inside the workspace with an explicit truncation flag", async () => {
     const cwd = await tempDir();
-    await mkdir(join(cwd, "node_modules"), { recursive: true });
-    await writeFile(join(cwd, "node_modules", "hidden.txt"), "needle\n", "utf8");
     await writeFile(join(cwd, "visible.txt"), "needle here\n", "utf8");
-    const registry = createRegistry(readFileTool, searchTextTool);
+    const registry = createRegistry(readFileTool);
 
     const read = await executeToolCall({
       call: call("read_file", { path: "visible.txt" }),
@@ -267,6 +269,20 @@ describe("workspace boundaries", () => {
       cwd,
       timeoutMs: 2_000,
     });
+
+    if (read.type !== "observation") throw new Error("expected an observation");
+    expect(data(read.output)).toMatchObject({ path: "visible.txt", truncated: false });
+    expect(typeof data(read.output)["sha256"]).toBe("string");
+  });
+
+  // ripgrep 是外部二进制：CI 会显式安装它，开发者机器上则可能没有。
+  it.skipIf(!hasRipgrep)("searches literal text without leaking excluded directories", async () => {
+    const cwd = await tempDir();
+    await mkdir(join(cwd, "node_modules"), { recursive: true });
+    await writeFile(join(cwd, "node_modules", "hidden.txt"), "needle\n", "utf8");
+    await writeFile(join(cwd, "visible.txt"), "needle here\n", "utf8");
+    const registry = createRegistry(searchTextTool);
+
     const search = await executeToolCall({
       call: call("search_text", { query: "needle" }, "call-2"),
       registry,
@@ -274,16 +290,36 @@ describe("workspace boundaries", () => {
       timeoutMs: 5_000,
     });
 
-    if (read.type !== "observation" || search.type !== "observation") {
-      throw new Error("expected observations");
-    }
-    expect(data(read.output)).toMatchObject({ path: "visible.txt", truncated: false });
-    expect(typeof data(read.output)["sha256"]).toBe("string");
-
+    if (search.type !== "observation") throw new Error("expected an observation");
     const matches = data(search.output)["matches"];
     expect(Array.isArray(matches)).toBe(true);
     expect(JSON.stringify(matches)).toContain("visible.txt");
     expect(JSON.stringify(matches)).not.toContain("node_modules");
+  });
+
+  it("reports a structured observation instead of throwing when the search binary is missing", async () => {
+    const cwd = await tempDir();
+    await writeFile(join(cwd, "visible.txt"), "needle\n", "utf8");
+    const registry = createRegistry(searchTextTool);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      const search = await executeToolCall({
+        call: call("search_text", { query: "needle" }, "call-3"),
+        registry,
+        cwd,
+        timeoutMs: 5_000,
+      });
+
+      if (search.type !== "observation") throw new Error("expected an observation");
+      expect(search.ok).toBe(false);
+      expect(search.errorCode).toBe("tool_error");
+      expect(JSON.parse(search.output)).toMatchObject({ ok: false, error: "tool_error" });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
   });
 });
 
