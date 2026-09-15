@@ -1,56 +1,28 @@
-import { type ReactElement, useEffect, useRef, useState } from "react";
+import { type ReactElement, useEffect, useRef } from "react";
 
+import { AnswerBox } from "./components/AnswerBox.js";
 import { Collapsible } from "./components/Collapsible.js";
+import { SnapshotPanel } from "./components/SnapshotPanel.js";
 import { StopBanner } from "./components/StopBanner.js";
 import { Timeline } from "./components/Timeline.js";
 import { UsagePanel } from "./components/UsagePanel.js";
 import { pendingQuestion, type RunView } from "./lib/journal.js";
+import type { RunSnapshotView } from "./lib/snapshot.js";
 
 export interface RunConsoleProps {
   view: RunView;
   streaming: boolean;
   paused: boolean;
   error?: string | undefined;
+  /** checkpoint 兜底数据；实时流不可用时它是唯一能看到的东西。 */
+  snapshot?: RunSnapshotView | undefined;
+  /** 实时流已经拿不到了（API 进程重启 / 频道被挤出缓冲）。 */
+  streamUnavailable?: boolean | undefined;
   onTogglePause(): void;
   onStop(): void;
   onAnswer(input: { requestId: string; text: string }): void;
-}
-
-function AnswerBox({
-  requestId,
-  reason,
-  onAnswer,
-}: {
-  requestId: string;
-  reason: string;
-  onAnswer(input: { requestId: string; text: string }): void;
-}): ReactElement {
-  const [text, setText] = useState("");
-  return (
-    <form
-      className="answer"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (text.trim().length === 0) return;
-        onAnswer({ requestId, text: text.trim() });
-        setText("");
-      }}
-    >
-      <strong>需要回答（requestId={requestId}）</strong>
-      <p className="muted small">{reason}</p>
-      <div className="answer-row">
-        <input
-          aria-label="answer-text"
-          value={text}
-          placeholder="批准 / 澄清内容"
-          onChange={(event) => setText(event.target.value)}
-        />
-        <button className="primary" type="submit" disabled={text.trim().length === 0}>
-          提交并继续
-        </button>
-      </div>
-    </form>
-  );
+  /** 清空当前运行并去掉地址栏里的 `?run=`，回到全新状态。 */
+  onNew(): void;
 }
 
 /**
@@ -63,9 +35,12 @@ export function RunConsole({
   streaming,
   paused,
   error,
+  snapshot,
+  streamUnavailable = false,
   onTogglePause,
   onStop,
   onAnswer,
+  onNew,
 }: RunConsoleProps): ReactElement {
   const endRef = useRef<HTMLDivElement | null>(null);
   const rounds = view.rounds.length;
@@ -79,6 +54,14 @@ export function RunConsole({
   }, [paused, rounds, logLines]);
 
   const question = pendingQuestion(view);
+  // 时间线里没有待答请求时才回落到快照里的那条：两者不会重复渲染同一个请求。
+  const snapshotQuestion = question === undefined ? snapshot?.pending : undefined;
+  // 频道没了就答不了（`answer` 依赖进程内的批准账本），此时快照只作说明，不给表单。
+  const snapshotCanAnswer = snapshotQuestion !== undefined && !streamUnavailable;
+  // 频道还在且有记录时，时间线比快照丰富；否则（进程重启、缓冲被挤出）只能给快照。
+  const showSnapshot =
+    snapshot !== undefined &&
+    (streamUnavailable || view.rounds.length === 0 || snapshotQuestion !== undefined);
 
   return (
     <div className="console">
@@ -93,15 +76,31 @@ export function RunConsole({
         <button type="button" onClick={onStop} disabled={!streaming}>
           断开实时流
         </button>
+        <button type="button" onClick={onNew}>
+          清空并新建
+        </button>
       </div>
 
       {error === undefined ? null : <p className="error">{error}</p>}
 
       <StopBanner view={view} />
 
+      {showSnapshot ? (
+        <SnapshotPanel snapshot={snapshot} streamUnavailable={streamUnavailable} />
+      ) : null}
+
       {question === undefined ? null : (
         <AnswerBox requestId={question.requestId} reason={question.reason} onAnswer={onAnswer} />
       )}
+
+      {snapshotCanAnswer ? (
+        <AnswerBox
+          requestId={snapshotQuestion.requestId}
+          question={snapshotQuestion.question}
+          reason={snapshotQuestion.reason}
+          onAnswer={onAnswer}
+        />
+      ) : null}
 
       <div className="console-grid">
         <main className="console-main">

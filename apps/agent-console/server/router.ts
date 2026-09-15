@@ -8,7 +8,7 @@ import {
   readString,
 } from "../src/lib/journal.js";
 import type { RunHub } from "./bus.js";
-import { redactAll, secretValues } from "./redact.js";
+import { redactAll, redactRecord, secretValues } from "./redact.js";
 import {
   CONSOLE_DEFAULT_MAX_STEPS,
   CONSOLE_DEFAULT_MAX_TOOL_CALLS,
@@ -23,6 +23,7 @@ export const MAX_BODY_BYTES = 1_000_000;
 
 export type RouteMatch =
   | { name: "health" }
+  | { name: "runs" }
   | { name: "start" }
   | { name: "stream"; runId: string }
   | { name: "snapshot"; runId: string }
@@ -31,6 +32,7 @@ export type RouteMatch =
 /** 纯路由匹配：只做方法与路径的判断，方便离线单测。 */
 export function matchRoute(method: string, pathname: string): RouteMatch | undefined {
   if (method === "GET" && pathname === "/api/health") return { name: "health" };
+  if (method === "GET" && pathname === "/api/runs") return { name: "runs" };
   if (method === "POST" && pathname === "/api/run") return { name: "start" };
 
   const match = /^\/api\/runs\/([^/]+)(\/stream|\/answer)?$/.exec(pathname);
@@ -243,6 +245,12 @@ export function createRequestHandler(
             ok: true,
             apiKeyConfigured: typeof apiKey === "string" && apiKey.length > 0,
           });
+          return;
+        }
+        case "runs": {
+          const runs = await options.runner.list();
+          // 任务描述可能被模型写进过密钥？不可能，但脱敏是承诺：出口统一过一遍。
+          sendJson(response, 200, redactRecord({ runs }, secrets));
           return;
         }
         case "start": {

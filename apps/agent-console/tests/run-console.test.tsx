@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { RunList } from "../src/components/RunList.js";
 import { type JournalRecord, projectRun } from "../src/lib/journal.js";
+import type { RunSnapshotView } from "../src/lib/snapshot.js";
 import { RunConsole } from "../src/RunConsole.js";
 
 /** 一轮带思维链与工具调用 + 一轮没有推理的离线记录。 */
@@ -113,6 +115,7 @@ describe("RunConsole 渲染", () => {
         onTogglePause={noop}
         onStop={noop}
         onAnswer={noop}
+        onNew={noop}
       />,
     );
 
@@ -159,9 +162,158 @@ describe("RunConsole 渲染", () => {
         onTogglePause={noop}
         onStop={noop}
         onAnswer={noop}
+        onNew={noop}
       />,
     );
 
     expect(html).toContain("cost=unknown");
+  });
+});
+
+/** `GET /api/runs/:runId` 的解析结果：频道没了之后界面唯一的数据源。 */
+function snapshot(overrides: Partial<RunSnapshotView> = {}): RunSnapshotView {
+  return {
+    runId: "run-1",
+    task: "读取 package.json 并总结",
+    savedAt: "2024-01-01T00:00:05.000Z",
+    status: "waiting",
+    stopReason: "approval_required",
+    budget: { maxSteps: 6, maxToolCalls: 12, modelSteps: 1, toolCalls: 1 },
+    usage: {
+      inputTokens: 1_262,
+      outputTokens: 64,
+      cachedInputTokens: 1_024,
+      modelCalls: 1,
+      wallMs: 3_000,
+      costUsd: 0.000613,
+    },
+    changedFiles: [],
+    pending: {
+      requestId: "req-1",
+      question: "是否允许执行 run_command？",
+      reason: "策略要求人工批准",
+    },
+    ...overrides,
+  };
+}
+
+describe("RunConsole 的 checkpoint 快照面板", () => {
+  it("实时流不可用时，用快照说清状态、预算与成本", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", [])}
+        streaming={false}
+        paused={false}
+        snapshot={snapshot()}
+        streamUnavailable
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).toContain('data-testid="snapshot-panel"');
+    expect(html).toContain("运行快照（来自 checkpoint）");
+    expect(html).toContain("实时流不可用");
+    expect(html).toContain("读取 package.json 并总结");
+    expect(html).toContain("waiting");
+    expect(html).toContain("approval_required");
+    expect(html).toContain("1/6");
+    expect(html).toContain("1/12");
+    expect(html).toContain("$0.000613");
+  });
+
+  it("频道还在时，快照里的待答请求渲染成可提交的输入框", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", [])}
+        streaming
+        paused={false}
+        snapshot={snapshot()}
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).toContain('data-testid="answer-box"');
+    expect(html).toContain("需要回答（requestId=req-1）");
+    expect(html).toContain("是否允许执行 run_command？");
+    expect(html).toContain("策略要求人工批准");
+  });
+
+  it("进程重启后（频道没了）不再给输入框，只说明在等什么、为什么答不了", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", [])}
+        streaming={false}
+        paused={false}
+        snapshot={snapshot()}
+        streamUnavailable
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).not.toContain('data-testid="answer-box"');
+    expect(html).toContain("等待回答");
+    expect(html).toContain("requestId=req-1");
+    expect(html).toContain("无法继续");
+  });
+
+  it("没有快照时不渲染快照面板", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", records())}
+        streaming={false}
+        paused={false}
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).not.toContain('data-testid="snapshot-panel"');
+    expect(html).not.toContain("实时流不可用");
+  });
+});
+
+describe("RunList 渲染", () => {
+  it("列出最近的运行，并标出还在实时接收的那些", () => {
+    const html = renderToStaticMarkup(
+      <RunList
+        runs={[
+          {
+            runId: "run-live",
+            task: "正在跑的任务",
+            status: "running",
+            savedAt: "2024-01-02T00:00:00.000Z",
+            live: true,
+          },
+          { runId: "run-done", status: "completed", stopReason: "final_answer", live: false },
+        ]}
+        onOpen={noop}
+      />,
+    );
+
+    expect(html).toContain('data-testid="run-list"');
+    expect(html).toContain("run-live");
+    expect(html).toContain("正在跑的任务");
+    expect(html).toContain("实时");
+    expect(html).toContain("run-done");
+    expect(html).toContain("final_answer");
+    // 每一项都是可点的打开按钮。
+    expect(html).toContain("打开");
+  });
+
+  it("没有历史运行时整块不渲染", () => {
+    const html = renderToStaticMarkup(<RunList runs={[]} onOpen={noop} />);
+
+    expect(html).toBe("");
   });
 });

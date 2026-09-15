@@ -260,6 +260,63 @@ textarea:focus {
   margin-top: 6px;
 }
 
+/* checkpoint 快照：实时流不可用时的兜底面板。 */
+.snapshot {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.snapshot-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.snapshot-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 2px 16px;
+}
+
+/* 最近的运行：重开一次旧运行的入口。 */
+.runs {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.runs ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.runs li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.runs .run-id {
+  font-size: 12px;
+}
+
+.runs .run-task {
+  flex: 1 1 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---------- 布局 ---------- */
 
 .console-grid {

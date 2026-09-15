@@ -7,6 +7,12 @@
  */
 
 import { isPlainObject, type JournalRecord, parseJournalRecord } from "./journal.js";
+import {
+  parseRunSnapshot,
+  parseRunSummaries,
+  type RunSnapshotView,
+  type RunSummaryView,
+} from "./snapshot.js";
 
 export interface RunFormValues {
   task: string;
@@ -76,12 +82,22 @@ export async function sendAnswer(runId: string, requestId: string, text: string)
   await postJson(`/api/runs/${encodeURIComponent(runId)}/answer`, { requestId, text });
 }
 
-export async function fetchSnapshot(runId: string): Promise<JournalRecord | undefined> {
+/**
+ * 读 checkpoint 快照。**404 返回 `undefined`**（没有这个运行的检查点），
+ * 其它错误抛出——界面对"没有"和"拿不到"要给出不同的说法。
+ */
+export async function fetchSnapshot(runId: string): Promise<RunSnapshotView | undefined> {
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
   if (response.status === 404) return undefined;
   if (!response.ok) throw new Error(await errorMessage(response));
-  const body: unknown = await response.json();
-  return isPlainObject(body) ? body : undefined;
+  return parseRunSnapshot(await response.json());
+}
+
+/** 最近的运行列表（读磁盘 checkpoint，API 进程重启后依然可用）。 */
+export async function listRuns(): Promise<RunSummaryView[]> {
+  const response = await fetch("/api/runs");
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return parseRunSummaries(await response.json());
 }
 
 /**

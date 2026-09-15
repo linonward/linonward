@@ -44,6 +44,7 @@ server.listen(port, host, () => {
       `DEEPSEEK_API_KEY：${keyState}`,
       `GET  /api/health`,
       `POST /api/run`,
+      `GET  /api/runs`,
       `GET  /api/runs/:runId/stream`,
       `GET  /api/runs/:runId`,
       `POST /api/runs/:runId/answer`,

@@ -1,11 +1,28 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { toDurableState } from "../../../packages/agent-from-scratch-fixture/src/durable-state.js";
+import {
+  createRunCheckpoint,
+  LocalFileRunStore,
+} from "../../../packages/agent-from-scratch-fixture/src/run-store.js";
+import { PreApprovingLedger } from "../../../packages/agent-from-scratch-fixture/src/run-task.js";
+import { createInitialState } from "../../../packages/agent-from-scratch-fixture/src/state.js";
+import type {
+  AgentState,
+  DurableAgentState,
+} from "../../../packages/agent-from-scratch-fixture/src/types.js";
 import { type RunChannel, RunHub } from "../server/bus.js";
-import { createConsoleRunner, RunnerError, type StartRunInput } from "../server/runner.js";
+import {
+  clarificationMismatch,
+  createConsoleRunner,
+  RunnerError,
+  resolveAnswerKind,
+  type StartRunInput,
+} from "../server/runner.js";
 
 const FAKE_KEY = "sk-offline-test-not-a-real-key";
 
@@ -38,6 +55,60 @@ function collected(channel: RunChannel): Record<string, unknown>[] {
     onDone: () => undefined,
   });
   return records;
+}
+
+async function ensureDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true });
+}
+
+/** 造一份"运行过一轮、可能正在等回答"的检查点，用来测快照与列表。 */
+async function seedCheckpoint(input: {
+  storeRoot: string;
+  runId: string;
+  task: string;
+  status?: AgentState["status"];
+  stopReason?: string;
+  savedAt?: Date;
+  pendingUserInput?: DurableAgentState["pendingUserInput"];
+}): Promise<void> {
+  const savedAt = input.savedAt ?? new Date();
+  const store = new LocalFileRunStore(input.storeRoot, () => savedAt);
+  const lease = await store.acquireLease(input.runId, "seed-owner", 60_000);
+  const state = createInitialState(
+    input.task,
+    "/workspace",
+    { maxSteps: 6, maxToolCalls: 12 },
+    { runId: input.runId, now: savedAt },
+  );
+  const withPlan: AgentState = {
+    ...state,
+    status: input.status ?? "waiting",
+    stopReason: input.stopReason ?? "approval_required",
+    plan: {
+      version: 1,
+      goal: input.task,
+      acceptanceCriteria: [{ id: "ac1", description: "验收条件", status: "unverified" }],
+      steps: [
+        {
+          id: "st1",
+          title: "步骤",
+          status: "in_progress",
+          dependsOn: [],
+          completionEvidence: "证据",
+          evidence: [],
+        },
+      ],
+    },
+    pendingUserInput: input.pendingUserInput,
+  };
+  await store.saveCheckpoint(
+    createRunCheckpoint({
+      state: toDurableState(withPlan),
+      throughSequence: 1,
+      now: savedAt,
+    }),
+    lease,
+  );
 }
 
 /**
@@ -120,6 +191,260 @@ describe("createConsoleRunner（离线，假密钥 + 不可达 baseUrl）", () =
       await expect(
         runner.answer("missing-run", { requestId: "req-1", text: "同意" }),
       ).rejects.toMatchObject({ status: 404 });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * 快照与列表都只读磁盘上的 checkpoint：**页面刷新后唯一的兜底数据源**。
+ * 频道还在时走 SSE 补发，频道没了（API 进程重启）就只能靠这里。
+ */
+describe("checkpoint 快照与运行列表（离线）", () => {
+  it("快照带 task 与待答请求，刷新后能把输入框重建出来", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-snapshot-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-waiting",
+        task: "读取 package.json",
+        pendingUserInput: {
+          id: "req-1",
+          kind: "approval",
+          question: "是否允许执行 run_command？",
+          reason: "策略要求人工批准",
+          createdAt: "2024-01-01T00:00:04.000Z",
+        },
+      });
+
+      const runner = createConsoleRunner({ env: {}, hub: new RunHub(), storeRoot: directory });
+      const snapshot = await runner.snapshot("run-waiting");
+
+      expect(snapshot).toMatchObject({
+        runId: "run-waiting",
+        task: "读取 package.json",
+        status: "waiting",
+        stopReason: "approval_required",
+        pending: {
+          requestId: "req-1",
+          question: "是否允许执行 run_command？",
+          reason: "策略要求人工批准",
+        },
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("审批等待没有 pendingUserInput：从 journal 最后一条 waiting 记录里读回 requestId", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-snapshot-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-approval",
+        task: "跑一条命令",
+        status: "waiting",
+        stopReason: "approval_required",
+      });
+      // 审批等待只留在 journal 里（state.pendingUserInput 只管澄清）。
+      await writeFile(
+        join(directory, "run-approval", "journal.jsonl"),
+        [
+          JSON.stringify({ kind: "run_started", at: "2024-01-01T00:00:00.000Z" }),
+          JSON.stringify({
+            kind: "tool_result",
+            callId: "call-1",
+            name: "run_command",
+            ok: false,
+            waiting: { requestId: "req-9", reason: "approval_required" },
+          }),
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const runner = createConsoleRunner({ env: {}, hub: new RunHub(), storeRoot: directory });
+      const snapshot = await runner.snapshot("run-approval");
+
+      expect(snapshot?.pending).toEqual({
+        requestId: "req-9",
+        question: "",
+        reason: "approval_required",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("运行已经不在 waiting 时不会从 journal 里翻出过期的 pending", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-snapshot-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-answered",
+        task: "已经答过了",
+        status: "completed",
+        stopReason: "final_answer",
+      });
+      await writeFile(
+        join(directory, "run-answered", "journal.jsonl"),
+        `${JSON.stringify({
+          kind: "tool_result",
+          callId: "call-1",
+          name: "run_command",
+          waiting: { requestId: "req-9", reason: "approval_required" },
+        })}\n`,
+        "utf8",
+      );
+
+      const runner = createConsoleRunner({ env: {}, hub: new RunHub(), storeRoot: directory });
+      const snapshot = await runner.snapshot("run-answered");
+
+      expect(snapshot === undefined ? true : Object.hasOwn(snapshot, "pending")).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("没有待答请求时快照不含 pending 字段（缺失就是缺失）", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-snapshot-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-done",
+        task: "已完成的任务",
+        status: "completed",
+        stopReason: "final_answer",
+      });
+
+      const runner = createConsoleRunner({ env: {}, hub: new RunHub(), storeRoot: directory });
+      const snapshot = await runner.snapshot("run-done");
+
+      expect(snapshot).toBeDefined();
+      expect(snapshot === undefined ? true : Object.hasOwn(snapshot, "pending")).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("列表按保存时间倒序汇总，并标出还有活频道的运行", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-list-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-old",
+        task: "旧运行",
+        status: "completed",
+        stopReason: "final_answer",
+        savedAt: new Date("2024-01-01T00:00:00.000Z"),
+      });
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-new",
+        task: "新运行",
+        savedAt: new Date("2024-01-02T00:00:00.000Z"),
+      });
+      // 不是运行目录的条目必须被跳过，而不是让整个列表失败。
+      await ensureDirectory(join(directory, "not-a-run"));
+
+      const hub = new RunHub();
+      const live = hub.create("run-old");
+      const runner = createConsoleRunner({ env: {}, hub, storeRoot: directory });
+
+      const runs = await runner.list();
+
+      expect(runs.map((run) => run.runId)).toEqual(["run-new", "run-old"]);
+      expect(runs[0]).toMatchObject({ runId: "run-new", task: "新运行", status: "waiting" });
+      expect(runs[0]?.live).toBe(false);
+      expect(runs[1]?.live).toBe(true);
+
+      // 频道结束后不再是"活着的"。
+      live.finish();
+      const afterFinish = await runner.list();
+      expect(afterFinish.every((run) => !run.live)).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("空目录返回空列表而不是报错", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-list-empty-"));
+    try {
+      const runner = createConsoleRunner({ env: {}, hub: new RunHub(), storeRoot: directory });
+      await expect(runner.list()).resolves.toEqual([]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * 审批与澄清是两条不同的续跑路径：审批只要在账本里批准那条 requestId，
+ * 澄清才要把回答写进状态。搞错的症状很隐蔽——HTTP 200，但运行随即以
+ * `unexpected_user_input` 失败。
+ */
+describe("回答请求的分流（审批 vs 澄清）", () => {
+  const approvalRequest = {
+    id: "req-approval",
+    actionDigest: "digest-1",
+    summary: "Run node -e * in /workspace",
+    risks: ["风险"],
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+
+  it("账本里的 requestId 走审批路径，且凭证一次性、绑定同一个 actionDigest", async () => {
+    const approvals = new PreApprovingLedger();
+    await approvals.saveApprovalRequest("run-1", approvalRequest);
+
+    await expect(resolveAnswerKind(approvals, "run-1", "req-approval")).resolves.toBe("approval");
+
+    await approvals.approve("run-1", "req-approval");
+    // 重放同一调用时才能消费到凭证——这正是 resume 之后循环会做的事。
+    await expect(approvals.consumeApprovalGrant("run-1", "digest-1")).resolves.toBeDefined();
+    // 一次性。
+    await expect(approvals.consumeApprovalGrant("run-1", "digest-1")).resolves.toBeUndefined();
+  });
+
+  it("不属于任何待批准请求的 requestId 归到澄清路径", async () => {
+    const approvals = new PreApprovingLedger();
+
+    await expect(resolveAnswerKind(approvals, "run-1", "req-user-input")).resolves.toBe(
+      "user_input",
+    );
+    // 别的运行的批准请求不能串台。
+    await approvals.saveApprovalRequest("run-2", approvalRequest);
+    await expect(resolveAnswerKind(approvals, "run-1", "req-approval")).resolves.toBe("user_input");
+  });
+
+  it("澄清的 requestId 对不上时给出可读 4xx，而不是 200 + run_error", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-answer-"));
+    try {
+      await seedCheckpoint({
+        storeRoot: directory,
+        runId: "run-waiting",
+        task: "等一个回答",
+        pendingUserInput: {
+          id: "req-real",
+          kind: "clarification",
+          question: "用哪个目录？",
+          reason: "需要澄清",
+          createdAt: "2024-01-01T00:00:04.000Z",
+        },
+      });
+      const store = new LocalFileRunStore(directory);
+
+      await expect(
+        clarificationMismatch(store, "run-waiting", "req-real"),
+      ).resolves.toBeUndefined();
+      await expect(clarificationMismatch(store, "run-waiting", "req-typo")).resolves.toMatchObject({
+        status: 400,
+        message: "requestId 不匹配：当前等待的是 req-real",
+      });
+      await expect(clarificationMismatch(store, "run-done", "req-x")).resolves.toMatchObject({
+        status: 400,
+        message: "这次运行没有待回答的请求：req-x",
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

@@ -218,7 +218,10 @@ export function authorize(
       type: "ask",
       request: createApprovalRequest({
         tool,
-        input,
+        // 摘要只绑定真正会被执行的东西：`command` 与 `args`。
+        // `purpose` 是给人和日志看的标签，不参与执行；把它算进摘要会让"批准后模型重放
+        // 同一调用"因为换个说法而重新要求批准——同一条命令，用户被迫批两次。
+        input: { command: input.command, args: input.args },
         cwd: context.cwd,
         network: context.network,
         summary: `Run ${argv.join(" ")} in ${context.cwd}`,

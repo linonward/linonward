@@ -20,6 +20,9 @@ pnpm --filter @linonward/agent-console dev:web   # http://127.0.0.1:5173
 打开 <http://127.0.0.1:5173>。前端只发相对路径的 `/api/...`，开发时由 Vite 代理到
 `http://127.0.0.1:8787`。
 
+地址栏里的 `?run=<runId>` 就是当前这次运行：刷新页面会重新接上它，链接可以直接分享给
+自己（同一个本地服务）。`清空并新建` 只去掉这个参数，不动磁盘上的运行。
+
 生产构建：
 
 ```sh
@@ -46,10 +49,35 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `GET` | `/api/health` | `{ ok, apiKeyConfigured }`（不含密钥）。 |
 | `POST` | `/api/run` | body `{ task, cwd, allowedArgv?, maxSteps?, maxToolCalls?, approveAllowed?, requireSandbox?, repeatGuard?, plannerModel? }` → `{ runId }`，立即返回。 |
 | `GET` | `/api/runs/:runId/stream` | SSE：`event: journal`（journal 记录 JSON，含 `kind`；每帧带 `id: <seq>`）→ `run_stopped` 之后 `event: done` 并关闭。支持 `?after=<seq>` 断点续订。 |
-| `GET` | `/api/runs/:runId` | 最新 checkpoint 快照：`status` / `stopReason` / `budget` / `usage` / `changedFiles` / `validations` / `plan` / `messages`。 |
+| `GET` | `/api/runs` | 最近的运行列表（读磁盘 checkpoint）：`[{ runId, task?, savedAt?, status?, stopReason?, live }]`。 |
+| `GET` | `/api/runs/:runId` | 最新 checkpoint 快照：`status` / `stopReason` / `budget` / `usage` / `changedFiles` / `validations` / `plan` / `messages` / `pending`（等待回答的请求）。 |
 | `POST` | `/api/runs/:runId/answer` | body `{ requestId, text }`：审批 / 澄清后继续运行。 |
 
 服务只监听 `127.0.0.1`，没有鉴权（本地工具）。
+
+## 刷新 / 重开一次运行
+
+运行完全由 SSE 驱动，而频道活在 API 进程的内存里。所以"刷新不丢"分成两层：
+
+| 情况 | 数据来源 | 界面表现 |
+| --- | --- | --- |
+| 同一个 API 进程 | `?run=` → SSE `?after=0` 全量补发 | 完整时间线，等待中的审批输入框照旧可提交 |
+| API 进程重启过 | `?run=` → checkpoint 快照 | 快照面板（状态 / 预算 / 用量 / 成本 / 计划）；频道取不到时明确说明原因 |
+
+第二层是刻意的兜底：检查点在磁盘上，进程重启后 `GET /api/runs/:runId` 依然答得出来，
+界面因此不会只剩一句"实时流已断开"。注意**继续**一次旧运行仍然要求原进程还在——
+`answer` 依赖进程内的批准账本与运行上下文，进程没了只能重新发起。
+
+等待中的请求有两类，回答入口都在同一个输入框里（`POST /api/runs/:runId/answer`）：
+
+| 类型 | 表现 | 回答后 |
+| --- | --- | --- |
+| 审批（策略 `ask`） | 时间线里出现 `status=waiting` 的工具结果 | 放行那一次调用并续跑 |
+| 澄清（`request_user_input`） | 时间线里出现提问 | 把回答写进上下文并续跑 |
+
+待答的 `requestId` 有两个来源，界面两条都用：实时流的历史补发（`tool_result.waiting`，
+进程还在时走这条）与 checkpoint 快照里的 `pending`（进程重启后走这条）。进程重启后
+快照仍会说明"在等什么"，但**不会**给出输入框——批准账本已经随进程消失，提交只会得到 4xx。
 
 ## 实现要点
 

@@ -200,6 +200,20 @@ peak / off-peak 两档（off-peak 恰好是 peak 的一半），内置表取 **p
 每次 `run` / `resume` / `answer` 都会在结束时释放 run 的 lease，因此三条命令可以连续执行，
 不需要等待 TTL 过期。
 
+`answer` 按 requestId 分辨两条恢复路径：
+
+| 情况 | 恢复方式 |
+| --- | --- |
+| **澄清**（`request_user_input`） | 把回答写进上下文（`applyUserAnswer`），状态回到 `running` |
+| **审批**（策略 `ask`） | 在批准账本里放行那条请求（`grantApproval`），重放的同一调用消费一次性凭证后执行 |
+
+批准凭证绑定"真正会被执行的东西"（`command` + `args` + cwd + 网络策略）：模型重放同一调用时
+换个 `purpose` 说法不会让批准失效，但换成另一条命令就必须重新批准。
+
+> **已知限制**：`agent answer` 只有在批准账本还活着时才能批准——CLI 每次调用都新建运行时，
+> 账本在进程内，所以跨进程的 `agent answer` 依然答不了审批（澄清不受影响，因为它只读检查点）。
+> 长驻进程（例如 `apps/agent-console`）每次运行持有一个账本，因此可以在其中批准。
+
 ## 接入真实模型（DeepSeek Responses API）
 
 真实通路与它的 CLI 装配由五个模块组成，都只依赖 Node 24 内置 `fetch`，不引入任何新运行时依赖（`tsx` 只是开发期执行器）：

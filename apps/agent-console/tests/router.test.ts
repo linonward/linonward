@@ -33,6 +33,17 @@ function createFakeRunner(overrides: Partial<ConsoleRunner> = {}): FakeRunner {
         if (runId !== "run-1") return undefined;
         return { runId, status: "completed", stopReason: "final_answer", changedFiles: ["a.txt"] };
       }),
+    list:
+      overrides.list ??
+      (async () => [
+        {
+          runId: "run-1",
+          task: "读取 package.json",
+          status: "completed",
+          savedAt: "2024-01-01T00:00:05.000Z",
+          live: false,
+        },
+      ]),
   };
   return { runner, starts, answers };
 }
@@ -68,9 +79,10 @@ async function withServer(
 const ENV_WITH_KEY: NodeJS.ProcessEnv = { DEEPSEEK_API_KEY: "sk-test-not-a-real-key" };
 
 describe("matchRoute", () => {
-  it("识别四条 API 路由", () => {
+  it("识别五条 API 路由", () => {
     expect(matchRoute("POST", "/api/run")).toEqual({ name: "start" });
     expect(matchRoute("GET", "/api/health")).toEqual({ name: "health" });
+    expect(matchRoute("GET", "/api/runs")).toEqual({ name: "runs" });
     expect(matchRoute("GET", "/api/runs/abc/stream")).toEqual({ name: "stream", runId: "abc" });
     expect(matchRoute("GET", "/api/runs/abc")).toEqual({ name: "snapshot", runId: "abc" });
     expect(matchRoute("POST", "/api/runs/abc/answer")).toEqual({ name: "answer", runId: "abc" });
@@ -81,6 +93,7 @@ describe("matchRoute", () => {
     expect(matchRoute("POST", "/api/runs/abc/stream")).toBeUndefined();
     expect(matchRoute("DELETE", "/api/runs/abc")).toBeUndefined();
     expect(matchRoute("GET", "/api")).toBeUndefined();
+    expect(matchRoute("POST", "/api/runs")).toBeUndefined();
   });
 });
 
@@ -184,6 +197,44 @@ describe("API 路由（注入假 runner）", () => {
         const body = (await response.json()) as { error: string };
         expect(body.error).toBe("boom ***");
         expect(body.error).not.toContain("sk-test");
+      },
+    );
+  });
+
+  it("GET /api/runs 返回运行列表（用于重开已结束的运行）", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const response = await fetch(`${base}/api/runs`);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          runs: [
+            {
+              runId: "run-1",
+              task: "读取 package.json",
+              status: "completed",
+              savedAt: "2024-01-01T00:00:05.000Z",
+              live: false,
+            },
+          ],
+        });
+      },
+    );
+  });
+
+  it("运行列表里的密钥同样被脱敏", async () => {
+    const fake = createFakeRunner({
+      list: async () => [
+        { runId: "run-1", task: `任务 ${ENV_WITH_KEY["DEEPSEEK_API_KEY"] ?? ""}`, live: false },
+      ],
+    });
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const body = await (await fetch(`${base}/api/runs`)).text();
+        expect(body).not.toContain("sk-test-not-a-real-key");
+        expect(body).toContain("任务 ***");
       },
     );
   });

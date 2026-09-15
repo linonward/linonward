@@ -16,7 +16,7 @@ import {
   type JournalRunUsage,
 } from "./cli-journal.js";
 import { createVerboseObserver, readBudgetExhaustedDetail } from "./cli-verbose.js";
-import { applyUserAnswer } from "./interaction.js";
+import { applyUserAnswer, grantApproval } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
@@ -372,7 +372,27 @@ export function createAgentCliRuntime(
 
         try {
           const now = runtime.clock.now();
-          const resumed = applyUserAnswer(fromDurableState(restored.state), answer, now);
+          // 审批与澄清是两条不同的恢复路径：审批只是放行一次调用（凭证进账本，
+          // 由重放的调用消费），澄清才把回答写进上下文。搞错会以
+          // `unexpected_user_input` 或 `invalid state transition: waiting -> waiting` 收场。
+          const approvals = runtime.approvals;
+          if (approvals === undefined) {
+            throw new Error("internal: runtime 缺少 approvals，无法受理回答");
+          }
+          const pendingApproval = (await approvals.pendingRequests(runId)).find(
+            (request) => request.id === answer.requestId,
+          );
+
+          const resumed =
+            pendingApproval === undefined
+              ? applyUserAnswer(fromDurableState(restored.state), answer, now)
+              : await grantApproval({
+                  approvals,
+                  state: fromDurableState(restored.state),
+                  requestId: answer.requestId,
+                  now,
+                });
+
           // store 的序号由 store 自己决定：内存日志含 `step_started` 等运行时事件，
           // 两个计数器并不共用，用 `state.nextEventSequence` 会被拒绝为 unexpected_sequence。
           const persisted = await options.store.readEvents(runId, 0);
@@ -381,11 +401,14 @@ export function createAgentCliRuntime(
             expectedSequence: (persisted.at(-1)?.sequence ?? 0) + 1,
             ownerId: restored.lease.ownerId,
             epoch: restored.lease.epoch,
-            event: {
-              type: "user_input_received",
-              requestId: answer.requestId,
-              content: answer.content,
-            },
+            event:
+              pendingApproval === undefined
+                ? {
+                    type: "user_input_received",
+                    requestId: answer.requestId,
+                    content: answer.content,
+                  }
+                : { type: "approval_granted", requestId: answer.requestId },
             now,
           });
 

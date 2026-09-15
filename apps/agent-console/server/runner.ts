@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -43,6 +44,7 @@ import { createStatelessResponsesDriver } from "../../../packages/agent-from-scr
 import {
   LocalFileRunStore,
   type RunLease,
+  type RunStore,
 } from "../../../packages/agent-from-scratch-fixture/src/run-store.js";
 import {
   createRealTaskRegistry,
@@ -60,12 +62,15 @@ import type {
 import { messageOf } from "../src/lib/format.js";
 import { isPlainObject, type JournalRecord } from "../src/lib/journal.js";
 import type { RunChannel, RunHub } from "./bus.js";
-import { type JournalTailer, startJournalTailer } from "./journal-tail.js";
-import { redactAll, secretValues } from "./redact.js";
+import { type JournalTailer, readLastWaitingRequest, startJournalTailer } from "./journal-tail.js";
+import { redactAll, redactRecord, secretValues } from "./redact.js";
 
 export const CONSOLE_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
 export const CONSOLE_DEFAULT_MAX_TOOL_CALLS = REAL_TASK_DEFAULT_MAX_TOOL_CALLS;
 export const CONSOLE_DEFAULT_STORE_ROOT = join(tmpdir(), "linonward-agent-console-runs");
+
+/** `GET /api/runs` 默认返回多少条：本地工具，够翻最近几次就够。 */
+export const LIST_DEFAULT_LIMIT = 20;
 
 export interface StartRunInput {
   task: string;
@@ -93,6 +98,7 @@ export class RunnerError extends Error {
 /** `GET /api/runs/:runId` 的返回：最新 checkpoint 的可序列化投影，**不含密钥**。 */
 export interface RunSnapshot {
   runId: string;
+  task?: string | undefined;
   savedAt?: string | undefined;
   status?: string | undefined;
   stopReason?: string | undefined;
@@ -102,12 +108,35 @@ export interface RunSnapshot {
   validations?: unknown;
   plan?: unknown;
   messages?: unknown;
+  /**
+   * 等待回答的请求（审批 / 澄清）。刷新页面后实时流可能已经不存在，
+   * 界面靠它把输入框重建出来，否则这次运行就永远卡在那里了。
+   */
+  pending?: RunPendingRequest | undefined;
+}
+
+export interface RunPendingRequest {
+  requestId: string;
+  question: string;
+  reason: string;
+}
+
+/** `GET /api/runs` 的列表项：一次运行在磁盘上的最新状态。 */
+export interface RunSummary {
+  runId: string;
+  task?: string | undefined;
+  savedAt?: string | undefined;
+  status?: string | undefined;
+  stopReason?: string | undefined;
+  /** 本进程里还有活着的频道（界面可以接实时流）。 */
+  live: boolean;
 }
 
 export interface ConsoleRunner {
   start(input: StartRunInput): Promise<{ runId: string }>;
   answer(runId: string, input: { requestId: string; text: string }): Promise<void>;
   snapshot(runId: string): Promise<RunSnapshot | undefined>;
+  list(limit?: number): Promise<RunSummary[]>;
 }
 
 export interface ConsoleRunnerOptions {
@@ -128,9 +157,60 @@ interface RunContext {
   ownerId: string;
   pricing: LoopPricing;
   store: LocalFileRunStore;
+  /** 批准账本：`answer` 靠它判断一个 requestId 是审批还是澄清。 */
+  approvals: PreApprovingLedger;
   /** 需要脱敏的密钥值：任何写回浏览器的文本都要先过一遍。 */
   secrets: string[];
   modelId: string | undefined;
+}
+
+/** 一个 requestId 该走哪条续跑路径。 */
+export type AnswerKind = "approval" | "user_input";
+
+/**
+ * 判断这次回答是"批准一个策略审批"还是"回复一次澄清"。
+ *
+ * 两条路径完全不同：澄清要把回答写进状态（`runtime.answer`），审批只需要在账本里
+ * 批准那条 requestId，然后从 checkpoint 重新进入循环（`runtime.resume`）——重放的工具
+ * 调用会在 `consumeApprovalGrant` 里拿到一次性凭证。走错路的症状很隐蔽：
+ * HTTP 200，但运行立刻以 `unexpected_user_input` 失败。
+ */
+export async function resolveAnswerKind(
+  approvals: PreApprovingLedger,
+  runId: string,
+  requestId: string,
+): Promise<AnswerKind> {
+  const pending = await approvals.pendingRequests(runId);
+  return pending.some((request) => request.id === requestId) ? "approval" : "user_input";
+}
+
+/**
+ * 澄清路径要求 requestId 与 checkpoint 里的 `pendingUserInput.id` 完全一致。
+ *
+ * 先查清楚再受理，免得把"打错字"变成一次 200 + `run_error`——那样界面会以为提交成功。
+ * 匹配时返回 `undefined`。
+ */
+export async function clarificationMismatch(
+  store: RunStore,
+  runId: string,
+  requestId: string,
+): Promise<RunnerError | undefined> {
+  let pendingId: string | undefined;
+  try {
+    const checkpoint = (await store.loadCheckpointHistory(runId, 1)).at(0);
+    pendingId = checkpoint?.state.pendingUserInput?.id;
+  } catch {
+    // 读不到 checkpoint 时按"没有待答请求"处理，错误信息同样可读。
+    pendingId = undefined;
+  }
+
+  if (pendingId === requestId) return undefined;
+  return new RunnerError(
+    400,
+    pendingId === undefined
+      ? `这次运行没有待回答的请求：${requestId}`
+      : `requestId 不匹配：当前等待的是 ${pendingId}`,
+  );
 }
 
 function defaultSkillsDirectory(): string {
@@ -189,29 +269,6 @@ function resolveDeepSeek(
   return { config: resolved, pricing: { modelId: resolved.model, table } };
 }
 
-/** 递归脱敏：任何字符串里的密钥值都会被替换，数组 / 对象的形状保持不变。 */
-function redactValue(value: unknown, secrets: readonly string[], depth: number): unknown {
-  if (typeof value === "string") return redactAll(value, secrets);
-  if (depth > 8) return value;
-  if (Array.isArray(value)) return value.map((item) => redactValue(item, secrets, depth + 1));
-  if (isPlainObject(value)) {
-    const nested: JournalRecord = {};
-    for (const [key, item] of Object.entries(value)) {
-      nested[key] = redactValue(item, secrets, depth + 1);
-    }
-    return nested;
-  }
-  return value;
-}
-
-function redactRecord(record: JournalRecord, secrets: readonly string[]): JournalRecord {
-  const result: JournalRecord = {};
-  for (const [key, value] of Object.entries(record)) {
-    result[key] = redactValue(value, secrets, 0);
-  }
-  return result;
-}
-
 /** 真实运行器：`POST /api/run` 与 `POST /answer` 背后的实现。 */
 export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunner {
   const env = options.env;
@@ -264,7 +321,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     const tailer = startJournalTailer({
       path: journalPath,
       onRecord: (record) => {
-        channel.push(redactRecord(record, secrets));
+        channel.push(redactRecord(record, secrets) as JournalRecord);
       },
     });
 
@@ -323,6 +380,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       ownerId: randomUUID(),
       pricing,
       store,
+      approvals,
       secrets,
       modelId: config.model,
     };
@@ -344,7 +402,10 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     const planBlocked = readPlanBlockedDetail(result.state);
     if (planBlocked !== undefined) {
       context.channel.push(
-        redactRecord({ kind: "plan_blocked", at, ...planBlocked }, context.secrets),
+        redactRecord(
+          { kind: "plan_blocked", at, ...planBlocked },
+          context.secrets,
+        ) as JournalRecord,
       );
     }
 
@@ -437,6 +498,15 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
         throw new RunnerError(404, `未知的 runId：${runId}（进程重启后无法继续旧运行）`);
       }
 
+      // 审批与澄清的续跑语义都在 fixture 的 runtime 里（`grantApproval` vs `applyUserAnswer`），
+      // 这里只补一层"打错字"的即时反馈：澄清的 requestId 必须与 checkpoint 完全一致，
+      // 否则会变成一次 200 + run_error，界面还以为提交成功了。
+      const kind = await resolveAnswerKind(context.approvals, runId, input.requestId);
+      if (kind === "user_input") {
+        const mismatch = await clarificationMismatch(store, runId, input.requestId);
+        if (mismatch !== undefined) throw mismatch;
+      }
+
       context.channel.reopen();
       const runtime = createAgentCliRuntime(context.base)(context.cliInput);
 
@@ -456,11 +526,9 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       if (checkpoint === undefined) return undefined;
 
       const state = checkpoint.state;
-      return {
+      const snapshot: RunSnapshot = {
         runId: checkpoint.runId,
-        savedAt: checkpoint.savedAt,
         status: state.status,
-        stopReason: state.stopReason,
         budget: state.budget,
         usage: state.usage,
         changedFiles: state.changedFiles,
@@ -468,6 +536,67 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
         plan: state.plan,
         messages: state.messages,
       };
+      if (state.task.length > 0) snapshot.task = state.task;
+      if (checkpoint.savedAt !== undefined) snapshot.savedAt = checkpoint.savedAt;
+      if (state.stopReason !== undefined) snapshot.stopReason = state.stopReason;
+      if (state.pendingUserInput !== undefined) {
+        snapshot.pending = {
+          requestId: state.pendingUserInput.id,
+          question: state.pendingUserInput.question,
+          reason: state.pendingUserInput.reason,
+        };
+      } else if (state.status === "waiting") {
+        // 审批等待只看得到 journal 里的那条 waiting 记录；运行一旦离开 waiting
+        // 就不该再翻出它（那会导致界面显示一个已经答过的请求）。
+        const waiting = readLastWaitingRequest(join(storeRoot, runId, "journal.jsonl"));
+        if (waiting !== undefined) {
+          snapshot.pending = { requestId: waiting.requestId, question: "", reason: waiting.reason };
+        }
+      }
+      return snapshot;
+    },
+
+    /**
+     * 最近的运行列表。
+     *
+     * 只读磁盘：`AGENT_STORE_ROOT` 下的每个目录就是一次运行，最新 checkpoint 给出它的
+     * 状态。单个目录坏掉（读到一半被杀、不是运行目录）只跳过它自己，不影响整个列表。
+     */
+    async list(limit = LIST_DEFAULT_LIMIT) {
+      let entries: string[];
+      try {
+        entries = await readdir(storeRoot);
+      } catch {
+        return [];
+      }
+
+      const summaries: RunSummary[] = [];
+      for (const runId of entries) {
+        try {
+          const history = await store.loadCheckpointHistory(runId, 1);
+          const checkpoint = history.at(0);
+          if (checkpoint === undefined) continue;
+
+          const channel = hub.get(runId);
+          const summary: RunSummary = {
+            runId,
+            status: checkpoint.state.status,
+            live: channel !== undefined && !channel.done,
+          };
+          if (checkpoint.state.task.length > 0) summary.task = checkpoint.state.task;
+          if (checkpoint.savedAt !== undefined) summary.savedAt = checkpoint.savedAt;
+          if (checkpoint.state.stopReason !== undefined) {
+            summary.stopReason = checkpoint.state.stopReason;
+          }
+          summaries.push(summary);
+        } catch {
+          // 单个运行读不出来（目录被删、检查点损坏）不应让整个列表失败。
+          continue;
+        }
+      }
+
+      summaries.sort((left, right) => (right.savedAt ?? "").localeCompare(left.savedAt ?? ""));
+      return summaries.slice(0, limit);
     },
   };
 }
