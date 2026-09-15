@@ -62,23 +62,139 @@ export function startJournalTailer(options: JournalTailerOptions): JournalTailer
   };
 }
 
-/**
- * 从 journal 尾部反向找出最后一条 `waiting` 工具结果。
- *
- * 审批等待**不写** `state.pendingUserInput`（那个字段只管澄清），所以进程重启后
- * 唯一还能说明"它在等什么"的地方就是这条 JSONL 记录。读到不完整/损坏的行直接跳过。
- */
-export function readLastWaitingRequest(
-  path: string,
-): { requestId: string; reason: string } | undefined {
+function readLines(path: string): string[] | undefined {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch {
     return undefined;
   }
+  return text.split("\n").filter((line) => line.length > 0);
+}
 
-  const lines = text.split("\n").filter((line) => line.length > 0);
+/** `run_started`（runMeta）记录：重建一次运行需要的全部参数。 */
+export interface JournalRunMetaView {
+  command?: string | undefined;
+  task?: string | undefined;
+  cwd?: string | undefined;
+  budgets?: { maxSteps?: number | undefined; maxToolCalls?: number | undefined } | undefined;
+  allowedArgv?: string[][] | undefined;
+  requireSandbox?: boolean | undefined;
+  approveAllowed?: boolean | undefined;
+  modelId?: string | undefined;
+}
+
+function readString(value: Record<string, unknown>, key: string): string | undefined {
+  const raw = value[key];
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
+function readBudgets(value: unknown): JournalRunMetaView["budgets"] {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const maxSteps = record["maxSteps"];
+  const maxToolCalls = record["maxToolCalls"];
+  return {
+    ...(typeof maxSteps === "number" ? { maxSteps } : {}),
+    ...(typeof maxToolCalls === "number" ? { maxToolCalls } : {}),
+  };
+}
+
+function readAllowedArgv(value: unknown): string[][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.filter(
+    (entry): entry is string[] =>
+      Array.isArray(entry) && entry.every((item) => typeof item === "string"),
+  );
+  return parsed.length === value.length ? parsed : undefined;
+}
+
+/**
+ * 读回 `run_started` 记录里的运行参数。
+ *
+ * 它写在 journal 最前面，是 API 进程重启后唯一能说明"这次运行是怎么被启动的"的地方：
+ * cwd、命令白名单、预算、是否自动批准。缺失的字段保持缺失——调用方宁可退回保守默认值，
+ * 也不能凭猜测把一次运行按更宽松的策略续跑。
+ */
+export function readRunMeta(path: string): JournalRunMetaView | undefined {
+  const lines = readLines(path);
+  if (lines === undefined) return undefined;
+
+  for (const line of lines) {
+    const record = parseJournalRecord(line);
+    if (record === undefined || record["kind"] !== "run_started") continue;
+
+    const meta: JournalRunMetaView = {};
+    const command = readString(record, "command");
+    if (command !== undefined) meta.command = command;
+    const task = readString(record, "task");
+    if (task !== undefined) meta.task = task;
+    const cwd = readString(record, "cwd");
+    if (cwd !== undefined) meta.cwd = cwd;
+    const budgets = readBudgets(record["budgets"]);
+    if (budgets !== undefined) meta.budgets = budgets;
+    const allowedArgv = readAllowedArgv(record["allowedArgv"]);
+    if (allowedArgv !== undefined) meta.allowedArgv = allowedArgv;
+    if (typeof record["requireSandbox"] === "boolean") {
+      meta.requireSandbox = record["requireSandbox"];
+    }
+    if (typeof record["approveAllowed"] === "boolean") {
+      meta.approveAllowed = record["approveAllowed"];
+    }
+    const modelId = readString(record, "modelId");
+    if (modelId !== undefined) meta.modelId = modelId;
+    return meta;
+  }
+  return undefined;
+}
+
+/** 等待中的审批请求：只有带完整摘要字段的记录才能被重新登记进批准账本。 */
+export interface WaitingApprovalRequest {
+  id: string;
+  actionDigest: string;
+  summary: string;
+  risks: string[];
+  expiresAt: string;
+}
+
+function readApprovalRequest(value: unknown): WaitingApprovalRequest | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const id = readString(record, "id");
+  const actionDigest = readString(record, "actionDigest");
+  const expiresAt = readString(record, "expiresAt");
+  if (id === undefined || actionDigest === undefined || expiresAt === undefined) return undefined;
+  return {
+    id,
+    actionDigest,
+    summary: readString(record, "summary") ?? "",
+    risks: Array.isArray(record["risks"])
+      ? record["risks"].filter((entry): entry is string => typeof entry === "string")
+      : [],
+    expiresAt,
+  };
+}
+
+export interface WaitingRequestView {
+  requestId: string;
+  reason: string;
+  /** 策略审批才有：进程重启后靠它把 requestId 重新登记进账本。 */
+  request?: WaitingApprovalRequest | undefined;
+}
+
+/**
+ * 从 journal 尾部反向找出最后一条 `waiting` 工具结果。
+ *
+ * 审批等待**不写** `state.pendingUserInput`（那个字段只管澄清），所以进程重启后
+ * 唯一还能说明"它在等什么"的地方就是这条 JSONL 记录。读到不完整/损坏的行直接跳过。
+ *
+ * 审批记录里还带着 `policy.request`（含 `actionDigest`）：把它一起读回来，
+ * 新的进程才能对同一个 requestId 发放凭证、让重放的调用消费掉。
+ */
+export function readLastWaitingRequest(path: string): WaitingRequestView | undefined {
+  const lines = readLines(path);
+  if (lines === undefined) return undefined;
+
   const start = Math.max(0, lines.length - WAITING_SCAN_MAX_LINES);
   for (let index = lines.length - 1; index >= start; index -= 1) {
     const line = lines[index];
@@ -89,8 +205,18 @@ export function readLastWaitingRequest(
     if (typeof waiting !== "object" || waiting === null) continue;
     const requestId = (waiting as Record<string, unknown>)["requestId"];
     if (typeof requestId !== "string" || requestId.length === 0) continue;
+
     const reason = (waiting as Record<string, unknown>)["reason"];
-    return { requestId, reason: typeof reason === "string" ? reason : "" };
+    const view: WaitingRequestView = {
+      requestId,
+      reason: typeof reason === "string" ? reason : "",
+    };
+    const policy = record["policy"];
+    if (typeof policy === "object" && policy !== null) {
+      const request = readApprovalRequest((policy as Record<string, unknown>)["request"]);
+      if (request !== undefined) view.request = request;
+    }
+    return view;
   }
   return undefined;
 }

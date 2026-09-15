@@ -450,3 +450,125 @@ describe("回答请求的分流（审批 vs 澄清）", () => {
     }
   });
 });
+
+/**
+ * API 进程重启后，等待中的运行必须还能被继续：频道没了，但检查点、运行参数与那条
+ * 审批请求都还在磁盘上。这里用一个**全新的 runner**（模拟重启后的进程）回答，
+ * 断言它会从磁盘重建运行，而不是直接 404。
+ */
+describe("进程重启后继续一次等待中的运行（离线）", () => {
+  const APPROVAL_REQUEST = {
+    id: "req-9",
+    actionDigest: "digest-9",
+    summary: "Run node -e * in /workspace",
+    risks: ["风险"],
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+
+  async function seedWaitingRun(storeRoot: string, runId: string): Promise<void> {
+    await seedCheckpoint({
+      storeRoot,
+      runId,
+      task: "跑一条命令",
+      status: "waiting",
+      stopReason: "approval_required",
+    });
+    await writeFile(
+      join(storeRoot, runId, "journal.jsonl"),
+      [
+        JSON.stringify({
+          kind: "run_started",
+          at: "2024-01-01T00:00:00.000Z",
+          command: "run",
+          cwd: "/workspace",
+          budgets: { maxSteps: 3, maxToolCalls: 6 },
+          allowedArgv: [["node", "-e", "*"]],
+          requireSandbox: false,
+          approveAllowed: false,
+          task: "跑一条命令",
+        }),
+        JSON.stringify({
+          kind: "tool_result",
+          at: "2024-01-01T00:00:01.000Z",
+          callId: "call-1",
+          name: "run_command",
+          waiting: { requestId: APPROVAL_REQUEST.id, reason: "approval_required" },
+          policy: { type: "ask", request: APPROVAL_REQUEST },
+        }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+  }
+
+  it("用新进程回答会重建运行：请求被受理，频道里能重放完整历史", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-rehydrate-"));
+    try {
+      await seedWaitingRun(directory, "run-waiting");
+
+      // 假密钥 + 不可达 baseUrl：重建本身不用网络，续跑会在模型调用处失败。
+      const hub = new RunHub();
+      const runner = createConsoleRunner({
+        env: { DEEPSEEK_API_KEY: FAKE_KEY, DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1" },
+        hub,
+        storeRoot: directory,
+      });
+
+      // 磁盘上有这个运行，但新进程里没有任何上下文：过去这里是 404。
+      // 快照把批准凭证的过期时间一并透出，界面据此判断"还值不值得给表单"。
+      const snapshot = await runner.snapshot("run-waiting");
+      expect(snapshot?.pending?.expiresAt).toBe(APPROVAL_REQUEST.expiresAt);
+
+      await expect(
+        runner.answer("run-waiting", { requestId: APPROVAL_REQUEST.id, text: "批准" }),
+      ).resolves.toBeUndefined();
+
+      const channel = hub.get("run-waiting");
+      expect(channel).toBeDefined();
+      if (channel === undefined) return;
+      await waitForDone(channel, 30_000);
+
+      // 重建的频道补发了历史（run_started + 那条 waiting），界面因此还能重建时间线。
+      const kinds = collected(channel).map((record) => record["kind"]);
+      expect(kinds).toContain("run_started");
+      expect(JSON.stringify(collected(channel))).toContain(APPROVAL_REQUEST.id);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("requestId 不属于任何待批准请求时仍然是可读 4xx", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-rehydrate-"));
+    try {
+      await seedWaitingRun(directory, "run-waiting");
+      const runner = createConsoleRunner({
+        env: { DEEPSEEK_API_KEY: FAKE_KEY, DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1" },
+        hub: new RunHub(),
+        storeRoot: directory,
+      });
+
+      await expect(
+        runner.answer("run-waiting", { requestId: "req-typo", text: "批准" }),
+      ).rejects.toMatchObject({ status: 400 });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("磁盘上没有检查点时依旧是 404", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-rehydrate-"));
+    try {
+      const runner = createConsoleRunner({
+        env: { DEEPSEEK_API_KEY: FAKE_KEY },
+        hub: new RunHub(),
+        storeRoot: directory,
+      });
+
+      await expect(
+        runner.answer("never-existed", { requestId: "req-1", text: "批准" }),
+      ).rejects.toMatchObject({ status: 404 });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});

@@ -215,7 +215,8 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
 
     expect(html).toContain('data-testid="snapshot-panel"');
     expect(html).toContain("运行快照（来自 checkpoint）");
-    expect(html).toContain("实时流不可用");
+    // 等待中的运行：说明会从磁盘重建它再继续，而不是一句"实时流不可用"。
+    expect(html).toContain("重建");
     expect(html).toContain("读取 package.json 并总结");
     expect(html).toContain("waiting");
     expect(html).toContain("approval_required");
@@ -244,7 +245,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
     expect(html).toContain("策略要求人工批准");
   });
 
-  it("进程重启后（频道没了）不再给输入框，只说明在等什么、为什么答不了", () => {
+  it("进程重启后（频道没了）照样给输入框：服务端会重建这次运行", () => {
     const html = renderToStaticMarkup(
       <RunConsole
         view={projectRun("run-1", [])}
@@ -259,10 +260,56 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
       />,
     );
 
-    expect(html).not.toContain('data-testid="answer-box"');
+    expect(html).toContain('data-testid="answer-box"');
+    expect(html).toContain("需要回答（requestId=req-1）");
     expect(html).toContain("等待回答");
     expect(html).toContain("requestId=req-1");
-    expect(html).toContain("无法继续");
+  });
+
+  it("过期的待答请求不给输入框，只说明为什么提交没用", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", [])}
+        streaming={false}
+        paused={false}
+        snapshot={snapshot({
+          pending: {
+            requestId: "req-1",
+            question: "是否允许执行 run_command？",
+            reason: "策略要求人工批准",
+            expiresAt: "2020-01-01T00:00:00.000Z",
+          },
+        })}
+        streamUnavailable
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).not.toContain('data-testid="answer-box"');
+    expect(html).toContain("已过期");
+    expect(html).toContain("重新发起");
+  });
+
+  it("已经结束的运行只说清楚时间线为什么重放不了", () => {
+    const html = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", [])}
+        streaming={false}
+        paused={false}
+        snapshot={snapshot({ status: "completed", stopReason: "final_answer", pending: undefined })}
+        streamUnavailable
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+      />,
+    );
+
+    expect(html).toContain("已经结束");
+    expect(html).not.toContain('data-testid="answer-box"');
   });
 
   it("没有快照时不渲染快照面板", () => {

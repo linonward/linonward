@@ -7,7 +7,7 @@ import { StopBanner } from "./components/StopBanner.js";
 import { Timeline } from "./components/Timeline.js";
 import { UsagePanel } from "./components/UsagePanel.js";
 import { pendingQuestion, type RunView } from "./lib/journal.js";
-import type { RunSnapshotView } from "./lib/snapshot.js";
+import { pendingExpired, type RunSnapshotView } from "./lib/snapshot.js";
 
 export interface RunConsoleProps {
   view: RunView;
@@ -56,8 +56,9 @@ export function RunConsole({
   const question = pendingQuestion(view);
   // 时间线里没有待答请求时才回落到快照里的那条：两者不会重复渲染同一个请求。
   const snapshotQuestion = question === undefined ? snapshot?.pending : undefined;
-  // 频道没了就答不了（`answer` 依赖进程内的批准账本），此时快照只作说明，不给表单。
-  const snapshotCanAnswer = snapshotQuestion !== undefined && !streamUnavailable;
+  // 频道没了也照样能答：服务端会用磁盘上的 checkpoint + journal 重建这次运行（`rehydrate`）。
+  // 但过期的审批凭证没必要给表单——提交必然被拒绝（15 分钟 TTL）。
+  const snapshotCanAnswer = snapshotQuestion !== undefined && !pendingExpired(snapshotQuestion);
   // 频道还在且有记录时，时间线比快照丰富；否则（进程重启、缓冲被挤出）只能给快照。
   const showSnapshot =
     snapshot !== undefined &&

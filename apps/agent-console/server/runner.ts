@@ -62,7 +62,12 @@ import type {
 import { messageOf } from "../src/lib/format.js";
 import { isPlainObject, type JournalRecord } from "../src/lib/journal.js";
 import type { RunChannel, RunHub } from "./bus.js";
-import { type JournalTailer, readLastWaitingRequest, startJournalTailer } from "./journal-tail.js";
+import {
+  type JournalTailer,
+  readLastWaitingRequest,
+  readRunMeta,
+  startJournalTailer,
+} from "./journal-tail.js";
 import { redactAll, redactRecord, secretValues } from "./redact.js";
 
 export const CONSOLE_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
@@ -119,6 +124,8 @@ export interface RunPendingRequest {
   requestId: string;
   question: string;
   reason: string;
+  /** 审批凭证的过期时间（澄清请求可能没有）：过期后提交只会被拒绝。 */
+  expiresAt?: string | undefined;
 }
 
 /** `GET /api/runs` 的列表项：一次运行在磁盘上的最新状态。 */
@@ -386,6 +393,45 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     };
   }
 
+  /**
+   * 进程重启后从磁盘重建一次运行。
+   *
+   * 频道的缓冲活在进程内存里，所以重启后旧运行的实时流必然拿不到——但"运行本身"没有丢：
+   * 检查点给出状态与计划，journal 的 `run_started` 给出 cwd / 白名单 / 预算 / 是否自动批准，
+   * 最后一条 `waiting` 记录还带着完整的审批请求（含 `actionDigest`）。把这些拼回一个新的
+   * 运行上下文，等待中的运行就还能被继续，而不是只剩一句"实时流不可用"。
+   *
+   * 缺数据时**退回保守默认值**：没有 `approveAllowed` 就当作 false——宁可多问一次，
+   * 也不能凭猜测把一次运行按更宽松的策略续跑。
+   */
+  async function rehydrate(runId: string): Promise<RunContext | undefined> {
+    const checkpoint = (await store.loadCheckpointHistory(runId, 1)).at(0);
+    if (checkpoint === undefined) return undefined;
+
+    const journalPath = join(storeRoot, runId, "journal.jsonl");
+    const meta = readRunMeta(journalPath);
+    const budgets = meta?.budgets;
+    const input: StartRunInput = {
+      task: meta?.task ?? checkpoint.state.task,
+      cwd: meta?.cwd ?? checkpoint.state.cwd,
+      allowedArgv: meta?.allowedArgv ?? [],
+      maxSteps: budgets?.maxSteps ?? checkpoint.state.budget.maxSteps,
+      maxToolCalls: budgets?.maxToolCalls ?? checkpoint.state.budget.maxToolCalls,
+      approveAllowed: meta?.approveAllowed === true,
+      requireSandbox: meta?.requireSandbox ?? false,
+      repeatGuard: true,
+    };
+
+    const context = createContext(runId, input);
+    // 把等待中的审批请求重新登记进新账本：没有它，`approve(requestId)` 会报 unknown。
+    const waiting = readLastWaitingRequest(journalPath);
+    if (waiting?.request !== undefined) {
+      await context.approvals.saveApprovalRequest(runId, waiting.request);
+    }
+    contexts.set(runId, context);
+    return context;
+  }
+
   function closeContext(context: RunContext): void {
     context.tailer.stop();
     context.journal.close();
@@ -476,6 +522,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
         budgets: { maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls },
         allowedArgv: input.allowedArgv,
         requireSandbox: input.requireSandbox,
+        approveAllowed: input.approveAllowed,
         modelId: context.modelId,
       });
 
@@ -493,9 +540,10 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     },
 
     async answer(runId, input) {
-      const context = contexts.get(runId);
+      // 进程重启后没有活上下文：先尝试从磁盘重建，能重建就继续，重建不了才是 404。
+      const context = contexts.get(runId) ?? (await rehydrate(runId));
       if (context === undefined) {
-        throw new RunnerError(404, `未知的 runId：${runId}（进程重启后无法继续旧运行）`);
+        throw new RunnerError(404, `未知的 runId：${runId}（磁盘上没有这次运行的检查点）`);
       }
 
       // 审批与澄清的续跑语义都在 fixture 的 runtime 里（`grantApproval` vs `applyUserAnswer`），
@@ -540,17 +588,27 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       if (checkpoint.savedAt !== undefined) snapshot.savedAt = checkpoint.savedAt;
       if (state.stopReason !== undefined) snapshot.stopReason = state.stopReason;
       if (state.pendingUserInput !== undefined) {
-        snapshot.pending = {
+        const pending: RunPendingRequest = {
           requestId: state.pendingUserInput.id,
           question: state.pendingUserInput.question,
           reason: state.pendingUserInput.reason,
         };
+        if (state.pendingUserInput.expiresAt !== undefined) {
+          pending.expiresAt = state.pendingUserInput.expiresAt;
+        }
+        snapshot.pending = pending;
       } else if (state.status === "waiting") {
         // 审批等待只看得到 journal 里的那条 waiting 记录；运行一旦离开 waiting
         // 就不该再翻出它（那会导致界面显示一个已经答过的请求）。
         const waiting = readLastWaitingRequest(join(storeRoot, runId, "journal.jsonl"));
         if (waiting !== undefined) {
-          snapshot.pending = { requestId: waiting.requestId, question: "", reason: waiting.reason };
+          const pending: RunPendingRequest = {
+            requestId: waiting.requestId,
+            question: "",
+            reason: waiting.reason,
+          };
+          if (waiting.request !== undefined) pending.expiresAt = waiting.request.expiresAt;
+          snapshot.pending = pending;
         }
       }
       return snapshot;

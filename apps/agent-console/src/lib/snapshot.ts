@@ -33,6 +33,8 @@ export interface SnapshotPendingView {
   requestId: string;
   question: string;
   reason: string;
+  /** 审批凭证的过期时间；缺失表示这个请求不会过期（例如澄清）。 */
+  expiresAt?: string | undefined;
 }
 
 export interface RunSnapshotView {
@@ -98,11 +100,30 @@ function parsePending(value: unknown): SnapshotPendingView | undefined {
   if (!isPlainObject(value)) return undefined;
   const requestId = readOptionalString(value, "requestId");
   if (requestId === undefined) return undefined;
-  return {
+  const pending: SnapshotPendingView = {
     requestId,
     question: readOptionalString(value, "question") ?? "",
     reason: readOptionalString(value, "reason") ?? "",
   };
+  const expiresAt = readOptionalString(value, "expiresAt");
+  if (expiresAt !== undefined) pending.expiresAt = expiresAt;
+  return pending;
+}
+
+/**
+ * 待答请求是否已经过期。
+ *
+ * 审批凭证有 15 分钟 TTL（`APPROVAL_TTL_MS`）：从"最近的运行"里重开一个放了一小时的
+ * 运行，输入框还在、提交却必然被拒绝。与其让用户白填一次，不如先把这件事说出来。
+ * 时间戳读不出来（或本来就没有）时按"没过期"处理——由服务端做最终裁决。
+ */
+export function pendingExpired(
+  pending: SnapshotPendingView | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (pending?.expiresAt === undefined) return false;
+  const expiresAt = Date.parse(pending.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= now;
 }
 
 export function parseRunSnapshot(value: unknown): RunSnapshotView | undefined {
@@ -171,4 +192,46 @@ export function parseRunSummaries(value: unknown): RunSummaryView[] {
     const summary = parseRunSummary(entry);
     return summary === undefined ? [] : [summary];
   });
+}
+
+/** 已经不会再变化的终端状态：这些运行没有"继续"可言，只有"重开一次"。 */
+const TERMINAL_STATUSES = ["completed", "failed", "blocked", "cancelled"] as const;
+
+/**
+ * 快照面板要对用户说的那句话。
+ *
+ * 面板出现的场合差别很大：可能只是历史频道不在内存里（运行早已结束），也可能是
+ * 运行正卡在等待回答、而进程已经重启。**已经结束的运行不该看到"实时流不可用、
+ * 请重新启动它"**——那既不是问题，也不是用户能做的动作；而等待中的运行恰恰相反，
+ * 现在真的可以接着回答（服务端会从磁盘重建它）。
+ *
+ * 返回 `undefined` 表示"没什么要额外说明的"。
+ */
+export function snapshotNotice(
+  snapshot: RunSnapshotView,
+  streamUnavailable: boolean,
+): string | undefined {
+  const hasPending = snapshot.pending !== undefined;
+  const status = snapshot.status ?? "unknown";
+
+  if (hasPending) {
+    if (pendingExpired(snapshot.pending)) {
+      return "这次运行等待的回答已经过期（审批凭证 15 分钟内有效），提交会被拒绝。请重新发起这个任务。";
+    }
+    if (!streamUnavailable) return "可以在下面提交回答，运行会接着往下走。";
+    return [
+      `实时流已不在（API 进程重启过），但这次运行仍停在等待回答：控制台会从磁盘上的`,
+      `checkpoint 重建它再继续。批准凭证过期（15 分钟）或 lease 仍被其它进程持有时，`,
+      `提交会被拒绝并给出原因。`,
+    ].join("");
+  }
+
+  // 频道还在时，面板只是"顺手展示一下检查点"，不需要额外解释。
+  if (!streamUnavailable) return undefined;
+
+  if ((TERMINAL_STATUSES as readonly string[]).includes(status)) {
+    return `这次运行已经结束（status=${status}）。实时频道只存在于 API 进程的内存里，所以时间线无法重放；以下是它最后一次 checkpoint 的摘要。`;
+  }
+
+  return `API 进程里已经没有这次运行的频道，而它最后一次检查点仍是 ${status}——多半是进程重启打断了它。请重新发起任务。`;
 }

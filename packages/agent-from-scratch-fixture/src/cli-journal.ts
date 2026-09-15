@@ -24,6 +24,11 @@ export interface JournalRunMeta {
   budgets: { maxSteps: number; maxToolCalls: number };
   allowedArgv: string[][];
   requireSandbox: boolean;
+  /**
+   * 这次运行是否对策略放行的命令自动批准。写进 journal 是为了让长驻进程在重启后
+   * 仍能按同一套策略续跑一次等待中的运行——缺失一律按 `false`（宁可多问一次）。
+   */
+  approveAllowed?: boolean | undefined;
   modelId?: string | undefined;
 }
 
@@ -300,6 +305,7 @@ export function createJournal(options: JournalOptions): Journal {
         requireSandbox: entry.requireSandbox,
       };
       if (entry.task !== undefined) record["task"] = clip(entry.task);
+      if (entry.approveAllowed !== undefined) record["approveAllowed"] = entry.approveAllowed;
       if (entry.modelId !== undefined) record["modelId"] = entry.modelId;
 
       writeRecord(record);
@@ -311,6 +317,7 @@ export function createJournal(options: JournalOptions): Journal {
           `maxSteps=${entry.budgets.maxSteps}`,
           `maxToolCalls=${entry.budgets.maxToolCalls}`,
           `requireSandbox=${String(entry.requireSandbox)}`,
+          `approveAllowed=${String(entry.approveAllowed ?? false)}`,
         ].join(" "),
       );
       if (entry.task !== undefined) writeLine(`[run] task: ${clip(entry.task)}`);
