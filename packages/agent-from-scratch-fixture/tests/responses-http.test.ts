@@ -197,6 +197,7 @@ describe("DeepSeek Responses HTTP client", () => {
       apiKey: FAKE_KEY,
       baseUrl: DEEPSEEK_DEFAULTS.baseUrl,
       model: DEEPSEEK_DEFAULTS.model,
+      plannerModel: DEEPSEEK_DEFAULTS.model,
     });
 
     expect(
@@ -209,6 +210,8 @@ describe("DeepSeek Responses HTTP client", () => {
       apiKey: FAKE_KEY,
       baseUrl: "https://proxy.test/v1",
       model: "deepseek-v4-pro",
+      // 没设 DEEPSEEK_PLANNER_MODEL 时规划模型回落到循环模型。
+      plannerModel: "deepseek-v4-pro",
     });
 
     let thrown: unknown;
@@ -222,6 +225,21 @@ describe("DeepSeek Responses HTTP client", () => {
     expect(thrown.message).toContain("DEEPSEEK_API_KEY");
     expect(thrown.message).not.toContain(FAKE_KEY);
     expect(thrown.message).not.toContain("sk-");
+  });
+
+  it("lets DEEPSEEK_PLANNER_MODEL override only the planning model", () => {
+    expect(
+      resolveDeepSeekConfig({
+        DEEPSEEK_API_KEY: FAKE_KEY,
+        DEEPSEEK_MODEL: "deepseek-v4-flash",
+        DEEPSEEK_PLANNER_MODEL: "deepseek-v4-pro",
+      }),
+    ).toEqual({
+      apiKey: FAKE_KEY,
+      baseUrl: DEEPSEEK_DEFAULTS.baseUrl,
+      model: "deepseek-v4-flash",
+      plannerModel: "deepseek-v4-pro",
+    });
   });
 
   it("rejects an empty apiKey at construction time without echoing a key", () => {

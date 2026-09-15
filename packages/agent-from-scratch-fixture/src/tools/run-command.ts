@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { z } from "zod";
 
-import { defineTool } from "../tool.js";
+import { wrapWithSandbox, type SandboxPolicy } from "../sandbox.js";
+import { defineTool, type ToolContext } from "../tool.js";
 
 export const RUN_COMMAND_TIMEOUT_MS = 60_000;
 export const RUN_COMMAND_MAX_OUTPUT_CHARACTERS = 20_000;
@@ -24,9 +25,28 @@ function capOutput(value: string): { text: string; truncated: boolean } {
 }
 
 /**
+ * 沙箱接线：字段与 `ToolContext` 上同名，executor 透传。
+ * 未注入时 `sandbox` 为 `undefined`，`wrapWithSandbox` 原样返回 argv。
+ */
+export interface RunCommandOptions {
+  sandbox?: ToolContext["sandbox"];
+  requireSandbox?: ToolContext["requireSandbox"];
+  sandboxPolicy?: ToolContext["sandboxPolicy"];
+}
+
+function policyFor(options: RunCommandOptions & { cwd: string }): SandboxPolicy {
+  return options.sandboxPolicy ?? { network: "disabled", writableRoot: options.cwd };
+}
+
+/**
  * 参数必须拆成 `command` 与 `args`，并且永远 `shell: false`。
  * 这不代表 `pnpm` 或 `node` 本身安全，它们仍能执行任意代码；
  * 真正的边界由权限策略、人工批准与外部进程隔离提供。
+ *
+ * 进程隔离是**可选注入**的（`ToolContext.sandbox`）。一旦注入了一个真沙箱，
+ * 或者调用方打开 `requireSandbox`，这里就只会"要么真隔离、要么抛错"：
+ * 不可用或无法满足 `network: "disabled"` 时抛 `sandbox_unavailable` /
+ * `sandbox_network_isolation_unsupported`，绝不退回无隔离执行。
  */
 export const runCommandTool = defineTool({
   name: "run_command",
@@ -35,10 +55,20 @@ export const runCommandTool = defineTool({
   effect: "execute",
   schema: runCommandInputSchema,
   async execute(input, context) {
+    const sandboxPolicy = policyFor(context);
+    const wrapped = await wrapWithSandbox(
+      { command: input.command, args: input.args, cwd: context.cwd },
+      {
+        sandbox: context.sandbox,
+        requireSandbox: context.requireSandbox,
+        policy: sandboxPolicy,
+      },
+    );
+
     const startedAt = Date.now();
     const timeout = AbortSignal.timeout(RUN_COMMAND_TIMEOUT_MS);
     const signal = AbortSignal.any([context.signal, timeout]);
-    const child = spawn(input.command, input.args, {
+    const child = spawn(wrapped.command, wrapped.args, {
       cwd: context.cwd,
       shell: false,
       signal,

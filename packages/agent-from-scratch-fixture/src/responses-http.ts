@@ -19,7 +19,13 @@ export const DEEPSEEK_DEFAULTS = {
 export interface DeepSeekConfig {
   apiKey: string;
   baseUrl: string;
+  /** 循环（多轮工具调用）使用的模型。 */
   model: string;
+  /**
+   * 规划器使用的模型。规划只做短 JSON 输出，通常可以用更强/更省的不同型号；
+   * `DEEPSEEK_PLANNER_MODEL` 缺省回落到 `model`。
+   */
+  plannerModel: string;
 }
 
 /** 只从环境变量解析；缺 key 时抛出可读错误，且**绝不回显 key 的值**。 */
@@ -33,7 +39,9 @@ export function resolveDeepSeekConfig(env: NodeJS.ProcessEnv = process.env): Dee
 
   const baseUrl = env["DEEPSEEK_BASE_URL"] ?? DEEPSEEK_DEFAULTS.baseUrl;
   const model = env["DEEPSEEK_MODEL"] ?? DEEPSEEK_DEFAULTS.model;
-  return { apiKey, baseUrl, model };
+  // 规划模型与循环模型解耦：只设 `DEEPSEEK_MODEL` 时两者一致，行为与之前相同。
+  const plannerModel = env["DEEPSEEK_PLANNER_MODEL"] ?? model;
+  return { apiKey, baseUrl, model, plannerModel };
 }
 
 /**

@@ -4,13 +4,40 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ModelRequest } from "../src/context.js";
-import type { FunctionCallOutput, ModelDriver, ModelTurn, ToolDefinition } from "../src/model.js";
+import type {
+  FunctionCallOutput,
+  Model,
+  ModelDriver,
+  ModelTurn,
+  ToolDefinition,
+} from "../src/model.js";
 import type { PlanDraft, PlanEvaluation, Planner } from "../src/planner.js";
-import { createRealTaskRegistry, runRealTask } from "../src/run-task.js";
+import { createModelPlanner } from "../src/planner-model.js";
+import type { ResponsesHttpClient } from "../src/responses-http.js";
+import { createDeepSeekTaskModels, createRealTaskRegistry, runRealTask } from "../src/run-task.js";
 import type { PlanStep, TaskPlan } from "../src/types.js";
 import { makeDraft, makeTempDir, removeTempDir } from "./support.js";
 
 type ContinueInput = Parameters<ModelDriver["continue"]>[0];
+type ResponsesBody = Parameters<ResponsesHttpClient["responses"]["create"]>[0];
+
+/** 记录每次请求的 model 字段，并按顺序回放文本；用于断言"规划/循环"模型确实分离。 */
+class RecordingResponsesClient implements ResponsesHttpClient {
+  readonly bodies: ResponsesBody[] = [];
+
+  constructor(private readonly replies: string[] = []) {}
+
+  readonly responses = {
+    create: async (body: ResponsesBody) => {
+      this.bodies.push(body);
+      return {
+        id: `resp-${this.bodies.length}`,
+        output_text: this.replies.shift() ?? "",
+        output: [],
+      };
+    },
+  };
+}
 
 /** 第一轮请求工具，第二轮直接给最终答案；断言 Loop 与驱动真的串起来了。 */
 class ScriptedDriver implements ModelDriver {
@@ -159,5 +186,90 @@ describe("runRealTask offline assembly", () => {
         "object",
       );
     }
+  });
+
+  it("converges with the model planner when evaluate receives the plan criteria", async () => {
+    const workspace = await makeTempDir("real-task-ws-");
+    const storeRoot = await makeTempDir("real-task-store-");
+    tempDirs.push(workspace, storeRoot);
+    await writeFile(join(workspace, "package.json"), '{"packageManager":"pnpm@12.4.1"}\n');
+
+    const draft = makeDraft({
+      criteria: [{ id: "criterion-1", description: "报告 package.json 的包管理器" }],
+      steps: [
+        {
+          id: "step-1",
+          title: "读取 package.json",
+          completionEvidence: "read_file 输出包含 packageManager",
+        },
+      ],
+    });
+
+    // 真实模型规划器的替身：create 回计划；evaluate 只用下标引用本轮 observation，
+    // 并且**只能**从 Loop 传进来的 acceptanceCriteria 里挑 criterion id。
+    // 如果 Loop 不把计划验收条件交给 evaluate，这里会显式失败而不是猜一个 id。
+    const plannerModel: Model = {
+      async generate(request) {
+        if (request.instructions.includes("结果评估器")) {
+          const payload = JSON.parse(request.input[0]?.content ?? "{}") as {
+            acceptanceCriteria?: Array<{ id: string }>;
+          };
+          const criteria = payload.acceptanceCriteria;
+          if (criteria === undefined || criteria.length === 0) {
+            throw new Error("evaluate 输入缺少 acceptanceCriteria");
+          }
+          return JSON.stringify({
+            completed: true,
+            evidenceIndexes: [0],
+            passedCriteria: criteria.map((criterion) => criterion.id),
+            replanReason: null,
+          });
+        }
+        return JSON.stringify(draft);
+      },
+    };
+
+    const outcome = await runRealTask({
+      cwd: workspace,
+      storeRoot,
+      model: new ScriptedDriver(),
+      planner: createModelPlanner(plannerModel),
+      skillsDirectory: join(workspace, "missing-skills"),
+      maxSteps: 6,
+      maxToolCalls: 4,
+    });
+
+    expect(outcome.result.stopReason).toBe("final_answer");
+    expect(outcome.result.state.plan?.steps.every((step) => step.status === "completed")).toBe(
+      true,
+    );
+    expect(
+      outcome.result.state.plan?.acceptanceCriteria.every(
+        (criterion) => criterion.status === "passed",
+      ),
+    ).toBe(true);
+    expect(outcome.result.state.plan?.revisionReason).toBeUndefined();
+  });
+
+  it("routes planning to plannerModel and the loop to model", async () => {
+    const client = new RecordingResponsesClient([JSON.stringify(makeDraft({}))]);
+    const { model, planner } = createDeepSeekTaskModels({
+      client,
+      config: {
+        apiKey: "fake-key",
+        baseUrl: "https://example.test/v1",
+        model: "loop-model",
+        plannerModel: "plan-model",
+      },
+    });
+
+    await planner.create({ goal: "g", context: "c", availableTools: [] });
+    expect(client.bodies[0]?.model).toBe("plan-model");
+
+    await model.start({
+      request: { instructions: "i", input: [{ role: "user", content: "go" }] },
+      tools: [],
+    });
+    expect(client.bodies[1]?.model).toBe("loop-model");
   });
 });

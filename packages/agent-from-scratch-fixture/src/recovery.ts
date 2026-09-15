@@ -6,6 +6,7 @@ import { waitForUserInput } from "./interaction.js";
 import type { FunctionCallOutput, ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
+import type { Sandbox } from "./sandbox.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { WriteLease } from "./tool.js";
 import type { TraceSink } from "./trace.js";
@@ -64,6 +65,8 @@ export interface AgentRuntime {
   policy?: PolicyContext | undefined;
   approvals?: ApprovalLedger | undefined;
   writeLease?: WriteLease | undefined;
+  sandbox?: Sandbox | undefined;
+  requireSandbox?: boolean | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
   /** 续跑时的压缩接线；与首次运行使用同一份配置。 */
   compaction?: LoopCompactionOptions | undefined;
@@ -327,6 +330,8 @@ export function loopOptionsFromRuntime(
     policy: runtime.policy,
     approvals: runtime.approvals,
     writeLease: runtime.writeLease,
+    sandbox: runtime.sandbox,
+    requireSandbox: runtime.requireSandbox,
     clock: runtime.clock,
     signal: runtime.signal,
     onEvent: runtime.onEvent,

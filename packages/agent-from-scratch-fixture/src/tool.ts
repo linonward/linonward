@@ -1,5 +1,6 @@
 import { z, type ZodType } from "zod";
 
+import type { Sandbox, SandboxPolicy } from "./sandbox.js";
 import type { AgentEventInput, SkillState } from "./types.js";
 
 /**
@@ -34,6 +35,12 @@ export interface ToolContext {
   skills: SkillState;
   maxSkillBytes: number;
   emit(event: AgentEventInput): void;
+  /** 可选注入的进程沙箱；不注入时 `run_command` 与接线之前行为完全一致。 */
+  sandbox?: Sandbox | undefined;
+  /** 调用方显式要求隔离：`true` 时任何"没有真隔离"的情况都会被拒绝执行。 */
+  requireSandbox?: boolean | undefined;
+  /** 传给 `Sandbox.wrap` 的策略输入，由 executor 从已解析的 `PolicyContext` 计算。 */
+  sandboxPolicy?: SandboxPolicy | undefined;
 }
 
 /** Schema 校验与真正执行被拆开：策略层必须看到已解析的输入。 */
