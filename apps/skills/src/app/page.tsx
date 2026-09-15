@@ -1,5 +1,5 @@
-import Link from "next/link";
 import { ArrowRight } from "lucide-react";
+import Link from "next/link";
 import { GitHubIcon } from "@/components/github-icon";
 import { InstallPanel } from "@/components/install-panel";
 import { SiteFooter } from "@/components/site-footer";

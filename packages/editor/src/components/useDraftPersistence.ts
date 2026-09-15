@@ -3,8 +3,8 @@ import { useCallback, useEffect, useRef } from "react";
 import type { EditorDraft } from "../draft";
 import {
   DEFAULT_DOCUMENT_ID,
-  indexedDbDraftRepository,
   type DraftRepository,
+  indexedDbDraftRepository,
 } from "../draftRepository";
 
 const SAVE_DELAY_MS = 250;

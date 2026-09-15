@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { buildModelRequest } from "../src/context.js";
 import { FakeModel } from "../src/fake-model.js";
+import { type ResponsesResultLike, toModelTurn } from "../src/model.js";
 import { createModel } from "../src/model-factory.js";
-import { toModelTurn, type ResponsesResultLike } from "../src/model.js";
 
 describe("offline model path", () => {
   it("returns scripted replies through the shared Model interface", async () => {

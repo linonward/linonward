@@ -10,7 +10,7 @@ import {
 } from "../src/plan.js";
 import { createInitialPlan, validatePlan } from "../src/planner.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "../src/types.js";
-import { ScriptedPlanner, makeDraft } from "./support.js";
+import { makeDraft, ScriptedPlanner } from "./support.js";
 
 function createPlanFixture(): TaskPlan {
   return {

@@ -1,8 +1,8 @@
 "use client";
 
 import { Check, ChevronDown, Copy, Menu, Moon, Palette, Sun, Upload } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, RefObject } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { OutlineItem } from "../outline";
 import { themes } from "../themes";

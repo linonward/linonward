@@ -1,5 +1,5 @@
-import { Schema } from "prosemirror-model";
 import type { Mark, MarkType, NodeType } from "prosemirror-model";
+import { Schema } from "prosemirror-model";
 import { schema as basicSchema } from "prosemirror-schema-basic";
 import { addListNodes } from "prosemirror-schema-list";
 import { tableNodes } from "prosemirror-tables";

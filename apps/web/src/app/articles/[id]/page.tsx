@@ -1,9 +1,8 @@
+import { getPublishedArticleById } from "@linonward/content";
 import { getTheme, parseDraft, renderWechatHtml, sanitizeWechatHtml } from "@linonward/editor";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-
 import { SiteHeader } from "@/components/site-header";
-import { getPublishedArticleById } from "@linonward/content";
 
 export const dynamic = "force-dynamic";
 

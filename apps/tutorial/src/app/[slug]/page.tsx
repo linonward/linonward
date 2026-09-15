@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { TutorialShell } from "@/components/tutorial-shell";
-import { chapters, getChapter, type AnyChapter } from "@/lib/chapters";
+import { type AnyChapter, chapters, getChapter } from "@/lib/chapters";
 import { extensionChapters, getExtensionChapter } from "@/lib/extensions";
 
 interface ChapterPageProps {

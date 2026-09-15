@@ -7,27 +7,27 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { editorSchema } from "../core/schema";
 import type { EditorDraft } from "../draft";
-import { indexedDbDraftRepository } from "../draftRepository";
 import type { DraftRepository } from "../draftRepository";
+import { indexedDbDraftRepository } from "../draftRepository";
 import type { ImageAttributes } from "../imageTypes";
 import { parseMarkdown } from "../markdown/parser";
 import {
-  composeProseMirrorPlugins,
-  defaultEditorPlugins,
+  addEditorTableColumn,
+  addEditorTableRow,
   applyFontSize as applyFontSizeMark,
   applyInlineFormatting,
   applyLink as applyLinkMark,
   captureInlineFormatting,
   clearInlineFormatting,
+  composeProseMirrorPlugins,
+  defaultEditorPlugins,
+  deleteEditorTable,
+  deleteEditorTableColumn,
+  deleteEditorTableRow,
   getLinkAtSelection,
   normalizeLink,
   redoEditor,
   removeLink as removeLinkMark,
-  addEditorTableColumn,
-  addEditorTableRow,
-  deleteEditorTable,
-  deleteEditorTableColumn,
-  deleteEditorTableRow,
   undoEditor,
 } from "../plugins";
 import { getTheme } from "../themes";
@@ -35,8 +35,8 @@ import { renderWechatHtml } from "../wechat/renderer";
 
 import EditorHeader from "./EditorHeader";
 import EditorToolbar from "./EditorToolbar";
-import { editorToolbarGroups, useEditorToolbarTools } from "./editorToolbarRegistry";
 import EditorWorkspace from "./EditorWorkspace";
+import { editorToolbarGroups, useEditorToolbarTools } from "./editorToolbarRegistry";
 import ImageEditorDialog from "./ImageEditorDialog";
 import ImageEditToolbar from "./ImageEditToolbar";
 import LinkEditorDialog, { type LinkDraft } from "./LinkEditorDialog";
@@ -45,6 +45,7 @@ import useDocumentActions from "./useDocumentActions";
 import useDraftPersistence from "./useDraftPersistence";
 import useEditorDerivedState from "./useEditorDerivedState";
 import useImageEditing from "./useImageEditing";
+
 const seed = `# 产品设计的第一原则
 
 好的产品设计，始于对用户的深刻理解。我们常常被功能、技术和商业目标牵引，却容易忽略最根本的问题：用户真正需要的是什么？

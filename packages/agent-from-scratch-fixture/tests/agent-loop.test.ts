@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { runAgentLoop, runAgentLoopFromState, type AgentLoopOptions } from "../src/agent-loop.js";
+import { type AgentLoopOptions, runAgentLoop, runAgentLoopFromState } from "../src/agent-loop.js";
 import { sha256 } from "../src/checkpoint.js";
 import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
@@ -12,7 +12,6 @@ import { InMemoryTraceSink } from "../src/trace.js";
 import type { ValidationSpec } from "../src/types.js";
 import {
   CompletingPlanner,
-  ScriptedPlanner,
   completeWith,
   createRegistry,
   criterion,
@@ -23,6 +22,7 @@ import {
   notCompleted,
   planStep,
   removeTempDir,
+  ScriptedPlanner,
 } from "./support.js";
 
 const temporaryDirectories: string[] = [];

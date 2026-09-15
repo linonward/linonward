@@ -1,9 +1,8 @@
+import { listArticles } from "@linonward/content";
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
-
 import { AdminHeader } from "@/components/admin-header";
 import { NewArticleButton } from "@/components/new-article-button";
-import { listArticles } from "@linonward/content";
 
 export default async function AdminPage() {
   const articles = await listArticles();

@@ -1,9 +1,9 @@
 import type { ContextSource } from "./context.js";
+import { type PlanDraft, validatePlan } from "./planner.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
-import { validatePlan, type PlanDraft } from "./planner.js";
 
-export { createInitialPlan, createModelPlanCreator, validatePlan } from "./planner.js";
 export type { PlanDraft, PlanEvaluation, Planner } from "./planner.js";
+export { createInitialPlan, createModelPlanCreator, validatePlan } from "./planner.js";
 
 export type ReplanReason =
   | "new_constraint"

@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
 import {
-  runAgentLoop,
   type AgentLoopOptions,
   type LoopCompactionOptions,
+  runAgentLoop,
 } from "../src/agent-loop.js";
 import {
   buildCompactionSnapshot,
+  type Compactor,
   compactionAsContextSources,
   isSafeCompactionBoundary,
   maybeCompactContext,
@@ -15,15 +16,13 @@ import {
   selectRawTailBoundary,
   shouldCompact,
   validateCompaction,
-  type Compactor,
 } from "../src/compaction.js";
-import { defineTool } from "../src/tool.js";
 import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
 import { createInitialState } from "../src/state.js";
+import { defineTool } from "../src/tool.js";
 import { InMemoryTraceSink } from "../src/trace.js";
 import type { AgentEvent, AgentState, CompactionSnapshot } from "../src/types.js";
 import {
-  ScriptedPlanner,
   completeWith,
   createRegistry,
   criterion,
@@ -32,6 +31,7 @@ import {
   makeTempDir,
   planStep,
   removeTempDir,
+  ScriptedPlanner,
 } from "./support.js";
 
 type Draft = Omit<CompactionSnapshot, "id" | "createdAt" | "checksum">;

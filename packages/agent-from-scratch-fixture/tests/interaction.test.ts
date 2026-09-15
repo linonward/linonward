@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { applyUserAnswer, applyUserSteering, waitForUserInput } from "../src/interaction.js";
-import { InMemoryApprovalLedger, authorize, type PolicyContext } from "../src/policy.js";
+import { authorize, InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
 import { createInitialState } from "../src/state.js";
 import { runCommandTool } from "../src/tools/run-command.js";
 import type { UserInputRequest } from "../src/types.js";

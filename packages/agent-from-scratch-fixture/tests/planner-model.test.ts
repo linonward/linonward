@@ -4,10 +4,10 @@ import type { ModelRequest } from "../src/context.js";
 import type { Model } from "../src/model.js";
 import type { PlanDraft } from "../src/planner.js";
 import {
-  MAX_PLANNER_RETRIES,
   createModelPlanner,
   extractJsonObject,
   filterEvidenceFromObservations,
+  MAX_PLANNER_RETRIES,
 } from "../src/planner-model.js";
 import type { AcceptanceCriterion, PlanStep } from "../src/types.js";
 

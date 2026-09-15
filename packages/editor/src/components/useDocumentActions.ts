@@ -1,7 +1,7 @@
 import { EditorState } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
-import { useState } from "react";
 import type { ChangeEvent, RefObject } from "react";
+import { useState } from "react";
 
 import { parseMarkdown, serializeMarkdown } from "../markdown/parser";
 import { getTheme } from "../themes";

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { leadSchema } from "@/lib/validations/lead";
+
 const valid = {
   name: "王小明",
   contact: "wechat-hello",

@@ -1,5 +1,5 @@
-import Link from "next/link";
 import type { Metadata } from "next";
+import Link from "next/link";
 import { InterviewFeedbackForm } from "@/components/interview-feedback-form";
 
 export const metadata: Metadata = {

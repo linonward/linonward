@@ -8,6 +8,7 @@ import {
   imagePresentation,
 } from "../imagePresentation";
 import type { Theme } from "../themes/types";
+
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const style = (o: Record<string, string>) =>

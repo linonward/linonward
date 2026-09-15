@@ -5,22 +5,22 @@ import { executeToolCall } from "../src/execute-tool.js";
 import type { ToolCall } from "../src/model.js";
 import type { PolicyContext } from "../src/policy.js";
 import { PreApprovingLedger } from "../src/run-task.js";
-import { runCommandTool } from "../src/tools/run-command.js";
 import {
-  SandboxError,
   buildBubblewrapArgs,
   buildSeatbeltProfile,
   detectSandbox,
   linuxBubblewrapSandbox,
   macOsSeatbeltSandbox,
   noSandbox,
-  seatbeltWritableRoots,
-  wrapWithSandbox,
   type Sandbox,
   type SandboxCommand,
+  SandboxError,
   type SandboxGuarantee,
   type SandboxPolicy,
+  seatbeltWritableRoots,
+  wrapWithSandbox,
 } from "../src/sandbox.js";
+import { runCommandTool } from "../src/tools/run-command.js";
 import { createRegistry, makeTempDir, removeTempDir } from "./support.js";
 
 const DISABLED: SandboxPolicy = { network: "disabled", writableRoot: "/work space/repo" };

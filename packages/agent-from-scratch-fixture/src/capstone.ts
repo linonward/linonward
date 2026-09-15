@@ -1,10 +1,10 @@
 import { isRecord } from "./checkpoint.js";
 import {
-  isAgentStatus,
-  runEvaluation,
   type EvaluationCase,
   type EvaluationReport,
   type EvaluationResult,
+  isAgentStatus,
+  runEvaluation,
 } from "./eval.js";
 import { addUsage, emptyUsage, type RunUsage } from "./trace.js";
 import type { AgentState } from "./types.js";

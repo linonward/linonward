@@ -1,7 +1,7 @@
 import { extractJsonObject } from "./json-object.js";
 import type { Model } from "./model.js";
-import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 import type { ReplanReason } from "./plan.js";
+import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 
 export interface PlanDraft {
   acceptanceCriteria: Array<{ id: string; description: string }>;

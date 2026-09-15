@@ -11,8 +11,8 @@ import {
   Undo2,
 } from "lucide-react";
 import type { EditorView } from "prosemirror-view";
-import { useEffect, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 export type ToolbarTool = {
   id: string;
