@@ -1,13 +1,13 @@
 "use client";
 
 import {
-  parseDraft,
-  RichTextEditor,
-  serializeDraftValue,
   type DocumentSummary,
   type DraftRepository,
   type EditorDraft,
   type EditorDraftValue,
+  parseDraft,
+  RichTextEditor,
+  serializeDraftValue,
 } from "@linonward/editor";
 import { useMemo, useRef } from "react";
 

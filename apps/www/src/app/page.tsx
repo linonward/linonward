@@ -1,9 +1,9 @@
-import Image from "next/image";
 import { ArrowRight, ArrowUp, ExternalLink } from "lucide-react";
-import { SiteHeader } from "@/components/site-header";
-import { Reveal } from "@/components/reveal";
+import Image from "next/image";
 import { CopyWechatButton } from "@/components/copy-wechat-button";
 import { CurrentYear } from "@/components/current-year";
+import { Reveal } from "@/components/reveal";
+import { SiteHeader } from "@/components/site-header";
 import { aboutPrinciples, brand, contentDirections } from "@/lib/brand";
 
 export default function Home() {

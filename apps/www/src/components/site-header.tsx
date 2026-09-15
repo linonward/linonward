@@ -1,6 +1,6 @@
 import Image from "next/image";
-import { brand } from "@/lib/brand";
 import { SiteHeaderControls } from "@/components/site-header-controls";
+import { brand } from "@/lib/brand";
 
 export function SiteHeader() {
   return (

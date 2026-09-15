@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 
-import { chapters, getChapterNeighbors, tutorialGoal, type AnyChapter } from "@/lib/chapters";
+import { type AnyChapter, chapters, getChapterNeighbors, tutorialGoal } from "@/lib/chapters";
 import { extensionChapters, getExtensionNeighbors } from "@/lib/extensions";
 
 import { ArrowIcon, BookIcon } from "./icons";

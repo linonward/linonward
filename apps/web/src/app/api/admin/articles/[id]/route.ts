@@ -1,6 +1,6 @@
-import { parseDraft, serializeDraftValue } from "@linonward/editor";
-import type { EditorDraftValue } from "@linonward/editor";
 import { getArticle, saveArticle } from "@linonward/content";
+import type { EditorDraftValue } from "@linonward/editor";
+import { parseDraft, serializeDraftValue } from "@linonward/editor";
 
 import { isAdministrator } from "@/server/auth";
 

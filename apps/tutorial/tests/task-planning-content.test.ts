@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { codeText, checkpoint, lessonSource, listProp, stepIds } from "./support/lesson-source";
+import { checkpoint, codeText, lessonSource, listProp, stepIds } from "./support/lesson-source";
 
 const source = lessonSource("task-planning");
 const code = codeText(source);
