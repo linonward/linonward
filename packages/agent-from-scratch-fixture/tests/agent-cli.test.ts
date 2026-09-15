@@ -24,15 +24,18 @@ import {
   userInputTurn,
   withUsage,
 } from "../src/fake-model.js";
-import { EXIT_CODES } from "../src/index.js";
+import type { AgentCliOptions } from "../src/index.js";
+import { createAgentCliRuntime, EXIT_CODES, runCli } from "../src/index.js";
 import type { ModelUsage, NormalizedModelResponse } from "../src/model.js";
 import {
   createStatelessResponsesDriver,
   type StatelessResponsesClient,
 } from "../src/responses-stateless-driver.js";
 import { InMemoryRunStore } from "../src/run-store.js";
+import { PreApprovingLedger } from "../src/run-task.js";
 import { createInitialState } from "../src/state.js";
 import { defineTool } from "../src/tool.js";
+import { runCommandTool } from "../src/tools/run-command.js";
 import {
   CompletingPlanner,
   createRegistry,
@@ -312,6 +315,62 @@ describe("createDeepSeekAgentCli", () => {
 
     expect(answerCode).toBe(EXIT_CODES.failed);
     expect(stderr.at(-1)).toContain("unexpected_user_input");
+  });
+
+  /**
+   * 审批必须跨"运行"与"回答"两次调用共享同一个批准账本：CLI 的 `agent answer` 是
+   * 另一个进程、另一份内存账本，所以这里直接驱动 `runCli` 并复用一个账本，
+   * 复现控制台（一个长驻进程、一个 per-run 账本）的情形。
+   */
+  it("approves a policy request and resumes the run (审批不是澄清)", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const approvals = new PreApprovingLedger();
+    const runCommand = turnWithTools({
+      callId: "call-1",
+      name: "run_command",
+      argumentsJson: '{"command":"node","args":["--version"]}',
+    });
+    const model = new FakeModelDriver([runCommand, runCommand, textTurn("node 版本已确认。")]);
+    const store = new InMemoryRunStore();
+    const base: AgentCliOptions = {
+      cwd: process.cwd(),
+      skillsDirectory: resolve(import.meta.dirname, "..", "skills"),
+      store,
+      model,
+      planner: new CompletingPlanner(makeDraft({}), ["criterion-1"]),
+      tools: createRegistry(runCommandTool),
+      policy: {
+        cwd: process.cwd(),
+        realWorkspaceRoot: process.cwd(),
+        allowedArgv: [["node", "--version"]],
+        network: "disabled",
+      },
+      approvals,
+      maxSteps: AGENT_DEFAULT_MAX_STEPS,
+      maxToolCalls: AGENT_DEFAULT_MAX_TOOL_CALLS,
+    };
+    const dependencies = { createRuntime: createAgentCliRuntime(base) };
+    const io = {
+      stdout: (text: string) => void stdout.push(text),
+      stderr: (text: string) => void stderr.push(text),
+    };
+
+    const runCode = await runCli(["run", "查看 node 版本"], dependencies, io, { verbose: true });
+    expect(runCode).toBe(EXIT_CODES.waiting);
+    const runId = runIdFromStderr(stderr);
+    // 策略请求确实落在了这个账本里，且还是"待批准"。
+    const pending = await approvals.pendingRequests(runId);
+    expect(pending).toHaveLength(1);
+    const requestId = pending[0]?.id ?? "";
+    expect(requestId.length).toBeGreaterThan(0);
+
+    const answerCode = await runCli(["answer", runId, requestId, "批准"], dependencies, io, {
+      verbose: true,
+    });
+
+    expect(answerCode).toBe(EXIT_CODES.completed);
+    expect(stdout.at(-1)).toBe("node 版本已确认。");
   });
 
   it("resumes a waiting run when the answer matches the pending request", async () => {

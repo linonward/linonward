@@ -30,6 +30,8 @@ export type DurableEvent =
   | { type: "compaction_completed"; snapshot: CompactionSnapshot }
   | { type: "run_waiting"; reason: string }
   | { type: "user_input_received"; requestId: string; content: string }
+  /** 人工批准了一条策略审批：凭证已进账本，运行从 `waiting` 回到 `running`。 */
+  | { type: "approval_granted"; requestId: string }
   | { type: "run_stopped"; reason: StopReason };
 
 export interface EventRecord {
@@ -153,6 +155,8 @@ function isDurableEvent(value: unknown): value is DurableEvent {
       return typeof value["reason"] === "string";
     case "user_input_received":
       return typeof value["requestId"] === "string" && typeof value["content"] === "string";
+    case "approval_granted":
+      return typeof value["requestId"] === "string";
     default:
       return false;
   }
