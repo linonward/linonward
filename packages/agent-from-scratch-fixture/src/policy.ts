@@ -4,9 +4,34 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { canonicalJson, isRecord, sha256 } from "./checkpoint.js";
 import type { RegisteredTool } from "./tool.js";
 
+/** 拒绝细节里最多保留多少条允许的 argv：超出的部分只保留计数。 */
+export const MAX_ALLOWED_ARGV_PREVIEW = 5;
+/** 拒绝细节里单条 argv 预览的最大字符数。 */
+export const MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS = 120;
+
+/**
+ * 策略拒绝时附带的**机器可读**细节。
+ *
+ * 只放可序列化的原始值，并且每一项都有界：`argv_not_allowed` 只带前
+ * `MAX_ALLOWED_ARGV_PREVIEW` 条允许 argv、实际条数与省略条数；
+ * `network_*` 只带当前 `network` 值。错误码本身仍是 `PolicyDecision.reason`，
+ * 这里既不重复、也不改变它的语义。
+ */
+export type PolicyDenyDetails =
+  | {
+      kind: "argv_not_allowed";
+      /** 实际配置的允许条数（不受预览上限影响）。 */
+      allowedArgvCount: number;
+      /** 有界预览：每条 argv 已渲染为一行并截断到 `MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS`。 */
+      allowedArgvPreview: string[];
+      /** 预览省略掉的条数，便于直接渲染 `…(+N more)`。 */
+      allowedArgvOmitted: number;
+    }
+  | { kind: "network"; network: PolicyContext["network"] };
+
 export type PolicyDecision =
   | { type: "allow"; scope: string }
-  | { type: "deny"; reason: string }
+  | { type: "deny"; reason: string; details?: PolicyDenyDetails }
   | { type: "ask"; request: ApprovalRequest };
 
 export interface ApprovalRequest {
@@ -118,6 +143,36 @@ function isInside(root: string, target: string): boolean {
   return pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
 }
 
+/** 把允许列表压成有界预览：条数与单条字符数都设上限，模型/操作者仍能看到全貌与总数。 */
+function boundedAllowedArgvPreview(allowedArgv: readonly string[][]): {
+  count: number;
+  preview: string[];
+  omitted: number;
+} {
+  const preview = allowedArgv.slice(0, MAX_ALLOWED_ARGV_PREVIEW).map((argv) => {
+    const rendered = argv.join(" ");
+    return rendered.length <= MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS
+      ? rendered
+      : `${rendered.slice(0, MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS)}…`;
+  });
+
+  return {
+    count: allowedArgv.length,
+    preview,
+    omitted: allowedArgv.length - preview.length,
+  };
+}
+
+function argvNotAllowedDetails(allowedArgv: readonly string[][]): PolicyDenyDetails {
+  const bounded = boundedAllowedArgvPreview(allowedArgv);
+  return {
+    kind: "argv_not_allowed",
+    allowedArgvCount: bounded.count,
+    allowedArgvPreview: bounded.preview,
+    allowedArgvOmitted: bounded.omitted,
+  };
+}
+
 /** 只做语法级预检；真正的 realpath 边界由 workspace.ts 在工具内部强制执行。 */
 function authorizeWorkspacePath(
   tool: RegisteredTool,
@@ -151,7 +206,13 @@ export function authorize(
 
     const argv = [input.command, ...input.args];
     const exactMatch = context.allowedArgv.some((allowed) => arraysEqual(argv, allowed));
-    if (!exactMatch) return { type: "deny", reason: "argv_not_allowed" };
+    if (!exactMatch) {
+      return {
+        type: "deny",
+        reason: "argv_not_allowed",
+        details: argvNotAllowedDetails(context.allowedArgv),
+      };
+    }
 
     return {
       type: "ask",
@@ -170,7 +231,11 @@ export function authorize(
   }
 
   if (tool.effect === "external" || context.network !== "disabled") {
-    return { type: "deny", reason: "network_or_external_effect_not_allowed" };
+    return {
+      type: "deny",
+      reason: "network_or_external_effect_not_allowed",
+      details: { kind: "network", network: context.network },
+    };
   }
 
   return { type: "deny", reason: "no_matching_policy" };

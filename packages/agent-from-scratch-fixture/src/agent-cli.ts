@@ -37,7 +37,7 @@ import type { ToolRegistry } from "./tool-registry.js";
 import type { Clock } from "./types.js";
 
 export const AGENT_USAGE =
-  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>]";
+  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose]";
 
 /** 与 `runRealTask` 保持同一组预算默认值：CLI 与真实通路不各自定义一套。 */
 export const AGENT_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
@@ -49,6 +49,7 @@ const REQUIRE_SANDBOX_FLAG = "--require-sandbox";
 const APPROVE_ALLOWED_FLAG = "--approve-allowed";
 const MAX_STEPS_FLAG = "--max-steps";
 const MAX_TOOL_CALLS_FLAG = "--max-tool-calls";
+const VERBOSE_FLAG = "--verbose";
 
 /** `--allow` 收集 argv 时遇到这些开关就停：它们属于 CLI，不属于被允许的命令。 */
 const KNOWN_FLAGS: ReadonlySet<string> = new Set([
@@ -58,6 +59,7 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   APPROVE_ALLOWED_FLAG,
   MAX_STEPS_FLAG,
   MAX_TOOL_CALLS_FLAG,
+  VERBOSE_FLAG,
 ]);
 
 function usageError(detail: string): Error {
@@ -79,6 +81,8 @@ export interface AgentCliConfig {
   autoApproveAllowedCommands: boolean;
   maxSteps: number;
   maxToolCalls: number;
+  /** 默认关闭：打开后只在 stderr 上追加有界详情，stdout 仍只有最终答案。 */
+  verbose: boolean;
 }
 
 /**
@@ -86,8 +90,11 @@ export interface AgentCliConfig {
  *
  * 子命令仍交给 `parseCliArgs` 解析（保持与既有 CLI 契约一致）；这里只负责把
  * `--cwd` / `--allow` / `--require-sandbox` / `--approve-allowed` / `--max-steps` /
- * `--max-tool-calls` 从位置参数里摘出来。`--allow` 每次吞掉一个完整 argv，
+ * `--max-tool-calls` / `--verbose` 从位置参数里摘出来。`--allow` 每次吞掉一个完整 argv，
  * 直到下一个已识别的 CLI flag 为止，因此可以重复出现。
+ *
+ * 布尔开关（`--require-sandbox` / `--approve-allowed` / `--verbose`）只看"出现过"，
+ * 放在子命令前或后都一样，重复出现也不报错。
  */
 export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; command: CliCommand } {
   const positionals: string[] = [];
@@ -97,6 +104,7 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   let autoApproveAllowedCommands = false;
   let maxSteps = AGENT_DEFAULT_MAX_STEPS;
   let maxToolCalls = AGENT_DEFAULT_MAX_TOOL_CALLS;
+  let verbose = false;
 
   let index = 0;
   while (index < argv.length) {
@@ -149,6 +157,11 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       continue;
     }
 
+    if (token === VERBOSE_FLAG) {
+      verbose = true;
+      continue;
+    }
+
     if (token.startsWith("--")) throw usageError(`未知参数：${token}`);
     positionals.push(token);
   }
@@ -168,6 +181,7 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       autoApproveAllowedCommands,
       maxSteps,
       maxToolCalls,
+      verbose,
     },
     command,
   };
@@ -367,7 +381,9 @@ export async function createDeepSeekAgentCli(
     });
 
     try {
-      return await runCli(toCliArgv(parsed.command), dependencies, io);
+      return await runCli(toCliArgv(parsed.command), dependencies, io, {
+        verbose: parsed.config.verbose,
+      });
     } catch (error) {
       // 运行期错误（未知 requestId、没有可恢复的检查点等）折成可读错误与非零退出码。
       io.stderr(messageOf(error));

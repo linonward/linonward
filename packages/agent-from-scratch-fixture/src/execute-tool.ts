@@ -7,7 +7,10 @@ import {
   type ApprovalLedger,
   authorize,
   InMemoryApprovalLedger,
+  MAX_ALLOWED_ARGV_PREVIEW,
+  MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS,
   type PolicyContext,
+  type PolicyDenyDetails,
 } from "./policy.js";
 import { type Sandbox, SandboxError } from "./sandbox.js";
 import { InMemoryWriteLease, type ToolEffect, type WriteLease } from "./tool.js";
@@ -123,12 +126,77 @@ function observationFromValue(
   return observation;
 }
 
-function failure(callId: string, code: string, message: string, effect: ToolEffect | "unknown") {
+/** 普通工具错误沿用既有 500 字符上限；策略拒绝用更长的独立上限（见下）。 */
+const MAX_FAILURE_MESSAGE_CHARACTERS = 500;
+
+/**
+ * 策略拒绝的 message 上限。预览已被 policy 限成
+ * `MAX_ALLOWED_ARGV_PREVIEW` 条 × `MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS` 字符，
+ * 因此这里只需要一个确定的上限，确保 `…(+N more)` 不会被截掉。
+ */
+export const MAX_DENIAL_MESSAGE_CHARACTERS = 1_024;
+
+function failureWithLimit(
+  callId: string,
+  code: string,
+  message: string,
+  effect: ToolEffect | "unknown",
+  maxMessageCharacters: number,
+) {
   return observationFromValue(
     callId,
-    { ok: false, error: code, message: message.slice(0, 500) },
+    { ok: false, error: code, message: message.slice(0, maxMessageCharacters) },
     { ok: false, effect, errorCode: code },
   );
+}
+
+function failure(callId: string, code: string, message: string, effect: ToolEffect | "unknown") {
+  return failureWithLimit(callId, code, message, effect, MAX_FAILURE_MESSAGE_CHARACTERS);
+}
+
+function truncateDeniedArgv(rendered: string): string {
+  return rendered.length <= MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS
+    ? rendered
+    : `${rendered.slice(0, MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS)}…`;
+}
+
+/** 白名单为空时的固定指引：让模型/操作者知道问题在配置，而不是这次请求的写法。 */
+const EMPTY_ALLOWED_ARGV_HINT =
+  "当前没有配置任何允许的 argv；需要执行命令时请用 `--allow <command> [args...]` 预先放行";
+
+/**
+ * 策略拒绝的 message：`error` 仍然是原来的错误码，这里只补**有界**、可操作的细节。
+ *
+ * 白名单为空时给出明确指引——"不是这次请求写错了，而是根本没有放行任何命令"；
+ * 非空时给出允许条数与预览，让模型知道下一步该改成什么，或者直接如实回答。
+ */
+function denialMessage(decision: { reason: string; details?: PolicyDenyDetails }): string {
+  const details = decision.details;
+
+  if (details?.kind === "argv_not_allowed") {
+    if (details.allowedArgvCount === 0) {
+      return `argv_not_allowed: ${EMPTY_ALLOWED_ARGV_HINT}`;
+    }
+
+    const preview = details.allowedArgvPreview
+      .slice(0, MAX_ALLOWED_ARGV_PREVIEW)
+      .map(truncateDeniedArgv);
+    if (details.allowedArgvOmitted > 0) preview.push(`…(+${details.allowedArgvOmitted} more)`);
+
+    return [
+      `argv_not_allowed: 允许的 argv 共 ${details.allowedArgvCount} 条，这次请求不在其中。`,
+      `允许的 argv 预览：${preview.join("; ")}`,
+    ].join(" ");
+  }
+
+  if (details?.kind === "network") {
+    return [
+      `network_or_external_effect_not_allowed: 当前 network=${details.network}，`,
+      "该工具可能产生网络或外部副作用，已被策略拒绝。",
+    ].join("");
+  }
+
+  return decision.reason;
 }
 
 /**
@@ -179,7 +247,13 @@ export async function executeToolCall(
   const decision = authorize(tool, prepared.input, policy);
 
   if (decision.type === "deny") {
-    return failure(options.call.callId, decision.reason, decision.reason, tool.effect);
+    return failureWithLimit(
+      options.call.callId,
+      decision.reason,
+      denialMessage(decision),
+      tool.effect,
+      MAX_DENIAL_MESSAGE_CHARACTERS,
+    );
   }
 
   if (decision.type === "ask") {

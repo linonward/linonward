@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { type AgentLoopOptions, runAgentLoop, runAgentLoopFromState } from "../src/agent-loop.js";
-import { sha256 } from "../src/checkpoint.js";
+import { isRecord, sha256 } from "../src/checkpoint.js";
 import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
 import { createInitialState, transitionState } from "../src/state.js";
@@ -70,6 +70,22 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
 
 const echoObservation = JSON.stringify({ ok: true, data: { echoed: "hi" } });
 const echoCall = { callId: "call-1", name: "echo", argumentsJson: '{"value":"hi"}' };
+
+/** `plan_blocked` 的 detail 是 JSON 文本：测试只按稳定字段读取，不做类型断言。 */
+function parseDetail(detail: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(detail);
+  if (!isRecord(parsed)) throw new Error("plan_blocked detail is not an object");
+  return parsed;
+}
+
+function pendingStepOf(detail: Record<string, unknown>, id: string): Record<string, unknown> {
+  const steps = detail["pendingSteps"];
+  if (!Array.isArray(steps)) throw new Error("pendingSteps is not an array");
+  for (const step of steps) {
+    if (isRecord(step) && step["id"] === id) return step;
+  }
+  throw new Error(`pending step ${id} is missing`);
+}
 
 describe("agent loop control flow", () => {
   it("runs model → tool → observation → model → final", async () => {
@@ -245,6 +261,45 @@ describe("agent loop control flow", () => {
     expect(result.stopReason).toBe("blocked_plan");
     expect(result.status).toBe("blocked");
     expect(result.state.budget.modelSteps).toBe(0);
+  });
+
+  it("records a plan_blocked event naming the step with unmet dependencies", async () => {
+    const cwd = await tempDir();
+    const state = {
+      ...createInitialState("任务", cwd, { maxSteps: 2, maxToolCalls: 2 }),
+      plan: makeTaskPlan({
+        steps: [
+          // 有一个 in_progress 步骤，`shouldReplan` 才不会先走修订分支。
+          planStep("active-step", { status: "in_progress" }),
+          planStep("blocked-step", { status: "blocked", dependsOn: ["active-step"] }),
+          planStep("step-2", { dependsOn: ["blocked-step"] }),
+        ],
+      }),
+    };
+
+    const result = await runAgentLoopFromState(
+      state,
+      base(cwd, {
+        model: new FakeModelDriver([]),
+        planner: new ScriptedPlanner(makeDraft({})),
+        tools: createRegistry(echoTool),
+      }),
+    );
+
+    expect(result.stopReason).toBe("blocked_plan");
+    const recorded = result.state.events.filter((event) => event.type === "plan_blocked");
+    expect(recorded).toHaveLength(1);
+
+    const detail = parseDetail(recorded[0]?.detail ?? "");
+    expect(detail["reason"]).toBe("no_ready_step");
+    expect(String(detail["summary"])).toContain("没有依赖就绪");
+
+    const pending = pendingStepOf(detail, "step-2");
+    expect(pending["status"]).toBe("pending");
+    expect(pending["unmetDependencies"]).toEqual(["blocked-step"]);
+
+    const steps = detail["pendingSteps"];
+    expect(Array.isArray(steps) ? steps.length : 0).toBeLessThanOrEqual(10);
   });
 
   it("emits plan_revised and bumps the plan version", async () => {
