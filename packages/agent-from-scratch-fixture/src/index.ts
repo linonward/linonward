@@ -299,6 +299,10 @@ export interface AgentCliOptions {
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
+  /** 花费上限（美元）：缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：缺省不限制。 */
+  maxWallMs?: number | undefined;
   /** 完整日志的工具钩子；由装配层接到 journal。 */
   onToolCall?: AgentLoopOptions["onToolCall"];
   /** 成本估算接线；由装配层从模型 id + 价目表解析。 */
@@ -346,6 +350,8 @@ export function createAgentCliRuntime(
         const state = createInitialState(task, options.cwd, {
           maxSteps: options.maxSteps ?? 12,
           maxToolCalls: options.maxToolCalls ?? 24,
+          ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+          ...(options.maxWallMs !== undefined ? { maxWallMs: options.maxWallMs } : {}),
         });
         const lease = await options.store.acquireLease(state.runId, randomUUID(), CLI_LEASE_TTL_MS);
 

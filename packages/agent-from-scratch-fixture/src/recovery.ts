@@ -335,6 +335,10 @@ export function loopOptionsFromRuntime(
     skillsDirectory: runtime.skillsDirectory,
     maxSteps: state.budget.maxSteps,
     maxToolCalls: state.budget.maxToolCalls,
+    // 钱与时间的上限同样随权威状态走：`runAgentLoop` 会用它重新建初始状态，
+    // 只把上限写进"预先建好的 state"是不够的。
+    ...(state.budget.maxCostUsd !== undefined ? { maxCostUsd: state.budget.maxCostUsd } : {}),
+    ...(state.budget.maxWallMs !== undefined ? { maxWallMs: state.budget.maxWallMs } : {}),
     toolTimeoutMs: runtime.toolTimeoutMs,
     model: runtime.model,
     planner: runtime.planner,

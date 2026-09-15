@@ -130,6 +130,29 @@ describe("parseAgentArgs", () => {
     });
   });
 
+  it("解析钱与时间的硬上限", () => {
+    const parsed = parseAgentArgs([
+      "run",
+      "任务",
+      "--max-cost-usd",
+      "0.5",
+      "--max-wall-ms",
+      "60000",
+    ]);
+
+    expect(parsed.config.maxCostUsd).toBe(0.5);
+    expect(parsed.config.maxWallMs).toBe(60_000);
+    expect(parseAgentArgs(["run", "任务"]).config.maxCostUsd).toBeUndefined();
+    expect(parseAgentArgs(["run", "任务"]).config.maxWallMs).toBeUndefined();
+  });
+
+  it("非法的上限一律拒绝", () => {
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "0"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "-1"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "abc"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-wall-ms", "0"])).toThrow("max-wall-ms");
+  });
+
   it("collects flags and repeated --allow argv", () => {
     const { config } = parseAgentArgs([
       "run",
@@ -717,6 +740,84 @@ describe("--verbose", () => {
     // 既有的 usage 行必须与诊断在同一次输出里，且 hint 收尾。
     expect(joined).toContain("[summary] usage modelCalls=1 toolCalls=1");
     expect(joined.indexOf("[summary] hint:")).toBeGreaterThan(joined.indexOf("[summary] usage"));
+  });
+
+  /** 价格 $1/token：`inputTokens: 1` 就是 $1，算术一眼可验。 */
+  const ONE_DOLLAR_PER_TOKEN = JSON.stringify({
+    asOf: "2024-01-01",
+    models: {
+      "test-model": {
+        inputPerMillionUsd: 1_000_000,
+        outputPerMillionUsd: 0,
+        asOf: "2024-01-01",
+      },
+    },
+  });
+
+  it("--max-cost-usd 越过上限时停止，并在汇总里给出上限与提示", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const model = new FakeModelDriver([
+      withUsage(
+        turnWithTools({ callId: "call-1", name: "echo", argumentsJson: '{"value":"hi"}' }),
+        {
+          inputTokens: 1,
+          outputTokens: 0,
+        },
+      ),
+    ]);
+    const cli = await createDeepSeekAgentCli({
+      env: { DEEPSEEK_PRICE_TABLE_JSON: ONE_DOLLAR_PER_TOKEN },
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        modelId: "test-model",
+        planner: new ScriptedPlanner(makeDraft({}), [notCompleted()]),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+      },
+    });
+
+    const code = await cli(["run", "花钱", "--verbose", "--max-cost-usd", "0.5"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("stopped: max_cost");
+    expect(joined).toContain("[summary] stopped detail:");
+    expect(joined).toContain("hint:");
+    expect(joined).toContain("--max-cost-usd");
+  });
+
+  it("--max-wall-ms 越过上限时停止", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let nowMs = Date.parse("2024-01-01T00:00:00.000Z");
+    const model = new FakeModelDriver([textTurn("太久了")]);
+    const cli = await createDeepSeekAgentCli({
+      env: {},
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        planner: new CompletingPlanner(makeDraft({}), ["criterion-1"]),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+        clock: {
+          now: () => {
+            nowMs += 10_000;
+            return new Date(nowMs);
+          },
+        },
+      },
+    });
+
+    const code = await cli(["run", "跑太久", "--verbose", "--max-wall-ms", "5000"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("stopped: max_wall_ms");
+    expect(joined).toContain("--max-wall-ms");
   });
 
   it("重复调用的 max_steps 运行给出重复提示，并把 budget_exhausted 写进 JSONL", async () => {

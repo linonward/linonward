@@ -21,7 +21,13 @@ export interface JournalRunMeta {
   command: string;
   task?: string | undefined;
   cwd: string;
-  budgets: { maxSteps: number; maxToolCalls: number };
+  /** 预算与硬上限：`run_started` 记录是进程重启后重建一次运行的唯一来源。 */
+  budgets: {
+    maxSteps: number;
+    maxToolCalls: number;
+    maxCostUsd?: number | undefined;
+    maxWallMs?: number | undefined;
+  };
   allowedArgv: string[][];
   requireSandbox: boolean;
   /**

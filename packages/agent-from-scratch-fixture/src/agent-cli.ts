@@ -50,6 +50,8 @@ const CWD_FLAG = "--cwd";
 const REQUIRE_SANDBOX_FLAG = "--require-sandbox";
 const APPROVE_ALLOWED_FLAG = "--approve-allowed";
 const MAX_STEPS_FLAG = "--max-steps";
+const MAX_COST_USD_FLAG = "--max-cost-usd";
+const MAX_WALL_MS_FLAG = "--max-wall-ms";
 const MAX_TOOL_CALLS_FLAG = "--max-tool-calls";
 const VERBOSE_FLAG = "--verbose";
 const LOG_FLAG = "--log";
@@ -64,6 +66,8 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   APPROVE_ALLOWED_FLAG,
   MAX_STEPS_FLAG,
   MAX_TOOL_CALLS_FLAG,
+  MAX_COST_USD_FLAG,
+  MAX_WALL_MS_FLAG,
   VERBOSE_FLAG,
   LOG_FLAG,
   NO_TRUNCATE_FLAG,
@@ -82,6 +86,15 @@ function positiveInteger(flag: string, value: string): number {
   return parsed;
 }
 
+/** 正数（允许小数）：金额用，`0` 与负数都没有意义。 */
+function positiveNumber(flag: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw usageError(`${flag} 需要一个正数，收到：${value}`);
+  }
+  return parsed;
+}
+
 export interface AgentCliConfig {
   cwd: string;
   allowedArgv: string[][];
@@ -89,6 +102,10 @@ export interface AgentCliConfig {
   autoApproveAllowedCommands: boolean;
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）。缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）。缺省不限制。 */
+  maxWallMs?: number | undefined;
   /** 默认关闭：打开后只在 stderr 上追加有界详情，stdout 仍只有最终答案。 */
   verbose: boolean;
   /** `--log <path>`：把同一条完整日志以 JSONL 追加写入文件。只在 `--verbose` 打开时生效。 */
@@ -118,6 +135,8 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   let requireSandbox = false;
   let autoApproveAllowedCommands = false;
   let maxSteps = AGENT_DEFAULT_MAX_STEPS;
+  let maxCostUsd: number | undefined;
+  let maxWallMs: number | undefined;
   let maxToolCalls = AGENT_DEFAULT_MAX_TOOL_CALLS;
   let verbose = false;
   let logPath: string | undefined;
@@ -162,6 +181,26 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       const parsed = positiveInteger(token, value);
       if (token === MAX_STEPS_FLAG) maxSteps = parsed;
       else maxToolCalls = parsed;
+      continue;
+    }
+
+    if (token === MAX_COST_USD_FLAG) {
+      const value = argv[index];
+      if (value === undefined || KNOWN_FLAGS.has(value)) {
+        throw usageError(`${MAX_COST_USD_FLAG} 需要一个正数（美元）`);
+      }
+      index += 1;
+      maxCostUsd = positiveNumber(MAX_COST_USD_FLAG, value);
+      continue;
+    }
+
+    if (token === MAX_WALL_MS_FLAG) {
+      const value = argv[index];
+      if (value === undefined || KNOWN_FLAGS.has(value)) {
+        throw usageError(`${MAX_WALL_MS_FLAG} 需要一个正整数（毫秒）`);
+      }
+      index += 1;
+      maxWallMs = positiveInteger(MAX_WALL_MS_FLAG, value);
       continue;
     }
 
@@ -219,6 +258,8 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       autoApproveAllowedCommands,
       maxSteps,
       maxToolCalls,
+      ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+      ...(maxWallMs !== undefined ? { maxWallMs } : {}),
       verbose,
       logPath,
       noTruncate,
@@ -357,6 +398,8 @@ function createRuntimeFactory(
       maxSteps: wiring.config.maxSteps,
       maxToolCalls: wiring.config.maxToolCalls,
       pricing: wiring.pricing,
+      ...(wiring.config.maxCostUsd !== undefined ? { maxCostUsd: wiring.config.maxCostUsd } : {}),
+      ...(wiring.config.maxWallMs !== undefined ? { maxWallMs: wiring.config.maxWallMs } : {}),
       repeatGuard: wiring.config.repeatGuard,
     };
     if (wiring.clock !== undefined) options.clock = wiring.clock;
@@ -452,7 +495,14 @@ export async function createDeepSeekAgentCli(
         command: parsed.command.command,
         task: parsed.command.command === "run" ? parsed.command.task : undefined,
         cwd: parsed.config.cwd,
-        budgets: { maxSteps: parsed.config.maxSteps, maxToolCalls: parsed.config.maxToolCalls },
+        budgets: {
+          maxSteps: parsed.config.maxSteps,
+          maxToolCalls: parsed.config.maxToolCalls,
+          ...(parsed.config.maxCostUsd !== undefined
+            ? { maxCostUsd: parsed.config.maxCostUsd }
+            : {}),
+          ...(parsed.config.maxWallMs !== undefined ? { maxWallMs: parsed.config.maxWallMs } : {}),
+        },
         allowedArgv: parsed.config.allowedArgv,
         requireSandbox: parsed.config.requireSandbox,
         modelId: realWiring?.modelId,
