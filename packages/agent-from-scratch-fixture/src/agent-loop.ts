@@ -353,6 +353,88 @@ function statusForStop(reason: StopReason): AgentState["status"] {
   return "failed";
 }
 
+/**
+ * `blocked_plan` 的触发点。操作者必须能区分"根本没有计划""没有依赖就绪的步骤"
+ * "模型要调工具但当前没有 active step"和"计划在打转"；否则只能从内存日志猜。
+ */
+export type PlanBlockedReason =
+  | "missing_plan"
+  | "no_ready_step"
+  | "no_active_step"
+  | "replan_thrash";
+
+/** `plan_blocked` 事件 detail 里最多登记多少条未完成步骤：超出只保留计数。 */
+export const MAX_PLAN_BLOCKED_PENDING_STEPS = 10;
+
+interface PlanBlockedPendingStep {
+  id: string;
+  status: PlanStep["status"];
+  dependsOn: string[];
+  unmetDependencies: string[];
+}
+
+/** `plan_blocked` 事件 detail 的稳定形状：机器可读字段 + 一句人类摘要。 */
+export interface PlanBlockedDetail {
+  type: "plan_blocked";
+  reason: PlanBlockedReason;
+  summary: string;
+  activeStepId?: string | undefined;
+  pendingSteps: PlanBlockedPendingStep[];
+  pendingStepsOmitted: number;
+}
+
+/** 未完成步骤的**有界**投影：只保留前 N 条，每条带依赖与未满足的依赖。 */
+function planBlockedPendingSteps(state: AgentState): {
+  pendingSteps: PlanBlockedPendingStep[];
+  omitted: number;
+} {
+  const steps = state.plan?.steps ?? [];
+  const completed = new Set(
+    steps.filter((step) => step.status === "completed").map((step) => step.id),
+  );
+  const unfinished = steps.filter((step) => step.status !== "completed");
+  const pendingSteps = unfinished.slice(0, MAX_PLAN_BLOCKED_PENDING_STEPS).map((step) => ({
+    id: step.id,
+    status: step.status,
+    dependsOn: [...step.dependsOn],
+    unmetDependencies: step.dependsOn.filter((dependency) => !completed.has(dependency)),
+  }));
+
+  return { pendingSteps, omitted: unfinished.length - pendingSteps.length };
+}
+
+const PLAN_BLOCKED_SUMMARY: Record<PlanBlockedReason, string> = {
+  missing_plan: "运行状态下没有计划：没有可供选择或执行的步骤。",
+  no_ready_step: "没有依赖就绪的待办步骤：请先完成或解除被阻塞的依赖，否则需要修订计划。",
+  no_active_step: "模型请求了工具，但当前没有 active step，也没有可启动的 ready 步骤。",
+  replan_thrash: "连续多轮只修订计划却没有任何步骤完成：继续只会消耗预算，因此停止。",
+};
+
+function describePlanBlocked(state: AgentState, reason: PlanBlockedReason): PlanBlockedDetail {
+  const { pendingSteps, omitted } = planBlockedPendingSteps(state);
+  const detail: PlanBlockedDetail = {
+    type: "plan_blocked",
+    reason,
+    summary: PLAN_BLOCKED_SUMMARY[reason],
+    pendingSteps,
+    pendingStepsOmitted: omitted,
+  };
+  if (state.activeStepId !== undefined) detail.activeStepId = state.activeStepId;
+  return detail;
+}
+
+/**
+ * 停止前登记**可诊断**的阻塞原因。这是运行时事件（只进内存日志，不占用 store 的
+ * 权威事件流），并随最终 `AgentResult.state.events` 返回给 CLI 与操作者。
+ */
+function recordPlanBlocked(
+  state: AgentState,
+  reason: PlanBlockedReason,
+  context: LoopContext,
+): void {
+  context.persistRuntime(state, "plan_blocked", JSON.stringify(describePlanBlocked(state, reason)));
+}
+
 /** 停止事件同时是权威状态变更与 durable 事件，两者 payload 必须逐字节一致。 */
 function writeStatusEvent(state: AgentState, reason: StopReason, now: Date): AgentState {
   const recorded = appendEvent(
@@ -602,7 +684,10 @@ export async function runAgentLoopFromState(
       return interruptedResult(state);
     }
   }
-  if (!state.plan) return finishStop(state, "blocked_plan", context);
+  if (!state.plan) {
+    recordPlanBlocked(state, "missing_plan", context);
+    return finishStop(state, "blocked_plan", context);
+  }
   await persistPlan(state.plan);
   if (!(await context.checkpoint(state, context.now()))) return interruptedResult(state);
 
@@ -664,7 +749,10 @@ export async function runAgentLoopFromState(
     }
 
     let plan: TaskPlan | undefined = state.plan;
-    if (!plan) return finishStop(state, "blocked_plan", context);
+    if (!plan) {
+      recordPlanBlocked(state, "missing_plan", context);
+      return finishStop(state, "blocked_plan", context);
+    }
 
     const replanReason = shouldReplan({
       userChangedGoal: false,
@@ -697,6 +785,7 @@ export async function runAgentLoopFromState(
           "replan_thrash",
           JSON.stringify({ attempts: replansWithoutProgress, reason: replanReason }),
         );
+        recordPlanBlocked(state, "replan_thrash", context);
         return finishStop(state, "blocked_plan", context);
       }
       await persistPlan(plan);
@@ -716,6 +805,7 @@ export async function runAgentLoopFromState(
         activeStep = plan.steps.find((step) => step.id === ready.id);
         context.persistRuntime(state, "step_started", ready.id);
       } else if (plan.steps.some((step) => step.status !== "completed")) {
+        recordPlanBlocked(state, "no_ready_step", context);
         return finishStop(state, "blocked_plan", context);
       }
     }
@@ -883,7 +973,10 @@ export async function runAgentLoopFromState(
     if (state.budget.toolCalls + turn.toolCalls.length > state.budget.maxToolCalls) {
       return finishStop(state, "max_tool_calls", context);
     }
-    if (!activeStep) return finishStop(state, "blocked_plan", context);
+    if (!activeStep) {
+      recordPlanBlocked(state, "no_active_step", context);
+      return finishStop(state, "blocked_plan", context);
+    }
 
     const outputs: FunctionCallOutput[] = [];
     const observations: string[] = [];
@@ -1015,6 +1108,7 @@ export async function runAgentLoopFromState(
           "replan_thrash",
           JSON.stringify({ attempts: replansWithoutProgress, reason: progress.replanReason }),
         );
+        recordPlanBlocked(state, "replan_thrash", context);
         return finishStop(state, "blocked_plan", context);
       }
     }

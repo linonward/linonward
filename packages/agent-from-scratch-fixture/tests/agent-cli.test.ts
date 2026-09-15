@@ -16,7 +16,14 @@ import { FakeModelDriver, textTurn, turnWithTools, userInputTurn } from "../src/
 import { EXIT_CODES } from "../src/index.js";
 import { InMemoryRunStore } from "../src/run-store.js";
 import { createInitialState } from "../src/state.js";
-import { CompletingPlanner, createRegistry, echoTool, hugeTool, makeDraft } from "./support.js";
+import {
+  CompletingPlanner,
+  createRegistry,
+  echoTool,
+  hugeTool,
+  makeDraft,
+  ScriptedPlanner,
+} from "./support.js";
 
 /** 运行摘要写在 stderr 最后：这里逆序找出带 runId 的那一行。 */
 function runIdFromStderr(stderr: string[]): string {
@@ -306,6 +313,67 @@ describe("--verbose", () => {
     expect(joined).toContain("changedFiles=");
     expect(joined).toContain("validations=0");
     expect(joined).toContain("trace=run_started");
+  });
+
+  /**
+   * 计划反复修订却没有任何步骤完成：Loop 会以 `blocked_plan` 停止。
+   * 这个 fixture 因此能在全离线条件下产生真实的 `plan_blocked` 事件。
+   */
+  function blockedRun() {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const draft = makeDraft({ steps: [{ id: "step-1", title: "读取 package.json" }] });
+    const echoObservation = JSON.stringify({ ok: true, data: { echoed: "hi" } });
+    const evaluations = [1, 2, 3, 4].map(() => ({
+      completed: false,
+      evidence: [echoObservation],
+      passedCriteria: [] as string[],
+      replanReason: "failed_assumption" as const,
+    }));
+    const model = new FakeModelDriver(
+      [1, 2, 3, 4].map((index) =>
+        turnWithTools({ callId: `call-${index}`, name: "echo", argumentsJson: '{"value":"hi"}' }),
+      ),
+    );
+
+    return createDeepSeekAgentCli({
+      env: {},
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        planner: new ScriptedPlanner(draft, evaluations, draft),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+      },
+    }).then((cli) => ({ cli, stdout, stderr }));
+  }
+
+  it("在 blocked_plan 停止时把阻塞原因与步骤 id 写进汇总", async () => {
+    const { cli, stderr } = await blockedRun();
+
+    const code = await cli(["run", "读取 package.json", "--verbose"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("[event] run_stopped reason=blocked_plan");
+    expect(joined).toContain("[summary] blocked:");
+    expect(joined).toContain("step-1");
+  });
+
+  it("关闭 verbose 时阻塞运行没有额外的订阅输出", async () => {
+    const { cli, stderr } = await blockedRun();
+
+    const code = await cli(["run", "读取 package.json"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    for (const line of stderr) {
+      expect(line.startsWith("[event] ")).toBe(false);
+      expect(line.startsWith("[tool] ")).toBe(false);
+      expect(line.startsWith("[summary] ")).toBe(false);
+    }
+    // 默认路径仍然只有 canonicalJson 事件行 + 一条摘要。
+    expect(stderr.at(-1)).toContain('"stopReason":"blocked_plan"');
   });
 
   it("对超长 observation 与过多观测条数都做有界处理", async () => {

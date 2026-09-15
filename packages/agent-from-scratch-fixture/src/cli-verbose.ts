@@ -68,6 +68,96 @@ function boundedList(items: readonly string[], total: number = items.length): st
   return omitted > 0 ? `${body},(+${omitted} more)` : body;
 }
 
+/** `plan_blocked` 事件 detail 的稳定投影；字段缺失时返回 `undefined`，绝不猜一个值。 */
+interface PlanBlockedSummary {
+  reason: string;
+  summary: string;
+  activeStepId?: string | undefined;
+  pendingSteps: Array<{ id: string; status: string; unmetDependencies: string[] }>;
+  pendingStepsOmitted: number;
+}
+
+const PLAN_BLOCKED_REASON_LABELS: Record<string, string> = {
+  missing_plan: "missing plan",
+  no_ready_step: "no ready step",
+  no_active_step: "no active step",
+  replan_thrash: "replan thrash",
+};
+
+function toPendingStep(value: unknown): PlanBlockedSummary["pendingSteps"][number] | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = value["id"];
+  const status = value["status"];
+  if (typeof id !== "string" || typeof status !== "string") return undefined;
+
+  const unmet = value["unmetDependencies"];
+  return {
+    id,
+    status,
+    unmetDependencies: Array.isArray(unmet)
+      ? unmet.filter((dependency): dependency is string => typeof dependency === "string")
+      : [],
+  };
+}
+
+/** 从 `state.events` 里取最后一条 `plan_blocked`：这是 Loop 在停止前登记的阻塞原因。 */
+function readPlanBlocked(state: AgentState): PlanBlockedSummary | undefined {
+  const event = [...state.events].reverse().find((candidate) => candidate.type === "plan_blocked");
+  if (event === undefined) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.detail);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+
+  const reason = parsed["reason"];
+  const summary = parsed["summary"];
+  if (typeof reason !== "string" || typeof summary !== "string") return undefined;
+
+  const rawPending = parsed["pendingSteps"];
+  const omitted = parsed["pendingStepsOmitted"];
+  const activeStepId = parsed["activeStepId"];
+  const result: PlanBlockedSummary = {
+    reason,
+    summary,
+    pendingSteps: Array.isArray(rawPending)
+      ? rawPending.flatMap((candidate) => {
+          const step = toPendingStep(candidate);
+          return step === undefined ? [] : [step];
+        })
+      : [],
+    pendingStepsOmitted: typeof omitted === "number" ? omitted : 0,
+  };
+  if (typeof activeStepId === "string") result.activeStepId = activeStepId;
+  return result;
+}
+
+/**
+ * `blocked_plan` 的停止原因必须出现在汇总里：操作者要能直接看到"哪个步骤卡住、
+ * 缺哪个依赖"，而不是从事件流里反推。沿用 200 字符截断与 20 项上限。
+ */
+export function planBlockedSummaryLines(result: AgentResult): string[] {
+  if (result.stopReason !== "blocked_plan") return [];
+
+  const detail = readPlanBlocked(result.state);
+  if (detail === undefined) return ["[summary] blocked: reason unavailable"];
+
+  const label = PLAN_BLOCKED_REASON_LABELS[detail.reason] ?? detail.reason;
+  const pending = detail.pendingSteps.map(
+    (step) => `${step.id}(status=${step.status}, unmet=[${step.unmetDependencies.join(",")}])`,
+  );
+  const pendingText = boundedList(pending, pending.length + detail.pendingStepsOmitted);
+  const active = detail.activeStepId === undefined ? "" : ` active=${detail.activeStepId}`;
+
+  return [
+    `[summary] blocked: ${label} (${detail.reason}); pending=${pendingText}${active}`,
+    `[summary] blocked detail: ${truncateVerboseDetail(detail.summary)}`,
+  ];
+}
+
 /**
  * 工具观测摘要取自最终结果的 `state.contextSources`（`kind: "tool_observation"`），
  * 而不是 `state.steps`：只有前者同时带着 callId、工具名/标签与完整输出，才够推出
@@ -110,6 +200,7 @@ function summaryLines(
     `[summary] budget ${budget}`,
     `[summary] changedFiles=${boundedList(state.changedFiles)} validations=${state.validations.length}`,
     `[summary] trace=${boundedList(trace.types, trace.total)}`,
+    ...planBlockedSummaryLines(result),
   ];
 }
 

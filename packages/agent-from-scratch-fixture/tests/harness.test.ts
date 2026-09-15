@@ -492,6 +492,65 @@ describe("permission policy at the executor boundary", () => {
     expect(parse(result.output)["error"]).toBe("argv_not_allowed");
   });
 
+  it("explains an empty allowlist and points at --allow", async () => {
+    const cwd = await tempDir();
+    const policy: PolicyContext = {
+      cwd,
+      realWorkspaceRoot: cwd,
+      allowedArgv: [],
+      network: "disabled",
+    };
+
+    const result = await executeToolCall({
+      call: call("run_command", { command: "pnpm", args: ["test"] }),
+      registry: createRegistry(runCommandTool),
+      cwd,
+      timeoutMs: 2_000,
+      policy,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    // 错误码不变，只有 message 补上了可操作信息。
+    expect(parse(result.output)["error"]).toBe("argv_not_allowed");
+    expect(result.errorCode).toBe("argv_not_allowed");
+
+    const message = String(parse(result.output)["message"]);
+    expect(message).toContain("没有配置任何允许的 argv");
+    expect(message).toContain("--allow <command> [args...]");
+  });
+
+  it("previews a bounded number of allowed argv entries", async () => {
+    const cwd = await tempDir();
+    const policy: PolicyContext = {
+      cwd,
+      realWorkspaceRoot: cwd,
+      allowedArgv: Array.from({ length: 8 }, (_, index) => [`cmd-${index + 1}`, "arg"]),
+      network: "disabled",
+    };
+
+    const result = await executeToolCall({
+      call: call("run_command", { command: "node", args: ["--version"] }),
+      registry: createRegistry(runCommandTool),
+      cwd,
+      timeoutMs: 2_000,
+      policy,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(parse(result.output)["error"]).toBe("argv_not_allowed");
+
+    const message = String(parse(result.output)["message"]);
+    expect(message).toContain("共 8 条");
+    // 有界：只列出前 5 条，其余折叠成计数。
+    for (const index of [1, 2, 3, 4, 5]) {
+      expect(message).toContain(`cmd-${index} arg`);
+    }
+    for (const index of [6, 7, 8]) {
+      expect(message).not.toContain(`cmd-${index} arg`);
+    }
+    expect(message).toContain("(+3 more)");
+  });
+
   it("asks for approval before starting the process and runs only once approved", async () => {
     const cwd = await tempDir();
     const registry = createRegistry(runCommandTool);
