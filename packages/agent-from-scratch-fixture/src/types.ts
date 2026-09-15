@@ -49,6 +49,8 @@ export interface StopReasonMap {
   user_input_required: true;
   blocked_plan: true;
   interrupted: true;
+  /** 压缩连续校验失败导致的停止：宁可停下，也不用"差不多"的摘要继续。 */
+  compaction_failed: true;
 }
 
 export type StopReason = keyof StopReasonMap;

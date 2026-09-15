@@ -76,15 +76,20 @@ CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntim
 - 模型提前宣布完成会被打回，并以 `harness_feedback` 重新 Assemble（`src/agent-loop.ts`）。
 - Planner 返回本轮 observation 之外的证据会被拒绝（`src/plan.ts`）。
 - 压缩漏项、引用不存在的事件、篡改 Goal/验收条件/变更文件都会被拒绝（`src/compaction.ts`）。
+- 压缩已接入 Loop：每轮 Assemble 前按阈值 + 安全边界触发，压缩后上下文用
+  "快照 + rawTail"表达；连续两次校验失败以 `compaction_failed` 停止，期间绝不换用"差不多"的摘要
+  （`src/agent-loop.ts`、`src/compaction.ts`）。
 - 崩溃恢复：事件日志 + 原子 checkpoint + lease fencing；in-flight 工具只对账不重跑，
   副作用总计只发生一次；恢复不重置预算（`src/run-store.ts`、`src/recovery.ts`）。
+- Loop 按边界把事件 flush 进 `RunStore` 并在每个安全边界写检查点；store 写入失败（含 lease 被抢占）
+  一律安全停止为 `interrupted`，不再写 store、也不让进程崩溃（`src/agent-loop.ts`）。
 
 ## 已知的降级处理
 
-- **Loop 与持久化没有逐事件接线**。`RunStore` 提供了 append-only 事件日志、原子 checkpoint 与
-  lease fencing，并且 `resumeAgentRun` 会在恢复结束时写入 checkpoint；但运行中的 `runAgentLoop`
-  没有把每一轮事件实时写进 store（教程把它留作"按边界 flush"的部署选择）。
-  `tests/recovery.test.ts` 用手写 fixture 覆盖崩溃点，而不是驱动完整 Loop 崩溃。
+- **事件日志是"按边界 flush"，不是逐条同步落盘**。Loop 在每个安全边界（初始计划之后、每个工具批次之后、
+  压缩之后、每次停止之前）写检查点，并按边界把 durable 事件 append 进 store；`step_started`、
+  `tool_batch_started` 这类只属于运行时的事件留在内存日志（检查点里），不写进 store 的
+  `DurableEvent` 联合。因此崩溃最多丢失"最后一个边界之后"的进度，重放从该检查点接续。
 - **进程隔离未实现**。`PolicyContext.network` 只是策略输入，不会真的给子进程禁网；
   教程明确要求执行不可信仓库代码时必须依赖容器或 OS sandbox，fixture 不做这件事。
 - **`providerCursor` 兼容性检查是可选钩子**。`ModelDriver.canResume` 存在时会用它；

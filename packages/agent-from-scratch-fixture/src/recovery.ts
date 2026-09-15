@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentLoopEvent, AgentLoopOptions } from "./agent-loop.js";
-import { runAgentLoopFromState } from "./agent-loop.js";
-import type { ContextSource } from "./context.js";
+import type { AgentLoopEvent, AgentLoopOptions, LoopCompactionOptions } from "./agent-loop.js";
+import { isPersistenceFailure, runAgentLoopFromState } from "./agent-loop.js";
 import { waitForUserInput } from "./interaction.js";
 import type { FunctionCallOutput, ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
@@ -10,6 +9,7 @@ import type { ApprovalLedger, PolicyContext } from "./policy.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { WriteLease } from "./tool.js";
 import type { TraceSink } from "./trace.js";
+import { fromDurableState, toDurableState } from "./durable-state.js";
 import type {
   AgentResult,
   AgentState,
@@ -65,104 +65,14 @@ export interface AgentRuntime {
   approvals?: ApprovalLedger | undefined;
   writeLease?: WriteLease | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
+  /** 续跑时的压缩接线；与首次运行使用同一份配置。 */
+  compaction?: LoopCompactionOptions | undefined;
   verifiers?: Record<string, ToolStateVerifier> | undefined;
   signal?: AbortSignal | undefined;
   onEvent?: ((event: AgentLoopEvent) => void) | undefined;
 }
 
-export function toDurableState(
-  state: AgentState,
-  providerCursor?: ProviderCursor | undefined,
-): DurableAgentState {
-  if (!state.plan) throw new Error("cannot persist a run without a plan");
-
-  const durable: DurableAgentState = {
-    runId: state.runId,
-    task: state.task,
-    cwd: state.cwd,
-    status: state.status,
-    plan: state.plan,
-    planHistory: state.planHistory,
-    messages: state.messages,
-    contextSources: state.contextSources.map((source) => ({
-      id: source.id,
-      kind: source.kind,
-      label: source.label,
-      content: source.content,
-      priority: source.priority,
-    })),
-    skills: state.skills,
-    compaction: state.compaction,
-    changedFiles: state.changedFiles,
-    changedFileHashes: state.changedFileHashes,
-    mutationRevision: state.mutationRevision,
-    validations: state.validations,
-    requiredCriterionIds: state.requiredCriterionIds,
-    budget: state.budget,
-    goalVersion: state.goalVersion,
-    constraints: state.constraints,
-    failedAttempts: state.failedAttempts,
-    events: state.events,
-    nextEventSequence: state.nextEventSequence,
-    stopReason: state.stopReason,
-  };
-  if (state.activeStepId !== undefined) durable.activeStepId = state.activeStepId;
-  if (state.pendingUserInput !== undefined) durable.pendingUserInput = state.pendingUserInput;
-  if (providerCursor !== undefined) durable.providerCursor = providerCursor;
-  return durable;
-}
-
-const CONTEXT_KINDS = [
-  "workspace_rule",
-  "file_excerpt",
-  "tool_observation",
-  "conversation_summary",
-  "task_plan",
-  "user_input",
-  "skill_catalog",
-  "skill_instructions",
-  "skill_resource",
-  "compaction_snapshot",
-  "harness_feedback",
-] as const satisfies readonly ContextSource["kind"][];
-
-export function isContextKind(value: unknown): value is ContextSource["kind"] {
-  return typeof value === "string" && (CONTEXT_KINDS as readonly string[]).includes(value);
-}
-
-export function fromDurableState(durable: DurableAgentState): AgentState {
-  const contextSources: ContextSource[] = durable.contextSources.flatMap((source) =>
-    isContextKind(source.kind) ? [{ ...source, kind: source.kind }] : [],
-  );
-
-  return {
-    runId: durable.runId,
-    task: durable.task,
-    cwd: durable.cwd,
-    status: durable.status,
-    messages: durable.messages,
-    contextSources,
-    steps: [],
-    changedFiles: durable.changedFiles,
-    changedFileHashes: durable.changedFileHashes,
-    mutationRevision: durable.mutationRevision,
-    validations: durable.validations,
-    requiredCriterionIds: durable.requiredCriterionIds,
-    failedAttempts: durable.failedAttempts,
-    budget: durable.budget,
-    events: durable.events,
-    nextEventSequence: durable.nextEventSequence,
-    stopReason: durable.stopReason,
-    plan: durable.plan,
-    activeStepId: durable.activeStepId,
-    planHistory: durable.planHistory,
-    pendingUserInput: durable.pendingUserInput,
-    goalVersion: durable.goalVersion,
-    constraints: durable.constraints,
-    skills: durable.skills,
-    compaction: durable.compaction,
-  };
-}
+export { CONTEXT_KINDS, fromDurableState, isContextKind, toDurableState } from "./durable-state.js";
 
 function statusForStopReason(reason: StopReason): AgentState["status"] {
   if (reason === "cancelled") return "cancelled";
@@ -182,14 +92,19 @@ export function reduceDurableEvent(
     case "plan_updated":
       return { ...state, plan: event.plan };
     case "model_completed":
-      return event.turn.finalText.trim().length === 0
-        ? state
-        : {
-            ...state,
-            messages: [...state.messages, { role: "assistant", content: event.turn.finalText }],
-          };
+      // 已消费预算必须随事件一起恢复，否则续跑会白拿一轮模型额度。
+      return {
+        ...(event.turn.finalText.trim().length === 0
+          ? state
+          : {
+              ...state,
+              messages: [...state.messages, { role: "assistant", content: event.turn.finalText }],
+            }),
+        budget: { ...state.budget, modelSteps: state.budget.modelSteps + 1 },
+      };
     case "tool_intent":
-      return state;
+      // tool_intent 就是这次调用被 Harness 准入的时刻，预算在此时计入。
+      return { ...state, budget: { ...state.budget, toolCalls: state.budget.toolCalls + 1 } };
     case "tool_result":
       return {
         ...state,
@@ -348,9 +263,12 @@ export async function reconcileInFlightTool(
       ? verified.output
       : JSON.stringify({ ok: false, error: "tool_not_applied", callId: call.callId });
 
+  // store 的 `expectedSequence` 必须来自 store 自己：内存日志里还有
+  // `step_started` / `tool_batch_started` 这类只属于运行时的条目，两者序号并不共用。
+  const persisted = await runtime.store.readEvents(state.runId, 0);
   await runtime.store.append({
     runId: state.runId,
-    expectedSequence: state.nextEventSequence,
+    expectedSequence: (persisted.at(-1)?.sequence ?? 0) + 1,
     ownerId: lease.ownerId,
     epoch: lease.epoch,
     event: { type: "tool_result", callId: call.callId, idempotencyKey, output },
@@ -386,7 +304,15 @@ function manualReconciliationRequest(
   };
 }
 
-export function loopOptionsFromRuntime(state: AgentState, runtime: AgentRuntime): AgentLoopOptions {
+/**
+ * 续跑时把 lease 一并注入：Loop 会在安全边界继续 flush 事件与写检查点，
+ * 写入仍然受同一把 owner/epoch 围栏保护。
+ */
+export function loopOptionsFromRuntime(
+  state: AgentState,
+  runtime: AgentRuntime,
+  lease?: RunLease | undefined,
+): AgentLoopOptions {
   return {
     cwd: state.cwd,
     skillsDirectory: runtime.skillsDirectory,
@@ -404,6 +330,8 @@ export function loopOptionsFromRuntime(state: AgentState, runtime: AgentRuntime)
     clock: runtime.clock,
     signal: runtime.signal,
     onEvent: runtime.onEvent,
+    compaction: runtime.compaction,
+    persistence: lease ? { store: runtime.store, lease } : undefined,
   };
 }
 
@@ -450,20 +378,30 @@ export async function resumeAgentRun(runId: string, runtime: AgentRuntime): Prom
 
   const previousResponseId = canReuse ? cursor?.previousResponseId : undefined;
 
-  const result = await runAgentLoopFromState(state, loopOptionsFromRuntime(state, runtime), {
-    previousResponseId,
-    outputs,
-  });
-
-  const persisted = await runtime.store.readEvents(result.state.runId, 0);
-  await runtime.store.saveCheckpoint(
-    createRunCheckpoint({
-      state: toDurableState(result.state, canReuse ? cursor : undefined),
-      throughSequence: persisted.at(-1)?.sequence ?? 0,
-      now: runtime.clock.now(),
-    }),
-    restored.lease,
+  const result = await runAgentLoopFromState(
+    state,
+    loopOptionsFromRuntime(state, runtime, restored.lease),
+    {
+      previousResponseId,
+      outputs,
+    },
   );
+
+  // Loop 已经在每个停止边界写过检查点；这里只补一版 providerCursor 投影。
+  // 围栏被拒时不能再写 store，也不该让恢复入口抛出非恢复错误。
+  const persisted = await runtime.store.readEvents(result.state.runId, 0);
+  try {
+    await runtime.store.saveCheckpoint(
+      createRunCheckpoint({
+        state: toDurableState(result.state, canReuse ? cursor : undefined),
+        throughSequence: persisted.at(-1)?.sequence ?? 0,
+        now: runtime.clock.now(),
+      }),
+      restored.lease,
+    );
+  } catch (error) {
+    if (!isPersistenceFailure(error)) throw error;
+  }
 
   return result;
 }

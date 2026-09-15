@@ -25,6 +25,14 @@ export interface CompactorInput {
   events: AgentEvent[];
   activeSkillNames: string[];
   changedFiles: string[];
+  /**
+   * 下面四项来自"当前状态投影"而不是事件区间。`validateCompaction` 会逐项对照权威状态，
+   * 因此压缩器必须能看到它们；否则任何存在验证证据、失败尝试或未决问题的运行都无法压缩。
+   */
+  constraints: string[];
+  failedAttempts: string[];
+  validationResults: ValidationRecord[];
+  unresolvedQuestions: string[];
 }
 
 export interface Compactor {
@@ -80,6 +88,12 @@ export async function buildCompactionSnapshot(options: {
     events: options.events.filter((event) => event.sequence >= from && event.sequence <= to),
     activeSkillNames: Object.keys(options.state.skills.activeSkills),
     changedFiles: options.state.changedFiles,
+    constraints: options.state.constraints,
+    failedAttempts: options.state.failedAttempts,
+    validationResults: options.state.validations,
+    unresolvedQuestions: options.state.pendingUserInput
+      ? [options.state.pendingUserInput.question]
+      : [],
   });
 
   const withoutChecksum = {
@@ -182,6 +196,9 @@ export function selectRawTailBoundary(
   const lastN = events.at(-rawTailSize)?.sequence ?? snapshot.sourceEventRange.from;
   const candidates = [
     lastN,
+    // 不允许 rawTail 从快照末尾之后开始：否则"快照之后、rawTail 之前"的事件
+    // 既不在快照里也不在原文里，等于被静默丢弃。
+    snapshot.sourceEventRange.to,
     events.findLast((event) => event.type === "step_started")?.sequence,
     events.findLast((event) => event.type === "user_input")?.sequence,
     events.findLast((event) => event.type === "tool_batch_started")?.sequence,
