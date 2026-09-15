@@ -7,6 +7,7 @@ import { runAgentLoop, summarizeRun, type AgentLoopEvent } from "./agent-loop.js
 import type { Compactor } from "./compaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
+import { createModelPlanner } from "./planner-model.js";
 import {
   InMemoryApprovalLedger,
   type ApprovalGrant,
@@ -14,7 +15,14 @@ import {
   type ApprovalRequest,
   type PolicyContext,
 } from "./policy.js";
+import {
+  createResponsesModel,
+  type DeepSeekConfig,
+  type ResponsesHttpClient,
+} from "./responses-http.js";
+import { createStatelessResponsesDriver } from "./responses-stateless-driver.js";
 import { LocalFileRunStore, type RunLease, type RunStore } from "./run-store.js";
+import { detectSandbox, type Sandbox } from "./sandbox.js";
 import { InMemoryWriteLease } from "./tool.js";
 import { ToolRegistry } from "./tool-registry.js";
 import { readFileTool } from "./tools/read-file.js";
@@ -56,6 +64,18 @@ export interface RunRealTaskOptions {
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
   toolTimeoutMs?: number | undefined;
+  /**
+   * 进程隔离实现。默认 `detectSandbox()`：darwin → seatbelt，linux → bubblewrap，
+   * 其它平台 → `noSandbox`。平台沙箱不可用时 `run_command` 会**拒绝执行**而不是无隔离运行。
+   * 明确接受无隔离（例如只跑可信仓库自己的测试）时传入 `noSandbox`。
+   */
+  sandbox?: Sandbox | undefined;
+  /**
+   * 显式要求隔离，默认 `false`。无人值守地执行不可信仓库代码时应当打开：
+   * 打开后任何"没有真隔离"的情况（未注入、`noSandbox`、平台沙箱不可用）都会
+   * 让 `run_command` 返回 `sandbox_unavailable`，而不是静默降级。
+   */
+  requireSandbox?: boolean | undefined;
 }
 
 export interface RealTaskOutcome {
@@ -116,6 +136,38 @@ export function createRealTaskRegistry(): ToolRegistry {
   registry.register(applyPatchTool);
   registry.register(runCommandTool);
   return registry;
+}
+
+/** 规划器默认只看最近 12 条 observation：evaluate 只需要判断"当前步骤是否被证明"。 */
+export const REAL_TASK_DEFAULT_PLANNER_MAX_OBSERVATIONS = 12;
+
+/** 真实通路的模型对：多轮循环用 `config.model`，规划用 `config.plannerModel`。 */
+export interface DeepSeekTaskModels {
+  model: ModelDriver;
+  planner: Planner;
+}
+
+/**
+ * 用同一份 `DeepSeekConfig` 装配"循环模型 + 模型版规划器"。
+ *
+ * 两者刻意分离：循环模型要处理长上下文与多轮工具调用；规划器只输出短 JSON，
+ * 且判据是"本轮 observations 是否已证明 completionEvidence"，用独立的规划模型更好调参。
+ * `resolveDeepSeekConfig` 保证 `plannerModel` 缺省回落到 `model`，因此不设
+ * `DEEPSEEK_PLANNER_MODEL` 时行为与单模型完全一致。
+ */
+export function createDeepSeekTaskModels(input: {
+  client: ResponsesHttpClient;
+  config: DeepSeekConfig;
+  maxObservations?: number | undefined;
+}): DeepSeekTaskModels {
+  const maxObservations = input.maxObservations ?? REAL_TASK_DEFAULT_PLANNER_MAX_OBSERVATIONS;
+  return {
+    model: createStatelessResponsesDriver({ client: input.client, modelId: input.config.model }),
+    planner: createModelPlanner(
+      createResponsesModel({ client: input.client, modelId: input.config.plannerModel }),
+      { maxObservations },
+    ),
+  };
 }
 
 /**
@@ -193,6 +245,8 @@ export async function runRealTask(options: RunRealTaskOptions): Promise<RealTask
       policy: buildPolicy(options),
       approvals,
       writeLease: new InMemoryWriteLease(),
+      sandbox: options.sandbox ?? detectSandbox(),
+      requireSandbox: options.requireSandbox ?? false,
       clock,
       signal: options.signal,
       onEvent: options.onEvent,

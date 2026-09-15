@@ -8,6 +8,7 @@ import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
+import type { Sandbox } from "./sandbox.js";
 import {
   fromDurableState,
   loopOptionsFromRuntime,
@@ -22,6 +23,28 @@ import { InMemoryWriteLease, type WriteLease } from "./tool.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import { InMemoryTraceSink, type TraceSink } from "./trace.js";
 import type { AgentResult, Clock, UserInputAnswer, ValidationSpec } from "./types.js";
+
+export {
+  MACOS_SEATBELT_EXECUTABLE,
+  SandboxError,
+  SEATBELT_WRITABLE_DEVICES,
+  buildBubblewrapArgs,
+  buildSeatbeltProfile,
+  detectSandbox,
+  linuxBubblewrapSandbox,
+  macOsSeatbeltSandbox,
+  noSandbox,
+  seatbeltWritableRoots,
+  wrapWithSandbox,
+} from "./sandbox.js";
+export type {
+  Sandbox,
+  SandboxCommand,
+  SandboxErrorCode,
+  SandboxGateOptions,
+  SandboxGuarantee,
+  SandboxPolicy,
+} from "./sandbox.js";
 
 export type CliCommand =
   | { command: "run"; task: string }
@@ -169,6 +192,10 @@ export interface AgentCliOptions {
   policy?: PolicyContext | undefined;
   approvals?: ApprovalLedger | undefined;
   writeLease?: WriteLease | undefined;
+  /** 可选注入的进程沙箱；缺省时 CLI 链路不包装 `run_command`。 */
+  sandbox?: Sandbox | undefined;
+  /** 显式要求隔离：`true` 时没有可用沙箱就拒绝执行。 */
+  requireSandbox?: boolean | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
@@ -187,6 +214,8 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     policy: base.policy,
     approvals: base.approvals,
     writeLease: base.writeLease ?? new InMemoryWriteLease(),
+    sandbox: base.sandbox,
+    requireSandbox: base.requireSandbox,
     validationSpecs: base.validationSpecs,
     signal: input.signal,
     onEvent: input.onEvent,

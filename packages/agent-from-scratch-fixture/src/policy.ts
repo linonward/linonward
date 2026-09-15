@@ -28,6 +28,11 @@ export interface PolicyContext {
   cwd: string;
   realWorkspaceRoot: string;
   allowedArgv: string[][];
+  /**
+   * 只是**声明**，不是隔离：`"disabled"` 会让策略层拒绝产生外部副作用的工具，
+   * 但不会给已经放行的 `run_command` 子进程禁网。真正禁止网络、把写入限制在工作区内，
+   * 必须依赖 `src/sandbox.ts` 的 OS 沙箱或外部容器（见 README"进程隔离"）。
+   */
   network: "disabled" | "enabled";
 }
 

@@ -4,10 +4,21 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { isRecord } from "../src/checkpoint.js";
-import { MAX_OBSERVATION_CHARACTERS, executeToolCall } from "../src/execute-tool.js";
+import {
+  MAX_OBSERVATION_CHARACTERS,
+  executeToolCall,
+  type ToolExecutionResult,
+} from "../src/execute-tool.js";
 import { FakeModel } from "../src/fake-model.js";
 import { runMinimalAgent } from "../src/harness.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
+import { PreApprovingLedger } from "../src/run-task.js";
+import {
+  noSandbox,
+  type Sandbox,
+  type SandboxCommand,
+  type SandboxPolicy,
+} from "../src/sandbox.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { runCommandTool } from "../src/tools/run-command.js";
@@ -565,5 +576,164 @@ describe("permission policy at the executor boundary", () => {
 
     if (result.type !== "observation") throw new Error("expected an observation");
     expect(parse(result.output)["error"]).toBe("network_or_external_effect_not_allowed");
+  });
+});
+
+describe("sandbox gate at the executor boundary", () => {
+  const MARKER = "require('node:fs').writeFileSync('started.txt','yes')";
+  const ORIGINAL = ["-e", "require('node:fs').writeFileSync('started.txt','original')"];
+  const WRAPPED = ["-e", "require('node:fs').writeFileSync('started.txt','wrapped')"];
+
+  /** 用自动批准账本跳过审批门禁，确保被断言的是沙箱门禁本身。 */
+  async function runCommandWith(options: {
+    cwd: string;
+    args: string[];
+    sandbox?: Sandbox | undefined;
+    requireSandbox?: boolean | undefined;
+  }): Promise<ToolExecutionResult> {
+    const approvals = new PreApprovingLedger();
+    approvals.allowPolicyApprovedCommands();
+    const policy: PolicyContext = {
+      cwd: options.cwd,
+      realWorkspaceRoot: options.cwd,
+      allowedArgv: [["node", ...options.args]],
+      network: "disabled",
+    };
+
+    return executeToolCall({
+      call: call("run_command", { command: "node", args: options.args }),
+      registry: createRegistry(runCommandTool),
+      cwd: options.cwd,
+      timeoutMs: 5_000,
+      policy,
+      approvals,
+      runId: "run-sandbox",
+      sandbox: options.sandbox,
+      requireSandbox: options.requireSandbox,
+    });
+  }
+
+  it("returns sandbox_unavailable instead of spawning when a required sandbox is unavailable", async () => {
+    const cwd = await tempDir();
+    let wrapCalls = 0;
+    const sandbox: Sandbox = {
+      id: "unavailable",
+      guarantees: ["network-isolation", "filesystem-write-confinement"],
+      isAvailable: async () => false,
+      wrap: async () => {
+        wrapCalls += 1;
+        return { command: "never", args: [] };
+      },
+    };
+
+    const result = await runCommandWith({
+      cwd,
+      args: ["-e", MARKER],
+      sandbox,
+      requireSandbox: true,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(result.ok).toBe(false);
+    expect(result.errorCode).toBe("sandbox_unavailable");
+    expect(parse(result.output)["error"]).toBe("sandbox_unavailable");
+    // 门禁在 spawn 之前拒绝：包装器没被调用，进程也没有留下任何副作用。
+    expect(wrapCalls).toBe(0);
+    await expect(readFile(join(cwd, "started.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("refuses an injected sandbox that is unavailable even when isolation is not required", async () => {
+    const cwd = await tempDir();
+    const sandbox: Sandbox = {
+      id: "unavailable",
+      guarantees: ["network-isolation", "filesystem-write-confinement"],
+      isAvailable: async () => false,
+      wrap: async () => ({ command: "never", args: [] }),
+    };
+
+    const result = await runCommandWith({
+      cwd,
+      args: ["-e", MARKER],
+      sandbox,
+      requireSandbox: false,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(result.errorCode).toBe("sandbox_unavailable");
+    await expect(readFile(join(cwd, "started.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("refuses when the sandbox cannot guarantee the network isolation the policy declares", async () => {
+    const cwd = await tempDir();
+    let wrapCalls = 0;
+    const sandbox: Sandbox = {
+      id: "filesystem-only",
+      guarantees: ["filesystem-write-confinement"],
+      isAvailable: async () => true,
+      wrap: async () => {
+        wrapCalls += 1;
+        return { command: "never", args: [] };
+      },
+    };
+
+    const result = await runCommandWith({
+      cwd,
+      args: ["-e", MARKER],
+      sandbox,
+      requireSandbox: true,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(result.errorCode).toBe("sandbox_network_isolation_unsupported");
+    expect(wrapCalls).toBe(0);
+    await expect(readFile(join(cwd, "started.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("keeps today's behavior when noSandbox is injected without requireSandbox", async () => {
+    const cwd = await tempDir();
+
+    const result = await runCommandWith({
+      cwd,
+      args: ["-e", MARKER],
+      sandbox: noSandbox,
+      requireSandbox: false,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(result.ok).toBe(true);
+    expect(data(result.output)["exitCode"]).toBe(0);
+    expect(await readFile(join(cwd, "started.txt"), "utf8")).toBe("yes");
+  });
+
+  it("spawns the argv produced by an available sandbox and forwards the workspace policy", async () => {
+    const cwd = await tempDir();
+    const seen: { input: SandboxCommand; policy: SandboxPolicy }[] = [];
+    const sandbox: Sandbox = {
+      id: "recording",
+      guarantees: ["network-isolation", "filesystem-write-confinement"],
+      isAvailable: async () => true,
+      async wrap(input, policy) {
+        seen.push({ input, policy });
+        return { command: "node", args: [...WRAPPED] };
+      },
+    };
+
+    const result = await runCommandWith({
+      cwd,
+      args: [...ORIGINAL],
+      sandbox,
+      requireSandbox: true,
+    });
+
+    if (result.type !== "observation") throw new Error("expected an observation");
+    expect(result.ok).toBe(true);
+    expect(seen).toEqual([
+      {
+        input: { command: "node", args: [...ORIGINAL], cwd },
+        policy: { network: "disabled", writableRoot: cwd },
+      },
+    ]);
+    // 落盘的是包装后的 argv，而不是原始 argv。
+    expect(await readFile(join(cwd, "started.txt"), "utf8")).toBe("wrapped");
   });
 });

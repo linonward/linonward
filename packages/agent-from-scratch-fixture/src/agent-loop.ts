@@ -32,6 +32,7 @@ import {
 } from "./plan.js";
 import type { Planner } from "./planner.js";
 import { InMemoryApprovalLedger, type ApprovalLedger, type PolicyContext } from "./policy.js";
+import type { Sandbox } from "./sandbox.js";
 import {
   createRunCheckpoint,
   type DurableEvent,
@@ -99,6 +100,10 @@ export interface AgentLoopOptions {
   policy?: PolicyContext | undefined;
   approvals?: ApprovalLedger | undefined;
   writeLease?: WriteLease | undefined;
+  /** 可选注入的进程沙箱，透传给 `executeToolCall`。 */
+  sandbox?: Sandbox | undefined;
+  /** 调用方显式要求隔离；`true` 时 `run_command` 宁可拒绝也不无隔离执行。 */
+  requireSandbox?: boolean | undefined;
   clock?: Clock | undefined;
   signal?: AbortSignal | undefined;
   /** 只在新建运行时有意义：持久化调用方要先知道 runId 才能取到 lease。 */
@@ -615,7 +620,11 @@ export async function runAgentLoopFromState(
 
     if (activeStep) {
       try {
-        const progress = await options.planner.evaluate({ step: activeStep, observations });
+        const progress = await options.planner.evaluate({
+          step: activeStep,
+          observations,
+          acceptanceCriteria: state.plan.acceptanceCriteria,
+        });
         assertEvidenceComesFromObservations(progress.evidence, observations);
         let plan = applyCriterionEvidence(state.plan, progress.passedCriteria, observations);
         if (progress.completed) {
@@ -910,6 +919,8 @@ export async function runAgentLoopFromState(
         runId: state.runId,
         writeLease: context.writeLease,
         skills: state.skills,
+        sandbox: options.sandbox,
+        requireSandbox: options.requireSandbox,
         signal: options.signal,
         now: context.now(),
         emit: (event) => {
@@ -953,7 +964,11 @@ export async function runAgentLoopFromState(
 
     let progress: Awaited<ReturnType<Planner["evaluate"]>>;
     try {
-      progress = await options.planner.evaluate({ step: activeStep, observations });
+      progress = await options.planner.evaluate({
+        step: activeStep,
+        observations,
+        acceptanceCriteria: plan.acceptanceCriteria,
+      });
       assertEvidenceComesFromObservations(progress.evidence, observations);
       if (progress.completed && progress.evidence.join("").trim().length === 0) {
         return finishStop(state, "invalid_model_output", context);

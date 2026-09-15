@@ -1,3 +1,4 @@
+import { extractJsonObject } from "./json-object.js";
 import type { Model } from "./model.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 import type { ReplanReason } from "./plan.js";
@@ -17,6 +18,11 @@ export interface PlanEvaluation {
   evidence: string[];
   passedCriteria: string[];
   replanReason?: ReplanReason | undefined;
+  /**
+   * 规划器把不可用的模型输出**降级**（而不是静默通过）时附上的可读原因。
+   * Loop 不消费它；它存在的意义是让"completed=true 但证据为空"这类降级可被观察与断言。
+   */
+  notes?: string[] | undefined;
 }
 
 /** Planner 是模型边界，只返回结构化候选；持久化与校验属于应用代码。 */
@@ -27,7 +33,15 @@ export interface Planner {
     reason: ReplanReason;
     observations: string[];
   }): Promise<PlanDraft>;
-  evaluate(input: { step: PlanStep; observations: string[] }): Promise<PlanEvaluation>;
+  evaluate(input: {
+    step: PlanStep;
+    observations: string[];
+    /**
+     * 当前计划的验收条件。模型必须看到它们才能只引用真实存在的 criterion id，
+     * 否则 `applyCriterionEvidence` 会因为计划外 id 直接抛错。旧调用方可以省略。
+     */
+    acceptanceCriteria?: readonly AcceptanceCriterion[] | undefined;
+  }): Promise<PlanEvaluation>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -137,14 +151,17 @@ export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
           '"steps":[{"id":"...","title":"...","dependsOn":[],',
           '"completionEvidence":"..."}]}',
           "Every step must be possible with the declared tools.",
-          "Every completionEvidence must describe observable evidence.",
+          "Every completionEvidence must describe observable evidence (a tool observation).",
+          "Prefer the fewest steps and the fewest acceptance criteria that still prove the goal.",
+          "A read-only question usually needs a single step and a single acceptance criterion.",
+          "Do not add extra verification steps that the declared tools cannot produce evidence for.",
         ].join("\n"),
         input: [{ role: "user", content: JSON.stringify(input) }],
       });
 
       let candidate: unknown;
       try {
-        candidate = JSON.parse(raw);
+        candidate = extractJsonObject(raw);
       } catch {
         throw new Error("planner returned invalid JSON");
       }

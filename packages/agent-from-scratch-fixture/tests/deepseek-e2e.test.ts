@@ -8,7 +8,7 @@ import type { ModelDriver } from "../src/model.js";
 import type { PlanDraft, PlanEvaluation, Planner } from "../src/planner.js";
 import { createStatelessResponsesDriver } from "../src/responses-stateless-driver.js";
 import { createResponsesHttpClient, resolveDeepSeekConfig } from "../src/responses-http.js";
-import { runRealTask, type RunRealTaskOptions } from "../src/run-task.js";
+import { createDeepSeekTaskModels, runRealTask, type RunRealTaskOptions } from "../src/run-task.js";
 import { InMemoryTraceSink } from "../src/trace.js";
 import type { ValidationSpec } from "../src/types.js";
 import { CompletingPlanner, makeDraft, makeTempDir, removeTempDir } from "./support.js";
@@ -260,6 +260,66 @@ describe.skipIf(!enabled)("DeepSeek Responses API end-to-end", () => {
           validatedOnCurrentRevision,
         }),
       );
+    },
+    E2E_TIMEOUT_MS,
+  );
+
+  /**
+   * 与前两条的对照点：这里**没有确定性规划器**，`create` / `evaluate`（必要时还有 `revise`）
+   * 全部由真实模型完成。它验证的是"模型版规划器能否在一个简单只读任务上收敛到
+   * `final_answer`"，而不是 Harness 的完成门禁。
+   *
+   * 循环模型与规划模型来自同一份 `DeepSeekConfig`：循环用 `DEEPSEEK_MODEL`，
+   * 规划用 `DEEPSEEK_PLANNER_MODEL`（缺省回落到循环模型）。
+   */
+  it(
+    "task 3 (read only, model planner): converges with the real planner model",
+    async () => {
+      const config = resolveDeepSeekConfig();
+      const workspace = await makeTempDir("deepseek-e2e-repo-");
+      const storeRoot = await makeTempDir("deepseek-e2e-store-");
+      tempDirs.push(workspace, storeRoot);
+      await writeFixture(workspace);
+
+      const client = createResponsesHttpClient({
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+        timeoutMs: 120_000,
+      });
+      const { model, planner } = createDeepSeekTaskModels({ client, config });
+
+      const events: string[] = [];
+      const outcome = await run({
+        cwd: workspace,
+        storeRoot,
+        task:
+          "读取 package.json，告诉我这个项目用哪个包管理器，并列出 scripts 里的命令。" +
+          "这是一个只读任务：不要修改任何文件。",
+        model,
+        planner,
+        allowedArgv: [],
+        onEvent: (event) => events.push(event.type),
+      });
+
+      console.log(
+        "[e2e task 3] models",
+        JSON.stringify({ loop: config.model, planner: config.plannerModel }),
+      );
+      console.log("[e2e task 3] summary", JSON.stringify(outcome.summary));
+      console.log("[e2e task 3] events", JSON.stringify(events));
+      console.log("[e2e task 3] answer", outcome.result.answer);
+
+      expect(outcome.result.stopReason).toBe("final_answer");
+      expect(outcome.result.answer).toContain("pnpm");
+
+      const observed = outcome.result.state.contextSources.filter(
+        (source) => source.kind === "tool_observation",
+      );
+      expect(observed.length).toBeGreaterThan(0);
+      expect(observed.map((source) => source.label).join(" ")).toMatch(/read_file|search_text/);
+      expect(observed.some((source) => source.content.includes("pnpm"))).toBe(true);
+      expect(events).toContain("run_started");
+      expect(events).toContain("run_stopped");
     },
     E2E_TIMEOUT_MS,
   );

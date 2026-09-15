@@ -9,6 +9,7 @@ import {
   type ApprovalLedger,
   type PolicyContext,
 } from "./policy.js";
+import { SandboxError, type Sandbox } from "./sandbox.js";
 import { InMemoryWriteLease, type ToolEffect, type WriteLease } from "./tool.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { AgentEventInput, SkillState } from "./types.js";
@@ -28,6 +29,8 @@ export const KNOWN_TOOL_ERRORS: ReadonlySet<string> = new Set([
   "resource_type_not_loadable",
   "binary_resource_denied",
   "skill_resource_too_large",
+  "sandbox_unavailable",
+  "sandbox_network_isolation_unsupported",
 ]);
 
 export const DENIED_TOOL_ERRORS: ReadonlySet<string> = new Set([
@@ -62,6 +65,10 @@ export interface ExecuteToolCallOptions {
   writeLease?: WriteLease | undefined;
   skills?: SkillState | undefined;
   maxSkillBytes?: number | undefined;
+  /** 可选注入的进程沙箱；透传给工具（目前只有 `run_command` 使用）。 */
+  sandbox?: Sandbox | undefined;
+  /** 调用方显式要求隔离；`true` 时"没有真隔离"一律拒绝执行。 */
+  requireSandbox?: boolean | undefined;
   signal?: AbortSignal | undefined;
   now?: Date | undefined;
   emit?: ((event: AgentEventInput) => void) | undefined;
@@ -213,6 +220,9 @@ export async function executeToolCall(
       skills: options.skills ?? emptySkills(),
       maxSkillBytes: options.maxSkillBytes ?? 64_000,
       emit: options.emit ?? ((): void => undefined),
+      sandbox: options.sandbox,
+      requireSandbox: options.requireSandbox,
+      sandboxPolicy: { network: policy.network, writableRoot: policy.realWorkspaceRoot },
     });
     return observationFromValue(
       options.call.callId,
@@ -226,9 +236,11 @@ export async function executeToolCall(
         ? "timeout"
         : error instanceof ZodError
           ? "invalid_arguments"
-          : KNOWN_TOOL_ERRORS.has(message)
-            ? message
-            : "tool_error";
+          : error instanceof SandboxError
+            ? error.code
+            : KNOWN_TOOL_ERRORS.has(message)
+              ? message
+              : "tool_error";
     return failure(options.call.callId, code, message, tool.effect);
   } finally {
     clearTimeout(timer);
