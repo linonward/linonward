@@ -50,6 +50,11 @@ export interface JournalModelResponse {
   phase: "start" | "continue";
   responseId: string;
   finalText: string;
+  /**
+   * 可见推理（思维链）。缺失即模型没返回 reasoning——不写空数组冒充。
+   * **只用于观测**：它不会进入任何 prompt / 上下文。
+   */
+  reasoning?: readonly string[] | undefined;
   toolCalls: readonly { callId: string; name: string; argumentsJson: string }[];
   durationMs: number;
 }
@@ -365,6 +370,10 @@ export function createJournal(options: JournalOptions): Journal {
           argumentsJson: clip(call.argumentsJson),
         })),
       };
+      // 思维链与 finalText 分开存放，并逐块遵守同一条截断规则。
+      if (entry.reasoning !== undefined) {
+        record["reasoning"] = entry.reasoning.map((block) => clip(block));
+      }
 
       writeRecord(record);
       writeLine(
@@ -377,6 +386,11 @@ export function createJournal(options: JournalOptions): Journal {
         ].join(" "),
       );
       writeLine(`[model] finalText: ${clip(entry.finalText)}`);
+      if (entry.reasoning !== undefined) {
+        entry.reasoning.forEach((block, index) => {
+          writeLine(`[model] reasoning[${index}]: ${clip(block)}`);
+        });
+      }
       for (const call of entry.toolCalls) {
         writeLine(
           `[model] toolCall callId=${call.callId} name=${call.name} argumentsJson=${clip(call.argumentsJson)}`,
@@ -605,6 +619,7 @@ export function createJournalModelDriver(
         phase: "start",
         responseId: turn.responseId,
         finalText: turn.finalText,
+        reasoning: turn.reasoning,
         toolCalls: turn.toolCalls,
         durationMs,
       });
@@ -636,6 +651,7 @@ export function createJournalModelDriver(
         phase: "continue",
         responseId: turn.responseId,
         finalText: turn.finalText,
+        reasoning: turn.reasoning,
         toolCalls: turn.toolCalls,
         durationMs,
       });

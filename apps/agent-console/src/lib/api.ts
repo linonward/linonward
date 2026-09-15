@@ -1,0 +1,124 @@
+/**
+ * 浏览器侧的 API 客户端。
+ *
+ * 只发相对路径（`/api/...`），开发时由 Vite 代理到本地 API 服务；生产构建下由
+ * 使用者自行把静态文件与 API 放在同一个源上。**任何密钥都不经过浏览器**：表单里
+ * 没有密钥字段，响应里也不会有。
+ */
+
+import { isPlainObject, type JournalRecord, parseJournalRecord } from "./journal.js";
+
+export interface RunFormValues {
+  task: string;
+  cwd: string;
+  allowedArgv: string[][];
+  maxSteps: number;
+  maxToolCalls: number;
+  approveAllowed: boolean;
+  requireSandbox: boolean;
+  repeatGuard: boolean;
+  plannerModel: string;
+}
+
+export interface StreamHandlers {
+  /** `seq` 是该记录在服务端频道里的序号，用作重连时的 `after`。 */
+  onRecord(record: JournalRecord, seq: number): void;
+  onDone(): void;
+  onError(message: string): void;
+}
+
+async function errorMessage(response: Response): Promise<string> {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = undefined;
+  }
+  if (typeof body === "object" && body !== null) {
+    const message = (body as Record<string, unknown>)["error"];
+    if (typeof message === "string" && message.length > 0) return message;
+  }
+  return `请求失败：HTTP ${response.status}`;
+}
+
+async function postJson(path: string, payload: unknown): Promise<JournalRecord> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const body: unknown = await response.json();
+  if (!isPlainObject(body)) throw new Error("服务端返回了非对象 JSON");
+  return body;
+}
+
+export async function startRun(values: RunFormValues): Promise<{ runId: string }> {
+  const body = await postJson("/api/run", {
+    task: values.task,
+    cwd: values.cwd,
+    allowedArgv: values.allowedArgv,
+    maxSteps: values.maxSteps,
+    maxToolCalls: values.maxToolCalls,
+    approveAllowed: values.approveAllowed,
+    requireSandbox: values.requireSandbox,
+    repeatGuard: values.repeatGuard,
+    plannerModel: values.plannerModel.trim().length === 0 ? undefined : values.plannerModel.trim(),
+  });
+  const runId = body["runId"];
+  if (typeof runId !== "string" || runId.length === 0) {
+    throw new Error("服务端没有返回 runId");
+  }
+  return { runId };
+}
+
+export async function sendAnswer(runId: string, requestId: string, text: string): Promise<void> {
+  await postJson(`/api/runs/${encodeURIComponent(runId)}/answer`, { requestId, text });
+}
+
+export async function fetchSnapshot(runId: string): Promise<JournalRecord | undefined> {
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const body: unknown = await response.json();
+  return isPlainObject(body) ? body : undefined;
+}
+
+/**
+ * 订阅一次运行的 journal 流。
+ *
+ * `after` 是已经收到的记录条数：服务端按序补发后续记录，重连（例如审批后继续运行）
+ * 因此不会重复渲染历史。返回的函数用于主动断开。
+ */
+export function openRunStream(runId: string, after: number, handlers: StreamHandlers): () => void {
+  const source = new EventSource(
+    `/api/runs/${encodeURIComponent(runId)}/stream?after=${Math.max(0, after)}`,
+  );
+  let closed = false;
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    source.close();
+  };
+
+  source.addEventListener("journal", (event) => {
+    if (!(event instanceof MessageEvent)) return;
+    const record = parseJournalRecord(event.data);
+    const seq = Number.parseInt(event.lastEventId, 10);
+    if (record !== undefined) handlers.onRecord(record, Number.isFinite(seq) ? seq : 0);
+  });
+
+  source.addEventListener("done", () => {
+    close();
+    handlers.onDone();
+  });
+
+  source.addEventListener("error", () => {
+    if (closed) return;
+    close();
+    handlers.onError("实时流已断开：请确认本地 API 服务仍在运行");
+  });
+
+  return close;
+}

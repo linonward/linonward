@@ -45,6 +45,14 @@ export interface ModelTurn {
   responseId: string;
   finalText: string;
   toolCalls: ToolCall[];
+  /**
+   * 可见推理（思维链）：每个 `reasoning` 输出 item 产出一个数组元素，元素内部是该
+   * item 的 `content[].reasoning_text` 按出现顺序的拼接。**与 `finalText` 严格分离**：
+   * 推理文本不参与上下文、也不会被当成最终答案。
+   *
+   * 模型没有返回 reasoning item 时保持 `undefined`——缺失就是缺失，不用空数组冒充。
+   */
+  reasoning?: string[] | undefined;
   /** 交互章扩展：模型请求澄清时，Harness 必须先落盘再停止。 */
   userInputRequest?: UserInputRequest | undefined;
   /**
@@ -73,6 +81,19 @@ export interface ModelDriver {
 }
 
 /**
+ * 一条输出 item 的内容分片。
+ *
+ * `message` item 的正文放在 `text`（配合 `type: "output_text"`），`reasoning` item 的
+ * 可见推理放在 `reasoning_text`。两个字段名刻意不同：聚合 `output_text` 时只认前者，
+ * 思维链因此不会混进 `finalText`。
+ */
+export interface ModelResponseContentPart {
+  type?: string | undefined;
+  text?: string | undefined;
+  reasoning_text?: string | undefined;
+}
+
+/**
  * Responses API 的最小结构类型。
  *
  * 真实项目里由 `openai` SDK 满足这个形状；教程 fixture 刻意不引入厂商 SDK，
@@ -86,6 +107,8 @@ export interface ResponsesResultLike {
     call_id?: string;
     name?: string;
     arguments?: string;
+    /** 只有 `message` / `reasoning` item 带内容分片；其它 item 缺失该字段。 */
+    content?: readonly ModelResponseContentPart[] | undefined;
   }>;
 }
 
@@ -163,6 +186,35 @@ export const userInputRequestSchema = z
 /** 保留的澄清调用名。它不会走普通工具权限，也不会在等待前产生副作用。 */
 export const REQUEST_USER_INPUT_TOOL_NAME = "request_user_input";
 
+/**
+ * 从归一化响应的 `reasoning` items 里聚合可见推理。
+ *
+ * 每个 `reasoning` item 产出一个数组元素（该 item 所有 `reasoning_text` 分片按顺序拼接）；
+ * 没有 reasoning item、或全部为空文本时返回 `undefined`。**缺失就是缺失**：
+ * 不返回 `[]`，因为"模型没给推理"和"模型给了空推理"在观测上是同一件事，
+ * 上层只需要一个 `undefined` 就能区分"没有"与"有内容"。
+ */
+export function collectReasoning(
+  output: readonly ResponsesResultLike["output"][number][],
+): string[] | undefined {
+  const blocks: string[] = [];
+
+  for (const item of output) {
+    if (item.type !== "reasoning") continue;
+    const content = item.content;
+    if (!Array.isArray(content)) continue;
+
+    const text = content
+      .map((part) =>
+        isRecord(part) && typeof part["reasoning_text"] === "string" ? part["reasoning_text"] : "",
+      )
+      .join("");
+    if (text.length > 0) blocks.push(text);
+  }
+
+  return blocks.length === 0 ? undefined : blocks;
+}
+
 export function toModelTurn(response: NormalizedModelResponse, now = new Date()): ModelTurn {
   const toolCalls: ToolCall[] = [];
   let userInputRequest: UserInputRequest | undefined;
@@ -201,6 +253,9 @@ export function toModelTurn(response: NormalizedModelResponse, now = new Date())
     toolCalls,
   };
   if (userInputRequest !== undefined) turn.userInputRequest = userInputRequest;
+  // 思维链与 finalText 严格分离，且只在真的拿到非空推理时才写这个字段。
+  const reasoning = collectReasoning(response.output);
+  if (reasoning !== undefined) turn.reasoning = reasoning;
   // 缺失就是缺失：`usage` 不存在时不写这个字段，上层据此记 `unknown`。
   if (response.usage !== undefined) turn.usage = response.usage;
   return turn;

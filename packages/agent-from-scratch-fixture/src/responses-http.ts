@@ -1,4 +1,10 @@
-import type { Model, ModelUsage, NormalizedModelResponse, ResponsesClientLike } from "./model.js";
+import type {
+  Model,
+  ModelResponseContentPart,
+  ModelUsage,
+  NormalizedModelResponse,
+  ResponsesClientLike,
+} from "./model.js";
 import { parseModelUsage } from "./model.js";
 
 /**
@@ -60,10 +66,11 @@ export interface ResponseOutputItem {
   content?: readonly ResponseContentPart[];
 }
 
-export interface ResponseContentPart {
-  type?: string;
-  text?: string;
-}
+/**
+ * `message` item 的 `output_text` 与 `reasoning` item 的 `reasoning_text` 共用这个分片形状。
+ * 直接复用 `model.ts` 的定义，避免归一化层与 `toModelTurn` 对同一份 provider 形状各写一遍。
+ */
+export type ResponseContentPart = ModelResponseContentPart;
 
 /**
  * 归一化结果：`id` 保留、`output` 原样映射、`output_text` 从 message 块聚合、
