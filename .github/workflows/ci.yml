@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Ensure ripgrep is available for the agent fixture
+        run: command -v rg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep)
+
       - name: Show tool versions
         run: |
           node --version

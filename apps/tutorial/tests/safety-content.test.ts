@@ -1,55 +1,61 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-function lesson(name: string): string {
-  return readFileSync(
-    fileURLToPath(new URL(`../src/content/${name}.mdx`, import.meta.url)),
-    "utf8",
-  );
+import { checkpoint, codeText, lessonSource, listProp } from "./support/lesson-source";
+
+function code(name: string): string {
+  return codeText(lessonSource(name));
 }
 
 describe("safe repository agent lessons", () => {
   it("contains symlinks and option-like search input inside the workspace", () => {
-    const source = lesson("understand-repository");
+    const source = code("understand-repository");
 
     expect(source).toContain("realpath");
     expect(source).toMatch(/"--",\s+input\.query/);
-    expect(source).toContain('"!.git/**"');
-    expect(source).toContain('"!dist/**"');
-    expect(source).toContain('"!build/**"');
+    for (const excluded of ['"!.git/**"', '"!dist/**"', '"!build/**"']) {
+      expect(source, `search_text should exclude ${excluded}`).toContain(excluded);
+    }
   });
 
   it("teaches atomic hash-guarded patches instead of whole-file replacement", () => {
-    const source = lesson("edit-code");
+    const source = code("edit-code");
 
     expect(source).toContain('name: "apply_patch"');
     expect(source).toContain("expectedSha256");
     expect(source).toContain('flag: "wx"');
-    expect(source).toContain("create");
-    expect(source).toContain("delete");
+    expect(source).toContain('z.literal("create")');
+    expect(source).toContain('z.literal("delete")');
     expect(source).not.toContain('name: "write_file"');
   });
 
   it("binds completion evidence to the current mutation revision and criteria", () => {
-    const source = lesson("run-validation");
+    const source = code("run-validation");
+    const lesson = lessonSource("run-validation");
 
-    expect(source).toContain("mutationRevision");
-    expect(source).toContain("validatedRevision");
-    expect(source).toContain("changedFileHashes");
-    expect(source).toContain("criterionIds");
-    expect(source).toContain("requiredValidationCriteria");
+    for (const marker of [
+      "mutationRevision",
+      "validatedRevision",
+      "changedFileHashes",
+      "criterionIds",
+    ]) {
+      expect(source, `validation evidence should keep ${marker}`).toContain(marker);
+    }
+    expect(checkpoint(lesson)?.body).toContain("requiredValidationCriteria");
+    expect(listProp(lesson, "LessonOverview", "files")).toContain("src/completion.ts");
   });
 
   it("supports scoped allow, deny, and human approval decisions", () => {
-    const source = lesson("permissions-safety");
+    const source = code("permissions-safety");
 
-    expect(source).toContain('type: "ask"');
-    expect(source).toContain("ApprovalRequest");
-    expect(source).toContain("authorize(tool, prepared.input, policyContext)");
-    expect(source).toContain("tool.prepare(rawInput)");
-    expect(source).toContain("network");
-    expect(source).toContain("allowedArgv");
+    for (const marker of [
+      'type: "ask"',
+      "ApprovalRequest",
+      "authorize(tool, prepared.input, policyContext)",
+      "tool.prepare(rawInput)",
+      "network",
+      "allowedArgv",
+    ]) {
+      expect(source, `policy lesson should keep ${marker}`).toContain(marker);
+    }
   });
 });

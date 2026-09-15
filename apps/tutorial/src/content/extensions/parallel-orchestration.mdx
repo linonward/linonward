@@ -1,0 +1,260 @@
+<LessonOverview
+  goal="在可证明独立的 PlanStep 之间引入并行执行，并用并行层、并发上限、预算预占、取消传播与确定性归并，让调度结果与完成顺序无关。"
+  task="为 TaskPlan 计算并行层，在 maxConcurrency 下调度多个独立步骤，并证明同层冲突、预算超卖与归并抖动都会被拒绝。"
+  prerequisites="主线 10 任务分解与规划已经通过 Checkpoint（TaskPlan、PlanStep.dependsOn、selectNextStep、reconcilePlan 可用），主线 16 长程任务恢复已经通过 Checkpoint（append-only 事件日志、幂等键、RunStore、WriteLease、TraceSink 可用）。"
+  files={["src/schedule.ts", "src/independent.ts", "src/parallel-runner.ts", "src/plan.ts", "tests/schedule.test.ts"]}
+/>
+
+主线走到 `agent-loop` 时，Harness 每一轮只推进一个 `in_progress` 步骤。这不是能力上限，而是一条安全边界：在依赖关系、证据门禁和事件序号被测试固定之前，并发只会把不确定性放大。**并行不是主线 Capstone 的前置条件**——Capstone 只要求单 Agent 的串行边界稳定可验收，本章属于扩展篇，跳过它不影响主线任何 Checkpoint；只有串行调度已经可复现之后，才值得引入并行。
+
+并行带来的不是"更快"，而是三类新风险：两个步骤写入同一文件、N 个分支同时把预算吃光、完成顺序不同导致归并结果不同。处理它们的是确定性调度器而不是模型：模型可以提出"这两步看起来独立"，但**只有 `assertIndependent` 通过、且它们落在同一并行层，才允许并发**。
+
+<Step id="prove-independence" number={1} title="证明任务确实独立">
+
+"独立"必须是可执行的谓词，而不是自然语言声明。给 `PlanStep` 增加一个声明读写路径与共享外部状态的字段，由 Planner 生成、由 `validatePlan` 校验；Harness 不信模型的口头保证，只信这份契约。
+
+```typescript
+// 在主线 10 的 types 模块里用 interface merging 追加字段，
+// 不要复制一份 PlanStep：否则 selectNextStep / reconcilePlan 会看到两个不兼容的计划类型。
+type StepParallelism = { reads: string[]; writes: string[]; sharedState: string[] };
+
+export interface PlanStep {
+  parallelism?: StepParallelism | undefined;
+}
+
+export function assertIndependent(stepA: PlanStep, stepB: PlanStep): void {
+  const adjacent = stepA.dependsOn.includes(stepB.id) || stepB.dependsOn.includes(stepA.id);
+  if (adjacent) throw new Error(`declared_dependency:${stepA.id}:${stepB.id}`);
+
+  const a = stepA.parallelism;
+  const b = stepB.parallelism;
+  if (!a || !b) throw new Error("step parallelism contract is missing");
+
+  for (const path of a.writes) {
+    if (b.writes.includes(path) || b.reads.includes(path)) throw new Error(`write_conflict:${path}`);
+  }
+  for (const path of b.writes) {
+    if (a.reads.includes(path)) throw new Error(`write_conflict:${path}`);
+  }
+
+  const shared = a.sharedState.filter((resource) => b.sharedState.includes(resource));
+  if (shared.length > 0) throw new Error(`shared_state:${shared[0]}`);
+}
+```
+
+三条规则对应三种真实耦合：**依赖关系**说明存在先后顺序；**同一路径的写写或读写冲突**说明任一分支的 observation 会立刻过期（`apply_patch` 的 `expectedSha256` 前置条件正是这种冲突的守门人）；**共享可变外部状态**（同一远端分支、同一数据库行、同一份凭据配额）不属于本进程能协调的范围。任一条命中就抛错，调度器必须让它们串行。
+
+<Callout>
+
+模型可以建议并行，但不能授权并行。第 6 步会用 Fake Tool 记录真实触碰的路径，与 `parallelism` 声明交叉校验。
+
+</Callout>
+
+</Step>
+
+<Step id="compute-ready-layers" number={2} title="计算并行层">
+
+`selectNextStep` 只返回第一个就绪步骤。并行调度需要同一依赖深度上的全部就绪步骤：把 `dependsOn` 图逐层拓扑排序得到 `PlanLayer[]`，只有同一层内才允许并行，未完成依赖的步骤绝不能进入同一层。
+
+```typescript
+export interface PlanLayer {
+  index: number;
+  stepIds: string[];
+}
+
+export function computeReadyLayers(plan: TaskPlan): PlanLayer[] {
+  const remaining = new Map(plan.steps.map((step) => [step.id, new Set(step.dependsOn)] as const));
+  const done = new Set(plan.steps.filter((step) => step.status === "completed").map((s) => s.id));
+  const layers: PlanLayer[] = [];
+
+  while (remaining.size > 0) {
+    const ready = [...remaining.entries()]
+      .filter(([, dependencies]) => [...dependencies].every((id) => done.has(id)))
+      .map(([id]) => id)
+      .sort(); // 稳定排序：同一图的层内顺序永远是字典序
+
+    if (ready.length === 0) throw new Error(`no ready step: ${[...remaining.keys()].join(",")}`);
+    for (const id of ready) {
+      remaining.delete(id);
+      done.add(id);
+    }
+    layers.push({ index: layers.length, stepIds: ready });
+  }
+  return layers;
+}
+```
+
+图来自 `PlanStep.dependsOn`，而 `validatePlan` 已经拒绝未知依赖、重复 ID 和循环依赖，所以这里只有一种出口：所有节点都被分层。层号是**结构属性**：依赖与完成集合相同，`PlanLayer` 就完全相同；已完成步骤不参与调度，但它们的状态决定哪些后继进入下一层。
+
+</Step>
+
+<Step id="bound-concurrency" number={3} title="并发上限与背压">
+
+并发不是套一层 `Promise.all`，而是显式的**就绪队列 + 并发上限 + 预算预占**。把 `computeReadyLayers` 的结果摊平成队列，当前层全部结算后才把下一层入队，"未完成依赖的步骤"因此在结构上就进不了执行集合。
+
+```typescript
+// SchedulerOptions 复用主线已有边界：plan / budget / store / lease / writeLease / trace / signal
+export interface SchedulerOptions {
+  maxConcurrency: number;
+  plan: TaskPlan;
+  budget: AgentBudget;
+  store: RunStore;
+  lease: RunLease;
+  writeLease: WriteLease;
+  trace: TraceSink;
+  signal?: AbortSignal | undefined;
+}
+
+/** 已预占预算 = 正在运行的每个分支的估算之和；不足则不得启动。 */
+export function reserveBudget(
+  budget: AgentBudget,
+  reserved: Map<string, number>,
+  estimate: number,
+): boolean {
+  const inFlight = [...reserved.values()].reduce((sum, value) => sum + value, 0);
+  return estimate + inFlight <= budget.maxToolCalls - budget.toolCalls;
+}
+```
+
+`maxConcurrency` 限制同时在跑的步骤数；就绪队列为空但仍有步骤未完成时，调度器等待当前分支结算——这就是背压：上游不结束，下游不入队；预算不足，步骤原地等待，而不是先跑起来再超卖。
+
+预算必须**预占**而不是事后统计，原因与主线 14 的批次门禁一致：`maxToolCalls` 是运行级上限。如果 N 个并行分支各自"先执行、后计数"，每个分支检查时看到的都是同一个未消费余额，于是 N 个分支一起通过，运行到结算才发现超卖，而工具副作用已经发生。串行循环没暴露它，是因为一次只检查一个批次；并行把"检查"和"消费"拆成两个时刻，中间必须有预占。第 6 步用 `budget.toolCalls <= budget.maxToolCalls` 把这条不变量钉死。
+
+</Step>
+
+<Step id="propagate-cancellation" number={4} title="传播取消与部分失败">
+
+并行分支的失败语义必须**显式选择并写入策略**，不能靠默认行为。本章选择 `fail_fast`：同一层中任一分支抛出不可恢复错误，调度器取消该层其余分支；某分支**可恢复失败**（例如 `file_changed`）时其余分支继续，失败本身落成事件而不是被丢弃。
+
+```typescript
+export type PartialFailurePolicy = "fail_fast" | "continue_others";
+type BranchFailure = { stepId: string; recoverable: boolean; message: string };
+
+export async function runLayer(
+  layer: PlanLayer,
+  controller: AbortController,
+  options: SchedulerOptions,
+  runBranch: (stepId: string, signal: AbortSignal) => Promise<void>,
+): Promise<BranchFailure[]> {
+  const failures: BranchFailure[] = [];
+  const running = new Set<Promise<void>>();
+  for (const stepId of layer.stepIds) {
+    if (controller.signal.aborted) break;
+    const branch = runBranch(stepId, controller.signal).catch(async (error: unknown) => {
+      const failure: BranchFailure = {
+        stepId,
+        recoverable: !isFatal(error),
+        message: error instanceof Error ? error.message : String(error),
+      };
+      failures.push(failure);
+      recordBranchFailure(options, failure); // 写入 TraceSink：type=branch_failed
+      // 失败先落成 append-only 事件，再决定是否取消同层分支，绝不静默丢弃
+      await options.store.append({
+        runId: options.plan.goal,
+        expectedSequence: nextSequence(options.plan),
+        ownerId: options.lease.ownerId,
+        epoch: options.lease.epoch,
+        event: { type: "step_failed", stepId, message: failure.message },
+      });
+      if (!failure.recoverable) controller.abort(new Error("sibling_branch_failed"));
+    });
+    running.add(branch);
+  }
+  await Promise.allSettled(running);
+  return failures;
+}
+```
+
+取消传播是两跳：`AbortController` 取消本层剩余分支 → 每个分支持有的 `AbortSignal` 传给 `executeToolCall`，终止子进程与 `fetch`。取消**不删除证据**：已写下的 `tool_intent` / `tool_result` 保留，未结算分支从 `in_progress` 回到 `pending` 并记录 `stopReason`，绝不算作 `completed`。
+
+不可恢复失败不静默重试，而是收集已完成步骤的证据后触发 `reconcilePlan`，让新版本 plan 重新计算并行层；其语义契约检查保证只有 ID 与契约都没变的步骤才继承 `completed`。这是并行与恢复章节的接合点：事件日志仍是 append-only，`idempotencyKey` 仍按 `runId:callId` 生成，因此被取消的层重跑不会重复副作用。
+
+</Step>
+
+<Step id="merge-deterministically" number={5} title="确定性归并">
+
+并行分支的完成顺序天然非确定：可能 A 先返回，也可能 B 先返回。因此**归并不能按完成时间排列**：如果 `evidence` 顺序或事件 `sequence` 依赖 `Promise` 的 settle 顺序，同一份 plan 与同一组 observation 会产生两份不同状态，`reconcilePlan` 的继承判断、恢复重放与评测快照全部失去可比性。归并只能依赖**结构顺序**。
+
+```typescript
+export interface MergeKey {
+  layer: number;
+  stepId: string;
+}
+
+/** 归并顺序 = 层号升序，同层按 stepId 字典序；与完成时间无关。 */
+export function compareMergeKey(left: MergeKey, right: MergeKey): number {
+  return left.layer - right.layer || (left.stepId < right.stepId ? -1 : 1);
+}
+
+export interface BranchOutcome extends MergeKey {
+  evidence: string[];
+  events: AgentEvent[];
+}
+
+export function mergeLayerOutcomes(
+  plan: TaskPlan,
+  outcomes: BranchOutcome[],
+): { plan: TaskPlan; events: AgentEvent[] } {
+  const ordered = outcomes.toSorted((left, right) => compareMergeKey(left, right));
+  const events: AgentEvent[] = [];
+  let merged = plan;
+
+  for (const outcome of ordered) {
+    merged = updateStep(merged, outcome.stepId, (step) => ({
+      ...step,
+      status: "completed",
+      evidence: [...step.evidence, ...outcome.evidence],
+    }));
+    events.push(...outcome.events.toSorted((a, b) => a.sequence - b.sequence));
+  }
+  return { plan: merged, events };
+}
+```
+
+**事件序号由结构决定，而不是由到达时间决定**：分支内事件先按 `sequence` 排序，归并时按 `compareMergeKey` 拼接，因此最终日志确定且连续递增，可被主线恢复器无歧义重放；`evidence` 的追加顺序同理，只跟 `stepId` 字典序走。
+
+写入仍受 `WriteLease` 约束：**即使已通过 `assertIndependent`，写入步骤落盘时也要进入 `writeLease.runExclusive(path, ...)`**。独立性证明只是调度前的静态检查，覆盖不了"模型实际写到声明之外的路径"；租约是执行时的最后一道串行化，两者互相补充而非互相替代。
+
+</Step>
+
+<Step id="test-schedule" number={6} title="测试调度不变量">
+
+创建 `tests/schedule.test.ts`。调度器是确定性代码，断言必须落在**不变量**上，而不是某个"看起来并发"的时间点：用 `runSchedule(plan, { settleOrder })` 控制分支结算顺序，就能在不引入真实并发的前提下验证归并与完成顺序无关。
+
+```typescript
+it("只把依赖已完成的步骤放进同一层", () => {
+  expect(computeReadyLayers(createIndependentPlan())).toEqual([
+    { index: 0, stepIds: ["inspect-a", "inspect-b"] },
+    { index: 1, stepIds: ["patch-a", "patch-b"] },
+    { index: 2, stepIds: ["validate"] },
+  ]);
+});
+
+it("预算不足时既不预占也不启动分支", () => {
+  const budget: AgentBudget = { maxSteps: 8, maxToolCalls: 3, modelSteps: 0, toolCalls: 0 };
+  const reserved = new Map([["inspect-a", 2], ["inspect-b", 2]]);
+  expect(reserveBudget(budget, reserved, 2)).toBe(false);
+});
+
+it("归并顺序与完成顺序无关", async () => {
+  const plan = createIndependentPlan();
+  const slowFirst = await runSchedule(plan, { settleOrder: ["patch-b", "patch-a"] });
+  const fastFirst = await runSchedule(plan, { settleOrder: ["patch-a", "patch-b"] });
+  expect(mergedEvidence(plan, slowFirst)).toEqual(mergedEvidence(plan, fastFirst));
+  expect(eventSequences(slowFirst)).toEqual(eventSequences(fastFirst));
+});
+```
+
+至少覆盖三个负向用例，每个对应前面某一步的硬性约束：
+
+1. **同一文件并行写**：`parallelism` 重叠的步骤若进入同一层，`assertIndependent` 抛 `write_conflict`；篡改声明但真实写同一路径时，`WriteLease` 使两次写入串行，第二个 `apply_patch` 因 `expectedSha256` 不匹配得到 `file_changed`。
+2. **预算超卖**：`maxConcurrency=3` 且每个分支需 2 次工具调用时，`estimate + inFlight > maxToolCalls - toolCalls` 的分支不得启动；断言整轮结束满足 `toolCalls <= maxToolCalls`，且没有分支在启动后才被拒绝。
+3. **归并顺序不确定**：交换 `settleOrder` 后 `mergedEvidence` 与 `eventSequences` 必须逐字相等；若实现改回按完成时间 `push`，测试立刻变红。
+
+</Step>
+
+<Checkpoint command='pnpm typecheck && pnpm test -- tests/schedule.test.ts'>
+
+在 `agent-from-scratch` 目录运行命令。终端应先显示类型检查通过，再显示 `tests/schedule.test.ts` 全部通过：层结果为 `[["inspect-a","inspect-b"],["patch-a","patch-b"],["validate"]]`；`maxConcurrency=2` 下同一层至少两个分支同时处于运行状态，`maxConcurrency=1` 时退化为与主线串行循环相同的层内顺序；`eventSequences()` 与 `[1..n]` 相等，`mergeLayerOutcomes` 在任意 `settleOrder` 下输出相同。然后逐个确认负向用例真的失败：声明两个步骤写同一路径后 `assertIndependent` 必须抛 `write_conflict`；移除预算预占并调大 `maxConcurrency` 后，`toolCalls <= maxToolCalls` 断言必须失败；把归并改回按完成时间排序后，`settleOrder` 交换测试必须失败。任一负向用例没有按预期失败，说明对应约束尚未生效，本章不算通过。
+
+</Checkpoint>

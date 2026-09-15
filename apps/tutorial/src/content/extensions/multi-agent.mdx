@@ -1,0 +1,258 @@
+<LessonOverview
+  goal="在单 Agent 边界稳定之后，用持久化交接、角色权限与确定性归并，让多个受 Harness 约束的 Agent 协作完成同一个任务。"
+  task="把一次仓库调查拆成调查角色与验证角色，通过持久化 Handoff 运行子 Agent，并把结果确定性归并回父运行的 TaskPlan。"
+  prerequisites="主线 ToolRegistry、权限与安全、Agent Loop 与长程任务恢复已经通过各自 Checkpoint。"
+  files={["src/role.ts", "src/handoff.ts", "src/merge.ts", "src/recovery-events.ts", "src/agent-loop.ts", "tests/handoff.test.ts"]}
+/>
+
+多 Agent 不是把单 Agent 复制几份，而是把已经被 Harness 约束的 Loop 当成一个可调度的单元：父运行保留目标和总预算，子运行只负责一个被封装的子任务，二者之间唯一的合法通道是**持久化事件**，不是进程内的 Promise，也不是模型在对话里互相转述。
+
+<Callout title="先确认边界">
+
+如果单 Agent 还不能稳定地规划、验证和恢复，多 Agent 只会把同样的缺陷放大成并发缺陷。请先让主线的单 Agent 边界通过 Checkpoint 再阅读本章。扩展篇复用主线的 `AgentBudget`、`AgentEvent`、`RunStore`、`RunLease`、`WriteLease`、`ToolRegistry`、`TraceSink` 与 `AgentResult`，但**不是主线 Capstone 的前置条件**：跳过本章不会让任何主线章节或 Capstone 失败。
+
+</Callout>
+
+<Step id="define-role-contract" number={1} title="定义角色与交接契约">
+
+角色不是人设，而是**权限的子集**：系统 Prompt 片段决定它如何工作，工具白名单与 effect 上限决定它能做什么，预算上限决定它能花多少，三者必须由 Harness 一起强制。
+
+```typescript
+export type AgentRoleId = "researcher" | "implementer" | "verifier";
+export interface AgentRole {
+  id: AgentRoleId;
+  promptFragment: string;
+  allowedTools: string[];
+  maxEffect: Exclude<ToolEffect, "external">;
+  budgetCeiling: Pick<AgentBudget, "maxSteps" | "maxToolCalls">;
+}
+const rank: Record<ToolEffect, number> = { read: 0, write: 1, execute: 2, external: 3 };
+export function restrictRegistry(registry: ToolRegistry, role: AgentRole): ToolRegistry {
+  const names = registry.definitions()
+    .filter((tool) => role.allowedTools.includes(tool.name) && rank[tool.effect] <= rank[role.maxEffect])
+    .map((tool) => tool.name);
+  return registry.subset(names);
+}
+```
+
+`restrictRegistry` 只会**收窄**：子 Agent 拿不到父 Agent 没有的工具，也拿不到超过 `maxEffect` 的工具，而 `external` 不在 `maxEffect` 的可选值里，所以角色无法自行获得网络或外部副作用能力。角色只是把主线第 09 章的 `authorize` 输入变小，绝不会替换或跳过它。
+
+交接本身是一份持久化记录，而不是一次函数调用：
+
+```typescript
+export type AgentHandoffStatus =
+  "recorded" | "running" | "completed" | "failed" | "cancelled" | "manual_reconciliation";
+export interface AgentHandoff {
+  handoffId: string;
+  parentRunId: string;
+  childRunId: string;
+  parentStepId: string;
+  role: AgentRoleId;
+  task: string;
+  allowedTools: string[];
+  budget: AgentBudget;
+  idempotencyKey: string;
+  status: AgentHandoffStatus;
+  recordedAt: string;
+}
+```
+
+为什么必须由 Harness 记录，而不是让模型把任务“转述”给另一个 Agent：模型看不到 `runId`、`sequence`、`lease` 和真实预算，它无法保证消息落盘、无法幂等重试、无法在崩溃后恢复，也无法阻止自己顺手把不该给的工具一起转述过去。模型只提出候选交接，Harness 校验后追加 `handoff_recorded`，这条事件才是子运行存在的唯一依据。
+
+```typescript
+export type DurableEvent =
+  // 第 16 章已有成员
+  | { type: "handoff_recorded"; handoff: AgentHandoff }
+  | { type: "handoff_result"; handoffId: string; status: AgentHandoffStatus; budgetUsed: AgentBudget; evidence: string[] }
+  | { type: "handoff_conflict"; handoffId: string; conflicting: string[] };
+export interface StopReasonMap { manual_reconciliation: true; handoff_blocked: true; }
+```
+
+`StopReasonMap` 用 interface merging 扩展，新停止原因和其它路径一样进入 `AgentResult.stopReason`、`AgentEvent` 序列与 Trace，而不是抛一个无人处理的异常。
+
+</Step>
+
+<Step id="persist-handoff" number={2} title="持久化交接任务">
+
+先追加事件，再启动子运行。`idempotencyKey` 由父运行、父 Step 与角色确定性派生，因此崩溃后重放同一逻辑交接会命中同一条记录，而不会创建第二个子运行。
+
+```typescript
+export async function recordHandoff(options: {
+  parent: DurableAgentState; request: HandoffRequest; store: RunStore; lease: RunLease; clock: Clock;
+}): Promise<AgentHandoff> {
+  const idempotencyKey = `${options.parent.runId}:${options.request.stepId}:${options.request.role.id}`;
+  const existing = findHandoffByKey(options.parent.events, idempotencyKey);
+  if (existing) return existing;
+  const handoff: AgentHandoff = {
+    handoffId: crypto.randomUUID(), parentRunId: options.parent.runId,
+    childRunId: childRunIdFor(idempotencyKey), parentStepId: options.request.stepId,
+    role: options.request.role.id, task: options.request.task, idempotencyKey,
+    allowedTools: options.request.role.allowedTools, status: "recorded",
+    budget: sliceBudget(options.parent.budget, options.request.role, options.request.budgetRequest),
+    recordedAt: options.clock.now().toISOString(),
+  };
+  await appendHandoffEvent({ state: options.parent, lease: options.lease, store: options.store, handoff });
+  return handoff;
+}
+```
+
+预算切片在**记录交接时就预留**，而不是等子 Agent 用多少再扣多少：父运行的计数器先加上整个切片额度，事件 reducer 用同一个纯函数重放，这样三个子 Agent 即使同时跑满也无法突破父预算。
+
+```typescript
+export function reserveBudget(parent: AgentBudget, slice: AgentBudget): AgentBudget {
+  const next: AgentBudget = { ...parent, modelSteps: parent.modelSteps + slice.maxSteps, toolCalls: parent.toolCalls + slice.maxToolCalls };
+  if (next.modelSteps > next.maxSteps || next.toolCalls > next.maxToolCalls) throw new Error("budget_exhausted");
+  return next;
+}
+```
+
+子 Agent 的 `AgentBudget` 是切片额度、计数从零开始的独立预算。子 Agent 失败或取消时，`handoff_result` 事件仍带着 `budgetUsed` 落盘，父运行只把未使用部分通过 `settleBudget` 退还，预算证据不会被吞掉，也不会因为“跑挂了一个”就凭空多出额度。
+
+进程内的 `await runSubagent(...)` 崩溃后什么都不剩：既不知道子任务是否开始，也不知道它花掉了多少预算。先写 `handoff_recorded`，再由恢复器按 `idempotencyKey` 找到它并决定启动、续跑还是对账，才能让多 Agent 复用第 16 章的恢复能力。
+
+</Step>
+
+<Step id="run-subagent" number={3} title="运行子 Agent 并继承预算">
+
+接入点在 Agent Loop 的 **PLAN 与 ASSEMBLE 之间**：给 `PlanStep` 用 interface merging 增加可选的 `handoff` 字段，默认 `undefined` 时循环行为与主线完全一致；只有当前 Step 声明交接时，Harness 才走这个分支，`DECIDE/ACT/OBSERVE` 三步原样复用。
+
+```typescript
+export interface PlanStep {
+  handoff?: { role: AgentRoleId; task: string; budgetRequest: AgentBudget } | undefined;
+}
+// runAgentLoop 的循环体内，selectNextStep 之后：
+if (activeStep?.handoff) {
+  const handoff = await recordHandoff({ parent: state, request: { stepId: activeStep.id, ...activeStep.handoff }, store, lease, clock });
+  const outcome = await runHandoff({ handoff, role, parentState: state, parentRuntime, store, clock });
+  state = applyHandoffOutcome(state, outcome); // 写入 observation 与父 TaskPlan 证据
+  previousResponseId = undefined;
+  pendingOutputs = [];
+  continue;
+}
+```
+
+子运行必须拿到自己的 `RunLease`，绝不能复用父运行的 lease；它继承同一个 `cwd` 与真实工作区根目录、同一个 `WriteLease` 与 `TraceSink`，并通过 `restrictRegistry` 只看到角色允许的工具。
+
+```typescript
+export async function runHandoff(options: HandoffRunOptions): Promise<HandoffOutcome> {
+  const { store, handoff, role, parentState, parentRuntime } = options;
+  const childLease = await store.acquireLease(handoff.childRunId, crypto.randomUUID(), 30_000);
+  const childState = createInitialState(handoff.task, parentRuntime.cwd);
+  childState.runId = handoff.childRunId;
+  childState.budget = { ...handoff.budget, modelSteps: 0, toolCalls: 0 };
+  const childRuntime: AgentRuntime = {
+    ...parentRuntime,
+    tools: restrictRegistry(parentRuntime.tools, role),
+    store,
+    trace: parentRuntime.trace,
+  };
+  const result: AgentResult = await runAgentLoopFromState(childState, childRuntime);
+  await appendHandoffResult({ state: parentState, lease: options.parentLease, store, handoff, result });
+  await store.releaseLease(childLease);
+  return toOutcome(handoff, result);
+}
+```
+
+这里没有任何“因为是子 Agent 所以可以放宽”的例外：子运行的每个工具调用仍然经过 `prepare` 与 `authorize`，仍然受工作区边界约束，仍然使用共享 `WriteLease` 串行化写入，角色只会让权限更小。子 Agent 也不能自己批准审批，`ask` 决策会像主线一样把子运行置为 `waiting`，由操作者决定。父进程崩溃后，恢复器读取 `handoff_recorded` 与缺失的 `handoff_result`，按 `idempotencyKey` 对账：未开始就启动，已开始就续跑，副作用不明就转人工核对。
+
+</Step>
+
+<Step id="merge-results" number={4} title="确定性归并与冲突处理">
+
+归并是从子结果回到父 `TaskPlan` 证据链的唯一入口，必须与完成顺序、并发度、机器时钟无关。排序键固定为 `parentStepId`、`role`、`childRunId`，绝不使用 `completedAt`：
+
+```typescript
+export interface HandoffOutcome {
+  handoffId: string; childRunId: string; parentStepId: string; role: AgentRoleId;
+  status: AgentHandoffStatus; budgetUsed: AgentBudget; evidence: string[];
+  criteria: Record<string, "passed" | "failed" | "unknown">;
+}
+export function mergeHandoffOutcomes(plan: TaskPlan, outcomes: HandoffOutcome[]) {
+  let merged = plan;
+  const conflicts: HandoffConflict[] = [];
+  const ordered = [...outcomes].toSorted(compareOutcome);
+  for (const outcome of ordered) {
+    merged = applyCriterionEvidence(merged, outcome.criteria, outcome.evidence);
+    merged = appendEvidence(merged, outcome.parentStepId, outcome);
+  }
+  for (const conflict of detectCriterionConflicts(ordered)) {
+    conflicts.push(conflict);
+    merged = blockStep(merged, conflict.stepId, "manual_reconciliation");
+  }
+  return { plan: merged, conflicts };
+}
+```
+
+冲突判定只看**证据是否互相排斥**：两个结果对同一 `AcceptanceCriterion` 给出相反的 `passed` 与 `failed`，或对同一路径给出不同的文件 hash。此时保留双方证据、把对应 Step 置为 `blocked`、追加 `handoff_conflict`，并以 `manual_reconciliation` 停止，交由人判断。
+
+<Callout title="禁止多数投票">
+
+“三个子 Agent 里两个说测试通过”不是证据，只是三个可能都读错同一份输出的模型。归并不能用票数替代可复现的命令结果、文件 hash 或用户确认；无法对账时停下来，比自动选多数的伤害小得多。
+
+</Callout>
+
+只有通过校验的归并结果才调用主线的 `completeStep` 推进计划。子 Agent 自己的 `TaskPlan`、`AgentResult` 与事件序列始终留在子运行里，父运行只接收标记了来源（`childRunId` 与 `eventId`）的证据；父 `budget` 用 `settleBudget` 退还差额，`TraceSink.readRun(childRunId)` 仍可按需展开完整子轨迹。
+
+</Step>
+
+<Step id="test-handoff" number={5} title="测试交接与归并">
+
+创建 `tests/handoff.test.ts`。Fake Model 驱动父运行、固定返回的 Fake Agent 驱动子运行，断言事件顺序、预算不变量与归并确定性，不断言模型内部思考。
+
+```typescript
+describe("handoff", () => {
+  it("records handoff_recorded before the child run starts", async () => {
+    const fixture = createHandoffFixture();
+    await fixture.runParent();
+    expect(fixture.indexOf("handoff_recorded")).toBeLessThan(fixture.indexOf("run_started"));
+  });
+  it("never lets parallel children exceed the parent budget", async () => {
+    const result = await runParallelHandoffs(parentState, [request(4), request(4), request(4)]);
+    expect(result.state.budget.modelSteps).toBeLessThanOrEqual(parentState.budget.maxSteps);
+    expect(result.stopReason).toBe("max_steps");
+  });
+  it("keeps budget evidence when a child fails", async () => {
+    const outcome = await runFailingChild();
+    expect(outcome.budgetUsed.modelSteps).toBeGreaterThan(0);
+    expect(findEvent(parentRunId, "handoff_result")).toMatchObject({ status: "failed" });
+  });
+  it("merges outcomes independently of completion order", () => {
+    const forward = mergeHandoffOutcomes(plan, outcomes);
+    const backward = mergeHandoffOutcomes(plan, [...outcomes].reverse());
+    expect(backward.plan).toEqual(forward.plan);
+    expect(backward.conflicts).toEqual(forward.conflicts);
+  });
+  it("keeps both sides of a conflict and asks for manual reconciliation", () => {
+    const merged = mergeHandoffOutcomes(plan, [
+      outcome("verifier-a", { "tests-pass": "passed" }),
+      outcome("verifier-b", { "tests-pass": "failed" }),
+    ]);
+    expect(merged.conflicts).toHaveLength(1);
+    expect(merged.plan.steps[0]?.status).toBe("blocked");
+  });
+  it("denies a tool outside the role", async () => {
+    const child = await runChildWithRole("researcher", "apply_patch");
+    expect(child.trace.readRun(child.childRunId)).toContainEqual(expect.objectContaining({ errorCode: "policy_denied" }));
+  });
+  it("reconciles a handoff recorded before the child started", async () => {
+    const fixture = createHandoffFixture("after_handoff_recorded");
+    await expect(fixture.startParent()).rejects.toThrow("simulated_crash");
+    const result = await resumeAgentRun(fixture.parentRunId, fixture.restartedRuntime());
+    expect(result.stopReason).toBe("final_answer");
+    expect(fixture.childStartCount()).toBe(1);
+    expect(fixture.eventSequences()).toEqual(fixture.contiguousSequences());
+  });
+});
+```
+
+最后一条就是故障注入：让父运行在交接已落盘、子运行尚未启动的窗口崩溃。恢复后 Harness 必须按 `idempotencyKey` 复用同一条 handoff，只启动一次子运行、只写一次 `handoff_result`。如果子运行自己崩溃在 `after_tool_effect`，则复用第 16 章的 verifier 对账，保证副作用总计只发生一次。
+
+</Step>
+
+<Checkpoint command='pnpm typecheck && pnpm test -- tests/handoff.test.ts'>
+
+预期结果：`7 tests passed`。事件日志必须先出现 `handoff_recorded`，再出现子运行的 `run_started` 与 `handoff_result`；三个子 Agent 并行时父运行的 `modelSteps` 与 `toolCalls` 不得超过原上限；两个 verifier 对同一验收条件给出相反结论时，归并必须保留双方证据、把该 Step 置为 `blocked` 并以 `manual_reconciliation` 停止，而不是按多数投票自动完成。
+
+失败注入：在 `after_handoff_recorded` 处抛出 `simulated_crash`，让父进程在交接已落盘、子运行未启动时崩溃。用同一父 `runId` 恢复后，Harness 必须复用同一条 handoff 并只启动一次子运行；再把子运行的崩溃点移到 `after_tool_effect`，确认对账后副作用总计只发生一次、事件 sequence 连续，且恢复后的子预算仍不超过原切片。
+
+</Checkpoint>

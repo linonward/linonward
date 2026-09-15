@@ -1,24 +1,25 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-const source = readFileSync(
-  fileURLToPath(new URL("../src/content/context-and-prompt.mdx", import.meta.url)),
-  "utf8",
-);
+import { checkpoint, codeText, lessonSource, listProp } from "./support/lesson-source";
+
+const source = lessonSource("context-and-prompt");
+const code = codeText(source);
 
 describe("context and prompt lesson", () => {
-  it("provides a runnable verification for context selection and request boundaries", () => {
-    expect(source).toContain("tests/context.test.ts");
-    expect(source).toContain('describe("selectContext"');
-    expect(source).toContain('it("优先保留高优先级来源"');
-    expect(source).toContain('it("分离系统规则、用户任务和参考资料"');
-    expect(source).toContain('<Checkpoint command="pnpm typecheck && pnpm test">');
+  it("ships a runnable test suite for context selection and request boundaries", () => {
+    expect(checkpoint(source)?.command).toContain("pnpm typecheck");
+    expect(listProp(source, "LessonOverview", "files")).toContain("tests/context.test.ts");
+    for (const marker of [
+      'describe("selectContext"',
+      'it("优先保留高优先级来源"',
+      'it("分离系统规则、用户任务和参考资料"',
+    ]) {
+      expect(code, `context lesson should keep ${marker}`).toContain(marker);
+    }
   });
 
-  it("uses newline escapes that produce real line breaks when copied", () => {
-    expect(source).toContain(String.raw`.join("\n")`);
-    expect(source).not.toContain(String.raw`.join("\\n")`);
+  it("uses newline escapes that survive copy and paste", () => {
+    expect(code).toContain(String.raw`.join("\n")`);
+    expect(code).not.toContain(String.raw`.join("\\n")`);
   });
 });

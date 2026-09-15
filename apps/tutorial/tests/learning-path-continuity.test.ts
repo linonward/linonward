@@ -1,33 +1,36 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-function lesson(name: string): string {
-  return readFileSync(
-    fileURLToPath(new URL(`../src/content/${name}.mdx`, import.meta.url)),
-    "utf8",
-  );
+import { codeText, lessonSource } from "./support/lesson-source";
+
+/**
+ * 跨章接口契约：同一个 `agent-from-scratch` 项目逐章升级，
+ * 后面的章节必须继续满足前面章节已经建立的类型与调用顺序。
+ *
+ * 这里只断言代码块里的签名与顺序，因此正文措辞调整不会误报；
+ * 一旦这些断言变红，说明某一章教出来的接口与后续章节不再兼容。
+ */
+function code(name: string): string {
+  return codeText(lessonSource(name));
 }
 
 describe("cumulative tutorial project", () => {
   it("keeps the offline model path runnable after ModelRequest replaces strings", () => {
-    expect(lesson("model-call")).toContain("export function createModel");
-    expect(lesson("context-and-prompt")).toContain(
+    expect(code("model-call")).toContain("export function createModel");
+    expect(code("context-and-prompt")).toContain(
       "async generate(_request: ModelRequest): Promise<string>",
     );
   });
 
   it("introduces every write capability before the patch tool uses it", () => {
-    const source = lesson("edit-code");
+    const source = code("edit-code");
 
     expect(source).toContain("export interface WriteLease");
     expect(source).toContain("writeLease: WriteLease");
     expect(source).toContain("defineTool({");
   });
 
-  it("keeps schema validation before policy and side effects", () => {
-    const source = lesson("permissions-safety");
+  it("keeps schema validation before policy and policy before side effects", () => {
+    const source = code("permissions-safety");
 
     expect(source).toContain("prepare(input: unknown): PreparedToolCall");
     expect(source).toContain("const prepared = tool.prepare(rawInput)");
@@ -40,34 +43,32 @@ describe("cumulative tutorial project", () => {
   });
 
   it("upgrades minimal state without dropping validation evidence or lifecycle states", () => {
-    const source = lesson("task-state");
+    const source = code("task-state");
 
     expect(source).toContain("validations: ValidationRecord[]");
     expect(source).toContain("requiredCriterionIds: string[]");
     expect(source).toContain("mutationRevision: number");
     expect(source).toContain('"waiting"');
     expect(source).toContain('"cancelled"');
-    expect(source).not.toContain("最终完成还要在验证章加入");
   });
 
   it("adds interaction and skill fields before the full loop reads them", () => {
-    expect(lesson("user-interaction")).toContain("pendingUserInput?: UserInputRequest");
-    expect(lesson("progressive-skills")).toContain("skills: SkillState");
-    expect(lesson("progressive-skills")).toContain("skill_instructions: true");
-    expect(lesson("progressive-skills")).toContain("skill_resource: true");
+    expect(code("user-interaction")).toContain("pendingUserInput?: UserInputRequest");
+    expect(code("progressive-skills")).toContain("skills: SkillState");
+    expect(code("progressive-skills")).toContain("skill_instructions: true");
+    expect(code("progressive-skills")).toContain("skill_resource: true");
   });
 
   it("connects trace collection and evaluation to executable entry points", () => {
-    const source = lesson("observability-evaluation");
+    const source = code("observability-evaluation");
 
     expect(source).toContain("export interface TraceSink");
     expect(source).toContain("export async function runEvaluation");
-    expect(source).toContain("tests/eval.test.ts");
   });
 
   it("preserves authoritative state through compaction and recovery", () => {
-    const compaction = lesson("context-compaction");
-    const recovery = lesson("long-running-recovery");
+    const compaction = code("context-compaction");
+    const recovery = code("long-running-recovery");
 
     expect(compaction).not.toContain("state.pendingToolCalls");
     expect(compaction).toContain("validation evidence changed during compaction");
@@ -78,9 +79,6 @@ describe("cumulative tutorial project", () => {
   });
 
   it("gives the capstone a concrete suite runner instead of only a checklist", () => {
-    const source = lesson("capstone");
-
-    expect(source).toContain("export async function runCapstoneSuite");
-    expect(source).toContain("tests/capstone.test.ts");
+    expect(code("capstone")).toContain("export async function runCapstoneSuite");
   });
 });

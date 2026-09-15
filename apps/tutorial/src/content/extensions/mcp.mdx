@@ -1,0 +1,255 @@
+<LessonOverview
+  goal="把外部 MCP Server 暴露的能力适配成主线已有的 RegisteredTool，让它完整穿过 Schema 校验、权限策略、Executor 和 AgentEvent 审计，而不是给 Harness 增加第二条执行路径。"
+  task="用一个 Fake Transport 在离线状态完成初始化、能力发现、参数校验、授权拦截、取消传播和崩溃恢复，并写出对应的六组测试。"
+  prerequisites="主线 04 工具系统与 09 权限与安全已经通过 Checkpoint；本章复用它们的 ToolRegistry、authorize 与 executeToolCall，不重复讲解工具协议。"
+  files={["src/mcp/transport.ts", "src/mcp/client.ts", "src/mcp/schema.ts", "src/mcp/tools.ts", "src/cli.ts", "tests/mcp.test.ts"]}
+/>
+
+对 Harness 来说，MCP 不是新的执行通道，而是**又一批工具**：必须经过同一个 Schema 校验、同一个 `authorize` 和同一个 Executor。任何绕过这条链路的“直连 MCP”实现，都等于在权限层上开了一个后门。
+
+<Callout title="本章边界">
+
+MCP 不是主线 Capstone 的前置条件，本章也不引入任何真实网络调用或真实 Server 进程。所有代码只依赖一个可替换的传输接口，验证全部由 Fake Transport 离线完成。
+
+</Callout>
+<Step id="define-transport" number={1} title="定义传输边界">
+创建 `src/mcp/transport.ts`。上层只认识这几个方法，不认识 stdio、WebSocket 或 HTTP；JSON-RPC 错误在传输层就折叠成两种结果，避免调用点各自解析协议。
+
+```typescript
+export type McpResponse =
+  | { ok: true; result: unknown }
+  | { ok: false; error: { code: number; message: string } };
+
+export interface McpTransport {
+  request(method: string, params: unknown, signal: AbortSignal): Promise<McpResponse>;
+  close(): Promise<void>;
+}
+```
+
+`result` 保持为 `unknown`，因为每个方法的返回形状不同，应由调用点在紧邻位置校验，而不是在传输层做笼统断言。超时与取消的策略值统一放在 `McpRequestContext`（`signal` 与 `timeoutMs`）里传递。线上实现（例如子进程 stdio）负责用 `signal` 中止底层读写、超时后返回 `error` 而不是挂起、并在 `close()` 中回收全部句柄。离线实现是本章的主角：
+
+```typescript
+export class FakeTransport implements McpTransport {
+  readonly calls: { method: string; params: unknown }[] = [];
+  closed = false;
+
+  constructor(private readonly handlers: Record<string, (params: unknown) => McpResponse>) {}
+
+  async request(method: string, params: unknown, signal: AbortSignal): Promise<McpResponse> {
+    this.calls.push({ method, params });
+    if (signal.aborted) return { ok: false, error: { code: -32_800, message: "cancelled" } };
+
+    const handler = this.handlers[method];
+    if (!handler) return { ok: false, error: { code: -32_601, message: "method_not_found" } };
+    return handler(params);
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+```
+
+只依赖这个接口带来三个好处：测试不需要网络和子进程就能覆盖超时、取消与崩溃；权限与审计层完全不需要知道 MCP 的存在；换传输实现时 `src/mcp/client.ts` 以上的代码一行都不用改。真实接入应使用官方 `@modelcontextprotocol/sdk` 的传输实现，本章不引入该依赖。
+
+</Step>
+
+<Step id="discover-capabilities" number={2} title="发现并映射能力">
+创建 `src/mcp/client.ts`。先 `initialize` 握手并校验服务端声明的协议版本，再用 `tools/list` 拉取能力清单。把远端声明映射成本地描述符，字段含义对齐已有的 `SkillSummary`：只有名称、描述和 Schema 进入模型可见的工具列表。
+
+```typescript
+export interface McpToolDescriptor {
+  server: string;
+  remoteName: string;
+  description: string;
+  inputSchema: unknown;
+}
+
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"] as const;
+
+/** context 中的 signal 与 timeoutMs 由调用方注入，不来自服务端。 */
+export async function initializeServer(
+  transport: McpTransport,
+  context: McpRequestContext,
+): Promise<{ protocolVersion: string }> {
+  const request = {
+    protocolVersion: "2025-06-18",
+    capabilities: { tools: {} },
+    clientInfo: { name: "agent-from-scratch", version: "0.1.0" },
+  };
+  const response = await transport.request("initialize", request, context.signal);
+
+  if (!response.ok) throw new Error("mcp_initialize_failed: " + response.error.message);
+  const protocolVersion = asRecord(response.result).protocolVersion;
+  if (typeof protocolVersion !== "string" || !SUPPORTED_PROTOCOL_VERSIONS.some((v) => v === protocolVersion)) {
+    throw new Error("unsupported_protocol_version: " + String(protocolVersion));
+  }
+
+  await transport.request("notifications/initialized", {}, context.signal);
+  return { protocolVersion };
+}
+
+export async function listTools(
+  server: string,
+  transport: McpTransport,
+  context: McpRequestContext,
+): Promise<McpToolDescriptor[]> {
+  const response = await transport.request("tools/list", {}, context.signal);
+  if (!response.ok) throw new Error("mcp_tools_list_failed: " + response.error.message);
+
+  const tools = asRecord(response.result).tools;
+  if (!Array.isArray(tools)) throw new Error("invalid_tools_list");
+
+  return tools.map((tool) => {
+    const record = asRecord(tool);
+    if (typeof record.name !== "string" || !record.name) throw new Error("invalid_tool_name");
+    if (typeof record.description !== "string") throw new Error("invalid_tool_description");
+    return { server, remoteName: record.name, description: record.description, inputSchema: record.inputSchema };
+  });
+}
+```
+
+工具名必须加命名空间，例如 `mcp__<server>__<tool>`，并把结果记录进 `McpServerDescriptor`。服务器名与工具名都限制为 `[a-zA-Z0-9_-]`，其余字符直接拒绝。注册时调用已有的 `ToolRegistry.register`：它在重名时抛错，所以“远端工具覆盖本地 `read_file`”会变成启动失败而不是静默替换。本地工具是经过审查、有确定沙箱语义的实现，绝不能被一个远端声明顶掉；同一服务器返回两个同名工具同样属于启动失败。
+
+</Step>
+
+<Step id="validate-schemas" number={3} title="转换并校验参数">
+MCP 传回的是 JSON Schema 文本，本地 `RegisteredTool.parameters` 与 `PreparedToolCall` 的校验策略必须一起生成。创建 `src/mcp/schema.ts`，把转换失败变成显式拒绝，而不是“跳过校验先跑起来”。
+
+```typescript
+import { z, type ZodType } from "zod";
+
+const ALLOWED_KEYWORDS = new Set([
+  "type", "properties", "required", "additionalProperties", "items", "enum", "const",
+  "description", "default", "minimum", "maximum", "minLength", "maxLength", "oneOf", "anyOf",
+]);
+
+export function toLocalSchema(inputSchema: unknown): { schema: ZodType; parameters: Record<string, unknown> } {
+  if (!isSupportedJsonSchema(inputSchema)) throw new Error("unsupported_input_schema");
+
+  const schema = z.fromJSONSchema(inputSchema);
+  const { $schema: _, ...parameters } = z.toJSONSchema(schema);
+  return { schema, parameters };
+}
+
+export function isSupportedJsonSchema(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.keys(value).every((keyword) => ALLOWED_KEYWORDS.has(keyword));
+}
+```
+
+`z.fromJSONSchema` 得到校验器、`z.toJSONSchema` 生成模型可见的 JSON Schema，保证运行时校验与模型看到的定义来自同一来源。远端 Schema 里的未知关键字（例如 `$ref`、`patternProperties` 或自定义扩展）一律拒绝：转换器无法保证它们的语义，放任不管就会出现“模型以为会被校验、实际没有”。该 API 目前是半实验特性，升级 Zod 时必须连同本章测试一起跑。转换之后还要为 strict function calling 补齐三项：每个对象必须显式带 `additionalProperties: false`，否则模型可以塞入未声明字段；所有字段都要列入 `required`，因为 strict 模式不接受可选字段；可选值改用 `["string", "null"]` 这样的联合类型表达。这些补齐只用于规范化模型可见定义，不能反过来放宽本地校验器。
+
+最后把描述符注册成本地工具：
+
+```typescript
+const tool = defineTool({
+  name: "mcp__" + descriptor.server + "__" + descriptor.remoteName,
+  description: descriptor.description,
+  schema,
+  effect: "external",
+  execute: (input, context) => callRemoteTool(descriptor, input, context),
+});
+```
+
+`defineTool` 的 `prepare` 会在任何副作用之前运行 `schema.parse(input)`，所以模型传错参数时得到的是 `invalid_arguments` observation，而不是一次带坏参数的远端调用。
+
+</Step>
+
+<Step id="apply-policy" number={4} title="复用权限与沙箱">
+MCP 工具默认 `effect: "external"`，这让它们自动落入第 09 章的既有策略：`authorize(tool, prepared.input, policyContext)` 会返回 `ask` 或 `deny`，产生 `ApprovalRequest`，把运行置为 `waiting`，并在人工批准后把执行放进 sandbox。不要为 MCP 新增第二条授权路径，也不要让 MCP 传输层自己在请求里附带凭证。
+
+```typescript
+const prepared = tool.prepare(rawInput);
+const decision = authorize(tool, prepared.input, policyContext);
+if (decision.type === "deny") return observation(callId, { ok: false, error: "policy_denied", reason: decision.reason });
+if (decision.type === "ask" && !(await store.consumeApprovalGrant(state.runId, decision.request.actionDigest))) {
+  await store.saveApprovalRequest(state.runId, decision.request);
+  return { type: "waiting", requestId: decision.request.id, reason: "approval_required" };
+}
+
+return executeInSandbox(() => prepared.execute(toolContext), { network: policyContext.network });
+```
+
+远端调用与 `run_command` 走同一道门禁，没有例外。远端服务器声明的 `annotations.readOnlyHint` 或 `title` 只是提示，不能作为信任依据：能力清单来自对端进程，只读声明无法被本地验证，最多用于生成 `ApprovalRequest.summary` 帮助操作者判断，绝不能用来把 `effect` 降级成 `read`。批准的 `actionDigest` 必须继续绑定工具名、规范化后的 `input`、`cwd` 与 network 策略；服务器在两次调用之间换掉 Schema 或工具列表，也必须让旧批准失效。
+
+<Callout title="默认拒绝">
+
+网络与外部副作用在策略里默认关闭。要启用某个 MCP 工具，必须在策略里显式列出该工具及其允许的参数范围，并保持人类批准；本教程不提供“全部 MCP 工具自动放行”的开关。
+
+</Callout>
+
+</Step>
+
+<Step id="manage-lifecycle" number={5} title="管理生命周期与取消">
+一个受控的 MCP 连接包含四个阶段，每个阶段都必须有超时和取消：
+
+1. **握手**：`initialize` 携带客户端协议版本，服务端返回它的版本，双方取交集；没有交集就拒绝启动该服务器，而不是带着未知协议继续。
+2. **发现**：`tools/list` 的结果必须重新生成注册表，工具集合的任何变化都要让旧批准与旧会话失效。
+3. **调用**：每次 `tools/call` 都绑定一个 `AbortController` 与 `timeoutMs`；运行被取消或超时时，先 `signal.abort()`，再把结构化失败写回 observation。
+4. **关闭**：CLI 退出、配置变更或连接长时间空闲时调用 `transport.close()`，等待子进程退出并清理句柄。
+
+取消必须沿同一条链传播：`ToolContext.signal` 来自 `executeToolCall` 的超时控制器，传给 `McpTransport.request`，再由传输实现中止底层读写。传输层返回的 `cancelled` 错误要继续向上传递，而不是被吞掉变成空结果。
+
+```typescript
+async function callRemoteTool(
+  descriptor: McpToolDescriptor,
+  input: unknown,
+  context: ToolContext,
+): Promise<unknown> {
+  const response = await transport.request(
+    "tools/call",
+    { name: descriptor.remoteName, arguments: input },
+    context.signal,
+  );
+
+  if (!response.ok) return { ok: false, error: "mcp_error", code: response.error.code };
+  const result = asRecord(response.result);
+  if (result.isError === true) return { ok: false, error: "mcp_tool_error", content: result.content };
+  return { ok: true, content: result.content };
+}
+```
+
+`close()` 同样要有幂等语义与超时，失败时通过 `AgentEvent` 记录 `mcp_close_failed`，不能把关闭异常抛回退出的 CLI。服务端崩溃、进程提前退出或连接断开，都必须被翻译成结构化 observation，而不是让 `request` 抛出未处理异常直达循环。这样模型能基于 observation 换工具或报告失败，Harness 也能按既有规则决定停止原因。`initialize`、`mcp_tool_error`、`mcp_close_failed` 这些节点都要写入 `AgentEvent` 事件流，包含服务器名、方法名、耗时与结果码，绝不记录凭证或原始大响应。
+
+</Step>
+
+<Step id="test-mcp" number={6} title="用 Fake Transport 验证">
+创建 `tests/mcp.test.ts`，全部用例只使用 Fake Transport。先验证正向路径：`initialize` 与 `tools/list` 被依次调用，工具以 `mcp__<server>__<tool>` 注册进 `ToolRegistry`，并且 `registry.get(name)?.effect === "external"`。
+
+```typescript
+it("maps remote tools into namespaced external tools", async () => {
+  const transport = new FakeTransport({
+    initialize: () => ok({ protocolVersion: "2025-06-18" }),
+    "tools/list": () => ok({ tools: [{ name: "search", description: "Docs search", inputSchema: OBJECT_SCHEMA }] }),
+  });
+
+  await initializeServer(transport, context);
+  const tools = await listTools("docs", transport, context);
+  const registry = new ToolRegistry();
+  registerMcpTools(registry, tools.map(toLocalTool));
+
+  expect(registry.names()).toEqual(["mcp__docs__search"]);
+  expect(registry.get("mcp__docs__search")?.effect).toBe("external");
+  expect(transport.calls.map((call) => call.method)).toEqual(["initialize", "notifications/initialized", "tools/list"]);
+});
+```
+
+然后覆盖六组负向用例，每组都先注册一个同名本地工具或固定策略，确认失败是显式且可审计的：
+
+1. **未知工具**：模型调用 `mcp__docs__missing`，`executeToolCall` 返回 `unknown_tool` observation，Fake Transport 一次都没被调用；
+2. **Schema 不匹配**：`inputSchema` 缺少 `required` 字段或 `additionalProperties: false`，`prepare` 抛错并得到 `invalid_arguments`，远端调用次数为零；
+3. **服务器超时**：handler 永不返回，`timeoutMs` 到期后 `signal` 被中止，结果是与主线一致的 `timeout` observation；
+4. **重名覆盖**：工具名与本地 `read_file` 冲突时 `register` 抛错，注册表内容不变；
+5. **不可信只读声明**：带 `annotations.readOnlyHint: true` 的工具仍然走 `authorize`，策略返回 `deny` 或 `ask`，不会进入执行；
+6. **崩溃与关闭**：`tools/call` 返回传输错误时得到 `mcp_error` observation；取消传播后 `close()` 被调用一次，且没有未处理拒绝。
+
+最后在 `executeToolCall` 超时后断言 `FakeTransport` 记录到的 `signal.aborted === true`，确保信号真的传到了传输边界，而不是只停在 Executor 里。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test -- tests/mcp.test.ts">
+
+在 `apps/tutorial` 中执行该命令，预期 `pnpm typecheck` 通过，`tests/mcp.test.ts` 全部通过且没有任何真实网络调用。检查点必须同时满足六项：`mcp__docs__search` 以 `effect: "external"` 注册进 `ToolRegistry`；未知工具返回 `unknown_tool`；Schema 不匹配返回 `invalid_arguments` 且远端零调用；服务器超时返回 `timeout` 且 `signal.aborted` 为真；重名注册抛错且本地工具不被覆盖；只读声明不能绕过 `authorize`，崩溃被折叠成结构化 observation。任何一项失败，都说明 MCP 还没有真正接回主线的工具与权限边界。
+
+</Checkpoint>

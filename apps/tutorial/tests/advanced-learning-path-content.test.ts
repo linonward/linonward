@@ -1,42 +1,50 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-function lesson(name: string): string {
-  return readFileSync(
-    fileURLToPath(new URL(`../src/content/${name}.mdx`, import.meta.url)),
-    "utf8",
-  );
+import { checkpoint, codeText, lessonSource, listProp, stepIds } from "./support/lesson-source";
+
+function code(name: string): string {
+  return codeText(lessonSource(name));
 }
 
 describe("advanced learning path", () => {
   it("teaches persisted clarification and mid-run steering", () => {
-    const source = lesson("user-interaction");
+    const source = code("user-interaction");
 
-    expect(source).toContain("UserInputRequest");
-    expect(source).toContain("agent answer <run-id> <request-id>");
-    expect(source).toContain("goal_change");
-    expect(source).toContain("unexpected_user_input");
+    for (const marker of [
+      "UserInputRequest",
+      "agent answer <run-id> <request-id>",
+      "goal_change",
+      "unexpected_user_input",
+    ]) {
+      expect(source, `user interaction should keep ${marker}`).toContain(marker);
+    }
+    expect(stepIds(lessonSource("user-interaction"))).toContain("persist-user-request");
   });
 
   it("teaches traces, task datasets, layered graders, and regression gates", () => {
-    const source = lesson("observability-evaluation");
+    const source = code("observability-evaluation");
+    const lesson = lessonSource("observability-evaluation");
 
     expect(source).toContain("TraceEvent");
     expect(source).toContain("RunUsage");
-    expect(source).toContain("evals/cases.jsonl");
-    expect(source).toContain("确定性 grader");
-    expect(source).toContain("安全回归门禁");
+    expect(listProp(lesson, "LessonOverview", "files")).toContain("evals/cases.jsonl");
+    expect(checkpoint(lesson)?.command).toContain("tests/eval.test.ts");
   });
 
   it("finishes with a matrix that includes interaction, attacks, and recovery", () => {
-    const source = lesson("capstone");
+    const source = code("capstone");
+    const lesson = lessonSource("capstone");
 
-    expect(source).toContain("evals/capstone.jsonl");
-    expect(source).toContain("请求澄清");
-    expect(source).toContain("Prompt injection");
-    expect(source).toContain("副作用只发生一次");
+    expect(listProp(lesson, "LessonOverview", "files")).toContain("evals/capstone.jsonl");
+    expect(source).toContain("runCapstoneSuite");
     expect(source).toContain("correctlyBlockedCases");
+    expect(stepIds(lesson)).toEqual(
+      expect.arrayContaining([
+        "define-matrix",
+        "run-capstone",
+        "inject-failures",
+        "review-evidence",
+      ]),
+    );
   });
 });

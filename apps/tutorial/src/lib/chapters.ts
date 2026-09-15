@@ -5,17 +5,23 @@ export interface TableOfContentsItem {
   title: string;
 }
 
-interface ChapterModule {
+export interface ChapterModule {
   default: ComponentType;
 }
 
 export const tutorialGoal =
   "通过逐章可运行的增量，理解 Agent 的模型、上下文、任务状态、规划、工具、Skills 与 Agent Loop 等关键组件，并从零构建一个由 Harness 约束、不依赖 Agent 框架的可用 Agent。";
 
-export interface Chapter {
+export type ChapterTrack = "core" | "extension";
+
+/**
+ * 主线与扩展篇共用的章节契约。顺序、编号与轨道由各自模块的有序定义数组派生，
+ * 不要再新增一份手写的顺序列表。
+ */
+export interface TutorialChapter {
   slug: string;
   number: string;
-  track: "core";
+  track: ChapterTrack;
   title: string;
   label: string;
   minutes: number;
@@ -24,46 +30,30 @@ export interface Chapter {
   load: () => Promise<ChapterModule>;
 }
 
-export interface TutorialExtension {
-  id: string;
-  title: string;
-  description: string;
+export interface Chapter extends TutorialChapter {
+  track: "core";
 }
 
-export const tutorialExtensions: TutorialExtension[] = [
-  {
-    id: "multi-agent",
-    title: "多 Agent 协作",
-    description: "在单 Agent 边界稳定后，增加角色分工、任务交接和结果归并。",
-  },
-  {
-    id: "mcp",
-    title: "MCP 集成",
-    description: "把外部 MCP Server 适配到已有的工具、资源、权限和审计边界。",
-  },
-  {
-    id: "rag",
-    title: "RAG 与知识库",
-    description: "增加切分、索引、检索、引用和检索质量评测。",
-  },
-  {
-    id: "browser-automation",
-    title: "浏览器操作",
-    description: "把页面观测、交互、会话和高风险动作并入 Harness 约束。",
-  },
-  {
-    id: "voice",
-    title: "语音 Agent",
-    description: "处理实时输入输出、打断、转录、延迟和会话状态。",
-  },
-  {
-    id: "parallel-orchestration",
-    title: "复杂并行调度",
-    description: "在可证明独立的工作上引入并行、背压、取消、部分失败和确定性归并。",
-  },
-];
+export interface ExtensionChapter extends TutorialChapter {
+  track: "extension";
+  prerequisites: string;
+}
 
-const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
+/** 目录页与阅读壳层接受的可辨识联合：`track` 是判别字段。 */
+export type AnyChapter = Chapter | ExtensionChapter;
+
+export type ChapterDefinition = Omit<Chapter, "number" | "track">;
+export type ExtensionChapterDefinition = Omit<ExtensionChapter, "number" | "track">;
+
+export function numberChapter(index: number): string {
+  return index.toString().padStart(2, "0");
+}
+
+/**
+ * 主线的唯一事实源：数组顺序就是学习顺序，编号由下标派生。
+ * 新增章节时只在这里插入，不要再维护第二份顺序数组。
+ */
+const coreChapterDefinitions: ChapterDefinition[] = [
   {
     slug: "start",
     title: "开始",
@@ -112,34 +102,6 @@ const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
     load: () => import("../content/context-and-prompt.mdx"),
   },
   {
-    slug: "task-state",
-    title: "任务与状态",
-    label: "任务与状态",
-    minutes: 30,
-    description: "把一句自然语言请求转换成可以持续推进的任务状态。",
-    toc: [
-      { id: "define-messages", title: "定义消息" },
-      { id: "define-state", title: "定义状态" },
-      { id: "initialize-state", title: "从 CLI 初始化状态" },
-      { id: "enforce-transitions", title: "执行合法状态转换" },
-      { id: "test-state-machine", title: "测试状态机路径" },
-    ],
-    load: () => import("../content/task-state.mdx"),
-  },
-  {
-    slug: "task-planning",
-    title: "任务分解与规划",
-    label: "任务与规划",
-    minutes: 75,
-    description: "把用户目标拆成可执行步骤，用证据推进，并在计划失效时重规划。",
-    toc: [
-      { id: "plan-generation", title: "实验一：生成与校验" },
-      { id: "plan-progress", title: "实验二：推进与重规划" },
-      { id: "plan-verification", title: "实验三：测试与验收" },
-    ],
-    load: () => import("../content/task-planning.mdx"),
-  },
-  {
     slug: "agent-harness",
     title: "最小 Agent Loop",
     label: "最小 Agent Loop",
@@ -172,6 +134,102 @@ const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
     load: () => import("../content/tool-system.mdx"),
   },
   {
+    slug: "understand-repository",
+    title: "读懂仓库",
+    label: "读懂仓库",
+    minutes: 25,
+    description: "提供受控的文件搜索与读取能力。",
+    toc: [
+      { id: "safe-path", title: "限制所有路径在工作区内" },
+      { id: "read-file", title: "实现读取工具" },
+      { id: "search-text", title: "实现搜索工具" },
+      { id: "register-read-tools", title: "注册工具并收紧提示词" },
+    ],
+    load: () => import("../content/understand-repository.mdx"),
+  },
+  {
+    slug: "edit-code",
+    title: "修改代码",
+    label: "修改代码",
+    minutes: 35,
+    description: "通过补丁完成可审查、可追踪的文件修改。",
+    toc: [
+      { id: "write-file", title: "带前置条件的写入工具" },
+      { id: "track-files", title: "记录所有变更文件" },
+      { id: "update-prompt", title: "要求模型先读再写" },
+    ],
+    load: () => import("../content/edit-code.mdx"),
+  },
+  {
+    slug: "run-validation",
+    title: "运行验证",
+    label: "运行验证",
+    minutes: 30,
+    description: "让 Agent 用真实命令证明工作已经完成。",
+    toc: [
+      { id: "run-command", title: "无 Shell 的命令工具" },
+      { id: "record-validation", title: "记录验证证据" },
+      { id: "completion-gate", title: "加入完成门禁" },
+    ],
+    load: () => import("../content/run-validation.mdx"),
+  },
+  {
+    slug: "task-state",
+    title: "任务与状态",
+    label: "任务与状态",
+    minutes: 30,
+    description: "把一句自然语言请求转换成可以持续推进的任务状态。",
+    toc: [
+      { id: "define-messages", title: "定义消息" },
+      { id: "define-state", title: "定义状态" },
+      { id: "initialize-state", title: "从 CLI 初始化状态" },
+      { id: "enforce-transitions", title: "执行合法状态转换" },
+      { id: "test-state-machine", title: "测试状态机路径" },
+    ],
+    load: () => import("../content/task-state.mdx"),
+  },
+  {
+    slug: "permissions-safety",
+    title: "权限与安全",
+    label: "权限与安全",
+    minutes: 35,
+    description: "用策略层限制副作用，并在必要时请求人工确认。",
+    toc: [
+      { id: "risk-levels", title: "给工具标记风险等级" },
+      { id: "authorize", title: "执行前应用授权策略" },
+      { id: "final-run", title: "验收权限策略" },
+    ],
+    load: () => import("../content/permissions-safety.mdx"),
+  },
+  {
+    slug: "task-planning",
+    title: "任务分解与规划",
+    label: "任务与规划",
+    minutes: 75,
+    description: "把用户目标拆成可执行步骤，用证据推进，并在计划失效时重规划。",
+    toc: [
+      { id: "plan-generation", title: "实验一：生成与校验" },
+      { id: "plan-progress", title: "实验二：推进与重规划" },
+      { id: "plan-verification", title: "实验三：测试与验收" },
+    ],
+    load: () => import("../content/task-planning.mdx"),
+  },
+  {
+    slug: "user-interaction",
+    title: "用户澄清与中途转向",
+    label: "用户交互与转向",
+    minutes: 40,
+    description: "让 Agent 能提出问题、等待回答，并在用户改变目标时安全修订运行。",
+    toc: [
+      { id: "clarify-contract", title: "定义澄清契约" },
+      { id: "persist-user-request", title: "持久化等待请求" },
+      { id: "resume-with-input", title: "用用户输入恢复" },
+      { id: "steer-active-run", title: "处理中途转向" },
+      { id: "test-interaction", title: "测试交互状态机" },
+    ],
+    load: () => import("../content/user-interaction.mdx"),
+  },
+  {
     slug: "progressive-skills",
     title: "Skills 渐进式加载",
     label: "Skills 渐进加载",
@@ -187,6 +245,21 @@ const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
       { id: "test-progressive-loading", title: "测试渐进式加载" },
     ],
     load: () => import("../content/progressive-skills.mdx"),
+  },
+  {
+    slug: "observability-evaluation",
+    title: "可观测性与评测",
+    label: "可观测性与评测",
+    minutes: 55,
+    description: "用结构化 Trace、任务数据集和回归门禁衡量 Agent 是否真的变好。",
+    toc: [
+      { id: "define-trace", title: "定义 Trace 契约" },
+      { id: "record-usage", title: "记录用量与延迟" },
+      { id: "build-eval-suite", title: "建立任务评测集" },
+      { id: "grade-outcomes", title: "分层判定结果" },
+      { id: "regression-gate", title: "建立回归门禁" },
+    ],
+    load: () => import("../content/observability-evaluation.mdx"),
   },
   {
     slug: "agent-loop",
@@ -239,89 +312,6 @@ const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
     load: () => import("../content/long-running-recovery.mdx"),
   },
   {
-    slug: "understand-repository",
-    title: "读懂仓库",
-    label: "读懂仓库",
-    minutes: 25,
-    description: "提供受控的文件搜索与读取能力。",
-    toc: [
-      { id: "safe-path", title: "限制所有路径在工作区内" },
-      { id: "read-file", title: "实现读取工具" },
-      { id: "search-text", title: "实现搜索工具" },
-      { id: "register-read-tools", title: "注册工具并收紧提示词" },
-    ],
-    load: () => import("../content/understand-repository.mdx"),
-  },
-  {
-    slug: "edit-code",
-    title: "修改代码",
-    label: "修改代码",
-    minutes: 35,
-    description: "通过补丁完成可审查、可追踪的文件修改。",
-    toc: [
-      { id: "write-file", title: "带前置条件的写入工具" },
-      { id: "track-files", title: "记录所有变更文件" },
-      { id: "update-prompt", title: "要求模型先读再写" },
-    ],
-    load: () => import("../content/edit-code.mdx"),
-  },
-  {
-    slug: "run-validation",
-    title: "运行验证",
-    label: "运行验证",
-    minutes: 30,
-    description: "让 Agent 用真实命令证明工作已经完成。",
-    toc: [
-      { id: "run-command", title: "无 Shell 的命令工具" },
-      { id: "record-validation", title: "记录验证证据" },
-      { id: "completion-gate", title: "加入完成门禁" },
-    ],
-    load: () => import("../content/run-validation.mdx"),
-  },
-  {
-    slug: "permissions-safety",
-    title: "权限与安全",
-    label: "权限与安全",
-    minutes: 35,
-    description: "用策略层限制副作用，并在必要时请求人工确认。",
-    toc: [
-      { id: "risk-levels", title: "给工具标记风险等级" },
-      { id: "authorize", title: "执行前应用授权策略" },
-      { id: "final-run", title: "验收权限策略" },
-    ],
-    load: () => import("../content/permissions-safety.mdx"),
-  },
-  {
-    slug: "user-interaction",
-    title: "用户澄清与中途转向",
-    label: "用户交互与转向",
-    minutes: 40,
-    description: "让 Agent 能提出问题、等待回答，并在用户改变目标时安全修订运行。",
-    toc: [
-      { id: "clarify-contract", title: "定义澄清契约" },
-      { id: "persist-user-request", title: "持久化等待请求" },
-      { id: "resume-with-input", title: "用用户输入恢复" },
-      { id: "steer-active-run", title: "处理中途转向" },
-      { id: "test-interaction", title: "测试交互状态机" },
-    ],
-    load: () => import("../content/user-interaction.mdx"),
-  },
-  {
-    slug: "observability-evaluation",
-    title: "可观测性与评测",
-    label: "可观测性与评测",
-    minutes: 55,
-    description: "用结构化 Trace、任务数据集和回归门禁衡量 Agent 是否真的变好。",
-    toc: [
-      { id: "define-trace", title: "定义 Trace 契约" },
-      { id: "record-usage", title: "记录用量与延迟" },
-      { id: "build-eval-suite", title: "建立任务评测集" },
-      { id: "grade-outcomes", title: "分层判定结果" },
-      { id: "regression-gate", title: "建立回归门禁" },
-    ],
-    load: () => import("../content/observability-evaluation.mdx"),
-  },
-  {
     slug: "capstone",
     title: "综合 Capstone",
     label: "综合 Capstone",
@@ -337,33 +327,11 @@ const chapterDefinitions: Array<Omit<Chapter, "number" | "track">> = [
   },
 ];
 
-const chapterOrder = [
-  "start",
-  "model-call",
-  "context-and-prompt",
-  "agent-harness",
-  "tool-system",
-  "understand-repository",
-  "edit-code",
-  "run-validation",
-  "task-state",
-  "permissions-safety",
-  "task-planning",
-  "user-interaction",
-  "progressive-skills",
-  "observability-evaluation",
-  "agent-loop",
-  "context-compaction",
-  "long-running-recovery",
-  "capstone",
-] as const;
-
-export const chapters: Chapter[] = chapterOrder.map((slug, index) => {
-  const chapter = chapterDefinitions.find((candidate) => candidate.slug === slug);
-  if (!chapter) throw new Error(`Missing tutorial chapter: ${slug}`);
-
-  return { ...chapter, number: index.toString().padStart(2, "0"), track: "core" };
-});
+export const chapters: Chapter[] = coreChapterDefinitions.map((definition, index) => ({
+  ...definition,
+  number: numberChapter(index),
+  track: "core",
+}));
 
 export function getChapter(slug: string): Chapter | undefined {
   return chapters.find((chapter) => chapter.slug === slug);
@@ -383,4 +351,8 @@ export function getChapterNeighbors(slug: string): {
     previous: chapters[index - 1],
     next: chapters[index + 1],
   };
+}
+
+export function totalMinutes(items: readonly { minutes: number }[]): number {
+  return items.reduce((sum, item) => sum + item.minutes, 0);
 }
