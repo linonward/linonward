@@ -82,6 +82,8 @@ export interface AgentRuntime {
   onToolCall?: AgentLoopOptions["onToolCall"];
   /** 成本估算接线；透传给 `AgentLoopOptions.pricing`（缺省 → `cost=unknown`）。 */
   pricing?: LoopPricing | undefined;
+  /** 连续相同工具调用的护栏；透传给 `AgentLoopOptions.repeatGuard`（缺省 → 开启）。 */
+  repeatGuard?: boolean | undefined;
 }
 
 export { CONTEXT_KINDS, fromDurableState, isContextKind, toDurableState } from "./durable-state.js";
@@ -346,6 +348,7 @@ export function loopOptionsFromRuntime(
     onEvent: runtime.onEvent,
     onToolCall: runtime.onToolCall,
     pricing: runtime.pricing,
+    repeatGuard: runtime.repeatGuard,
     compaction: runtime.compaction,
     persistence: lease ? { store: runtime.store, lease } : undefined,
   };

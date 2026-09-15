@@ -1,7 +1,12 @@
-import type { AgentLoopEvent, PlanRevisedDetail } from "./agent-loop.js";
+import type {
+  AgentLoopEvent,
+  BudgetExhaustedDetail,
+  BudgetExhaustedToolCall,
+  PlanRevisedDetail,
+} from "./agent-loop.js";
 import { formatCostUsd } from "./pricing.js";
 import { formatUsageNumber } from "./trace.js";
-import type { AgentResult, AgentState } from "./types.js";
+import type { AgentResult, AgentState, PlanStep } from "./types.js";
 
 /**
  * `--verbose` 的**有界**详情输出：单条详情与列表长度都有上限，
@@ -207,6 +212,228 @@ export function planBlockedSummaryLines(result: AgentResult): string[] {
   ];
 }
 
+const PLAN_STEP_STATUSES: ReadonlySet<string> = new Set([
+  "pending",
+  "in_progress",
+  "completed",
+  "blocked",
+]);
+
+function isPlanStepStatus(value: unknown): value is PlanStep["status"] {
+  return typeof value === "string" && PLAN_STEP_STATUSES.has(value);
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+/** 有界数组读取：逐项做形状检查，坏项直接丢弃（不猜值）。 */
+function boundedArray<Item>(value: unknown, map: (item: unknown) => Item | undefined): Item[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const mapped = map(item);
+    return mapped === undefined ? [] : [mapped];
+  });
+}
+
+function pendingStepFrom(
+  value: unknown,
+): BudgetExhaustedDetail["pendingSteps"][number] | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = value["id"];
+  const status = value["status"];
+  if (typeof id !== "string" || !isPlanStepStatus(status)) return undefined;
+  return {
+    id,
+    status,
+    dependsOn: stringArray(value["dependsOn"]),
+    unmetDependencies: stringArray(value["unmetDependencies"]),
+  };
+}
+
+function toolCallFrom(value: unknown): BudgetExhaustedToolCall | undefined {
+  if (!isRecord(value)) return undefined;
+  const name = value["name"];
+  const ok = value["ok"];
+  const repeated = value["repeated"];
+  if (typeof name !== "string" || typeof ok !== "boolean" || typeof repeated !== "boolean") {
+    return undefined;
+  }
+  const entry: BudgetExhaustedToolCall = { name, ok, repeated };
+  const errorCode = value["errorCode"];
+  if (typeof errorCode === "string") entry.errorCode = errorCode;
+  return entry;
+}
+
+function activeStepFrom(value: unknown): BudgetExhaustedDetail["activeStep"] {
+  if (!isRecord(value) || !isPlanStepStatus(value["status"])) return undefined;
+  const completionEvidence = value["completionEvidence"];
+  return {
+    status: value["status"],
+    dependsOn: stringArray(value["dependsOn"]),
+    completionEvidence: typeof completionEvidence === "string" ? completionEvidence : "",
+  };
+}
+
+/**
+ * 从 `state.events` 里读回最后一条 `budget_exhausted`。事件由 Loop 自己写出，
+ * 这里只做形状校验：解析失败或字段缺失就返回 `undefined`，绝不猜值。
+ */
+export function readBudgetExhaustedDetail(state: AgentState): BudgetExhaustedDetail | undefined {
+  const event = [...state.events]
+    .reverse()
+    .find((candidate) => candidate.type === "budget_exhausted");
+  if (event === undefined) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.detail);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+
+  const reason = parsed["reason"];
+  if (reason !== "max_steps" && reason !== "max_tool_calls") return undefined;
+
+  const budget = parsed["budget"];
+  const usage = parsed["usage"];
+  if (!isRecord(budget) || !isRecord(usage)) return undefined;
+
+  const modelSteps = numberField(budget["modelSteps"]);
+  const maxSteps = numberField(budget["maxSteps"]);
+  const toolCalls = numberField(budget["toolCalls"]);
+  const maxToolCalls = numberField(budget["maxToolCalls"]);
+  const modelCalls = numberField(usage["modelCalls"]);
+  const usageToolCalls = numberField(usage["toolCalls"]);
+  const durationMs = numberField(usage["durationMs"]);
+  const cost = usage["cost"];
+  if (
+    modelSteps === undefined ||
+    maxSteps === undefined ||
+    toolCalls === undefined ||
+    maxToolCalls === undefined ||
+    modelCalls === undefined ||
+    usageToolCalls === undefined ||
+    durationMs === undefined ||
+    typeof cost !== "string"
+  ) {
+    return undefined;
+  }
+
+  const detail: BudgetExhaustedDetail = {
+    type: "budget_exhausted",
+    reason,
+    budget: { modelSteps, maxSteps, toolCalls, maxToolCalls },
+    usage: { modelCalls, toolCalls: usageToolCalls, durationMs, cost },
+    pendingSteps: boundedArray(parsed["pendingSteps"], pendingStepFrom),
+    pendingStepsOmitted: numberField(parsed["pendingStepsOmitted"]) ?? 0,
+    recentToolCalls: boundedArray(parsed["recentToolCalls"], toolCallFrom),
+    recentToolCallsOmitted: numberField(parsed["recentToolCallsOmitted"]) ?? 0,
+  };
+
+  const inputTokens = numberField(usage["inputTokens"]);
+  if (inputTokens !== undefined) detail.usage.inputTokens = inputTokens;
+  const outputTokens = numberField(usage["outputTokens"]);
+  if (outputTokens !== undefined) detail.usage.outputTokens = outputTokens;
+  const cachedInputTokens = numberField(usage["cachedInputTokens"]);
+  if (cachedInputTokens !== undefined) detail.usage.cachedInputTokens = cachedInputTokens;
+  const estimatedCostUsd = numberField(usage["estimatedCostUsd"]);
+  if (estimatedCostUsd !== undefined) detail.usage.estimatedCostUsd = estimatedCostUsd;
+
+  const activeStepId = parsed["activeStepId"];
+  if (typeof activeStepId === "string") detail.activeStepId = activeStepId;
+  const activeStep = activeStepFrom(parsed["activeStep"]);
+  if (activeStep !== undefined) detail.activeStep = activeStep;
+  const lastReplanReason = parsed["lastReplanReason"];
+  if (typeof lastReplanReason === "string") detail.lastReplanReason = lastReplanReason;
+
+  return detail;
+}
+
+/** 有界列表：逐项截断 + 最多 20 项，省略项写 `(+N)`（与 `plan_blocked` 同一口径）。 */
+function boundedJoined(items: readonly string[], total: number = items.length): string {
+  const shown = items.slice(0, MAX_VERBOSE_LIST_ITEMS).map((item) => truncateVerboseDetail(item));
+  if (shown.length === 0) return "(none)";
+  const omitted = total - shown.length;
+  const body = shown.join(", ");
+  return omitted > 0 ? `${body}(+${omitted})` : body;
+}
+
+/** 重复调用按工具名归并：`apply_patch x2`。 */
+function repeatedCallLabels(calls: readonly BudgetExhaustedToolCall[]): string[] {
+  const counts = new Map<string, number>();
+  for (const call of calls) {
+    if (!call.repeated) continue;
+    counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([name, count]) => `${name} x${count}`);
+}
+
+const BUDGET_REPEAT_HINT =
+  "模型在重复同一个工具调用，考虑检查 observation 是否足以让它继续，或提高 --max-tool-calls / 换更强模型";
+const BUDGET_UNFINISHED_HINT = "预算耗尽但计划未完成，可提高 --max-steps 或拆分任务";
+
+/** 依事实生成的可操作提示：重复调用优先于"计划没做完"。 */
+function budgetHint(detail: BudgetExhaustedDetail): string | undefined {
+  if (detail.recentToolCalls.some((call) => call.repeated)) return BUDGET_REPEAT_HINT;
+  if (detail.pendingSteps.length > 0 || detail.pendingStepsOmitted > 0) {
+    return BUDGET_UNFINISHED_HINT;
+  }
+  return undefined;
+}
+
+/**
+ * `max_steps` / `max_tool_calls` 的汇总：卡在哪个步骤、最后几次工具调用结果如何、
+ * 是否在原地打转、还差哪些步骤，最后给一条可操作提示。
+ *
+ * 全部沿用 200 字符 / 20 项上限；`hint` 依据事实生成，没有可说的就不加。
+ */
+export function budgetExhaustedSummaryLines(result: AgentResult): string[] {
+  if (result.stopReason !== "max_steps" && result.stopReason !== "max_tool_calls") return [];
+
+  const { state } = result;
+  const budget = `modelSteps=${state.budget.modelSteps}/${state.budget.maxSteps}, toolCalls=${state.budget.toolCalls}/${state.budget.maxToolCalls}`;
+  const detail = readBudgetExhaustedDetail(state);
+  if (detail === undefined) {
+    return [
+      `[summary] stopped: ${result.stopReason} (${budget})`,
+      "[summary] stopped detail: reason unavailable",
+    ];
+  }
+
+  const lastTools = detail.recentToolCalls.map(
+    (call) => `${call.name}(${call.ok ? "ok" : (call.errorCode ?? "failed")})`,
+  );
+  const active =
+    detail.activeStepId === undefined
+      ? "(none)"
+      : detail.activeStep === undefined
+        ? detail.activeStepId
+        : `${detail.activeStepId}(status=${detail.activeStep.status})`;
+  const pendingIds = detail.pendingSteps.map((step) => step.id);
+
+  const lines = [
+    `[summary] stopped: ${detail.reason} (modelSteps=${detail.budget.modelSteps}/${detail.budget.maxSteps}, toolCalls=${detail.budget.toolCalls}/${detail.budget.maxToolCalls})`,
+    [
+      `[summary] stopped detail: active=${active}`,
+      `last tools=${boundedJoined(lastTools, lastTools.length + detail.recentToolCallsOmitted)}`,
+      `repeated=${boundedJoined(repeatedCallLabels(detail.recentToolCalls))}`,
+      `pending=${boundedJoined(pendingIds, pendingIds.length + detail.pendingStepsOmitted)}`,
+    ].join("; "),
+  ];
+
+  const hint = budgetHint(detail);
+  if (hint !== undefined) lines.push(`[summary] hint: ${hint}`);
+  return lines;
+}
+
 /**
  * 工具观测摘要取自最终结果的 `state.contextSources`（`kind: "tool_observation"`），
  * 而不是 `state.steps`：只有前者同时带着 callId、工具名/标签与完整输出，才够推出
@@ -277,6 +504,7 @@ function summaryLines(
     `[summary] changedFiles=${boundedList(state.changedFiles)} validations=${state.validations.length}`,
     `[summary] trace=${boundedList(trace.types, trace.total)}`,
     ...planBlockedSummaryLines(result),
+    ...budgetExhaustedSummaryLines(result),
   ];
 }
 

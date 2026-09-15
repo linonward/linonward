@@ -70,6 +70,7 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | `--verbose` | 在 stderr 上追加**完整运行日志**：模型的真实输入与输出（system prompt 全文、每条输入消息全文、`finalText` 全文、`toolCalls` 的 `argumentsJson` 全文）、完整工具链（每个调用的 `argsJson` 与 observation `output` 全文、`ok` / `effect` / `errorCode` 与策略决定），以及既有的每个 Loop 事件一行（`[event] ...`）与运行结束汇总（`[summary] ...`）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
 | `--log <path>` | 把 `--verbose` 的同一条日志额外以 **JSONL** 追加写入文件（每行一个 JSON 对象，带 `kind` / `at` / `durationMs`），文件不存在则创建。只在 `--verbose` 打开时生效；`--verbose` 关闭时不会创建任何日志文件 |
 | `--no-truncate` | 关闭单条内容默认 `20000` 字符的上限；打开时会在 stderr 顶部打印一行警告。只在 `--verbose` 打开时生效 |
+| `--no-repeat-guard` | 关闭"连续相同工具调用"护栏（**默认开启**，属于 Harness 约束）。第 `2` 次 `name + 规范化 args` 完全相同的调用会追加一条 `harness_feedback`（priority `100`）提醒模型；第 `3` 次不再执行，直接返回结构化 `repeated_tool_call` observation 并记为失败尝试。同名但参数不同的正常重试不受影响 |
 
 `--verbose` 的日志分为两类：
 
@@ -160,6 +161,22 @@ peak / off-peak 两档（off-peak 恰好是 peak 的一半），内置表取 **p
 工具失败的 `[tool]` 行也补齐了原因：`ok=false` 之外还有 `error=<code>`（来自 observation 的
 `error` 字段）与截断到 `120` 字符的 `reason=<message>`；JSONL 的 `kind: "tool_result"` 记录里是
 `error` / `reason` 两个字段。
+
+### 预算耗尽说清"卡在哪、还差什么"
+
+`max_steps` / `max_tool_calls` 停止时，Loop 会先登记一条**有界**的 `budget_exhausted` 运行时事件
+（`reason` / `budget` / `usage`（含 `formatCostUsd` 后的 `cost`）/ 活动步骤 / `pendingSteps` /
+最近 ≤`5` 次工具调用（带 `repeated`）/ `lastReplanReason`），`--verbose` 的汇总据此追加：
+
+```text
+[summary] stopped: max_steps (modelSteps=16/16, toolCalls=22/32)
+[summary] stopped detail: active=step-3(status=in_progress); last tools=read_file(ok), apply_patch(file_changed); repeated=apply_patch x2; pending=step-3, step-4(+1)
+[summary] hint: 模型在重复同一个工具调用，考虑检查 observation 是否足以让它继续，或提高 --max-tool-calls / 换更强模型
+```
+
+`hint` 依事实生成：有重复调用时提示检查 observation / 提高 `--max-tool-calls`；否则若计划仍未完成，
+提示提高 `--max-steps` 或拆分任务。`--log` 里多出一条 `kind: "budget_exhausted"` 记录，字段与事件
+`detail` 一致；**默认路径仍然一行都不多**（`budget_exhausted` 只进内存事件日志，不改变 canonicalJson 事件流）。
 
 
 > **日志可能含敏感内容**：完整日志记录模型 payload、工具参数与工具结果的**原文**，仓库文件内容、

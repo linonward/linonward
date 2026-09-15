@@ -9,8 +9,13 @@ import {
   runAgentLoop,
 } from "./agent-loop.js";
 import { canonicalJson } from "./checkpoint.js";
-import { formatRunUsageLine, type Journal, type JournalRunUsage } from "./cli-journal.js";
-import { createVerboseObserver } from "./cli-verbose.js";
+import {
+  formatBudgetExhaustedLine,
+  formatRunUsageLine,
+  type Journal,
+  type JournalRunUsage,
+} from "./cli-journal.js";
+import { createVerboseObserver, readBudgetExhaustedDetail } from "./cli-verbose.js";
 import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
@@ -260,6 +265,13 @@ export async function runCli(
       const entry = runUsageEntry(result, options.pricing);
       if (options.journal?.active === true) options.journal.usage(entry);
       else io.stderr(formatRunUsageLine(entry));
+
+      // 预算耗尽的诊断：JSONL（`kind: "budget_exhausted"`）+ 一行可读摘要。
+      const budget = readBudgetExhaustedDetail(result.state);
+      if (budget !== undefined) {
+        if (options.journal?.active === true) options.journal.budgetExhausted(budget);
+        else io.stderr(formatBudgetExhaustedLine(budget));
+      }
     }
     return exitCodeFor(result);
   } finally {
@@ -291,6 +303,8 @@ export interface AgentCliOptions {
   onToolCall?: AgentLoopOptions["onToolCall"];
   /** 成本估算接线；由装配层从模型 id + 价目表解析。 */
   pricing?: LoopPricing | undefined;
+  /** 连续相同工具调用的护栏；缺省开启，`false` 时透传给 Loop 关闭。 */
+  repeatGuard?: boolean | undefined;
 }
 
 export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput): AgentRuntime {
@@ -313,6 +327,7 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     onEvent: input.onEvent,
     onToolCall: base.onToolCall,
     pricing: base.pricing,
+    repeatGuard: base.repeatGuard,
   };
 }
 

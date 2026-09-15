@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import type { BudgetExhaustedDetail } from "../src/agent-loop.js";
 import {
   createJournal,
   createJournalModelDriver,
@@ -447,6 +448,71 @@ describe("journal plan_revised records", () => {
       });
       // 可读行由 verbose 的 `[event] plan_revised ...` 负责：这里不重复打印。
       expect(lines.filter((line) => line.startsWith("[plan]"))).toHaveLength(0);
+    } finally {
+      await removeTempDir(directory);
+    }
+  });
+});
+
+describe("journal budget_exhausted records", () => {
+  it("写可读摘要行与 kind=budget_exhausted JSONL（字段与事件 detail 一致）", async () => {
+    const directory = await makeTempDir("journal-budget-");
+    try {
+      const logPath = join(directory, "journal.jsonl");
+      const { lines, write } = collector();
+      const journal = createJournal({ verbose: true, logPath, truncate: true, write });
+      const detail: BudgetExhaustedDetail = {
+        type: "budget_exhausted",
+        reason: "max_tool_calls",
+        budget: { modelSteps: 16, maxSteps: 16, toolCalls: 22, maxToolCalls: 32 },
+        usage: {
+          inputTokens: 1234,
+          outputTokens: 256,
+          cachedInputTokens: 1024,
+          modelCalls: 16,
+          toolCalls: 22,
+          durationMs: 3210,
+          estimatedCostUsd: 0.000123,
+          cost: "$0.000123",
+        },
+        activeStepId: "step-3",
+        activeStep: { status: "in_progress", dependsOn: [], completionEvidence: "证据" },
+        pendingSteps: [
+          {
+            id: "step-3",
+            status: "in_progress",
+            dependsOn: [],
+            unmetDependencies: [],
+          },
+        ],
+        pendingStepsOmitted: 0,
+        recentToolCalls: [{ name: "read_file", ok: true, repeated: false }],
+        recentToolCallsOmitted: 0,
+        lastReplanReason: "failed_assumption",
+      };
+
+      journal.budgetExhausted(detail);
+      journal.close();
+
+      expect(lines).toEqual([
+        "[budget] exhausted reason=max_tool_calls modelSteps=16/16 toolCalls=22/32 cost=$0.000123 active=step-3 pending=1",
+      ]);
+
+      const records = (await readFile(logPath, "utf8"))
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(records[0]).toMatchObject({
+        kind: "budget_exhausted",
+        reason: "max_tool_calls",
+        budget: { modelSteps: 16, maxSteps: 16, toolCalls: 22, maxToolCalls: 32 },
+        usage: { modelCalls: 16, toolCalls: 22, cost: "$0.000123" },
+        activeStepId: "step-3",
+        lastReplanReason: "failed_assumption",
+      });
+      expect(records[0]?.["recentToolCalls"]).toEqual([
+        { name: "read_file", ok: true, repeated: false },
+      ]);
     } finally {
       await removeTempDir(directory);
     }

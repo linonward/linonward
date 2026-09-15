@@ -39,7 +39,7 @@ import type { ToolRegistry } from "./tool-registry.js";
 import type { Clock } from "./types.js";
 
 export const AGENT_USAGE =
-  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose] [--log <path>] [--no-truncate]";
+  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose] [--log <path>] [--no-truncate] [--no-repeat-guard]";
 
 /** 与 `runRealTask` 保持同一组预算默认值：CLI 与真实通路不各自定义一套。 */
 export const AGENT_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
@@ -54,6 +54,7 @@ const MAX_TOOL_CALLS_FLAG = "--max-tool-calls";
 const VERBOSE_FLAG = "--verbose";
 const LOG_FLAG = "--log";
 const NO_TRUNCATE_FLAG = "--no-truncate";
+const NO_REPEAT_GUARD_FLAG = "--no-repeat-guard";
 
 /** `--allow` 收集 argv 时遇到这些开关就停：它们属于 CLI，不属于被允许的命令。 */
 const KNOWN_FLAGS: ReadonlySet<string> = new Set([
@@ -66,6 +67,7 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   VERBOSE_FLAG,
   LOG_FLAG,
   NO_TRUNCATE_FLAG,
+  NO_REPEAT_GUARD_FLAG,
 ]);
 
 function usageError(detail: string): Error {
@@ -93,6 +95,8 @@ export interface AgentCliConfig {
   logPath?: string | undefined;
   /** `--no-truncate`：关闭单条内容 20000 字符上限。只在 `--verbose` 打开时生效。 */
   noTruncate: boolean;
+  /** 连续相同工具调用的护栏，默认开启；`--no-repeat-guard` 关闭。 */
+  repeatGuard: boolean;
 }
 
 /**
@@ -100,11 +104,12 @@ export interface AgentCliConfig {
  *
  * 子命令仍交给 `parseCliArgs` 解析（保持与既有 CLI 契约一致）；这里只负责把
  * `--cwd` / `--allow` / `--require-sandbox` / `--approve-allowed` / `--max-steps` /
- * `--max-tool-calls` / `--verbose` / `--log` / `--no-truncate` 从位置参数里摘出来。
+ * `--max-tool-calls` / `--verbose` / `--log` / `--no-truncate` / `--no-repeat-guard`
+ * 从位置参数里摘出来。
  * `--allow` 每次吞掉一个完整 argv，直到下一个已识别的 CLI flag 为止，因此可以重复出现。
  *
- * 布尔开关（`--require-sandbox` / `--approve-allowed` / `--verbose` / `--no-truncate`）
- * 只看"出现过"，放在子命令前或后都一样，重复出现也不报错。
+ * 布尔开关（`--require-sandbox` / `--approve-allowed` / `--verbose` / `--no-truncate` /
+ * `--no-repeat-guard`）只看"出现过"，放在子命令前或后都一样，重复出现也不报错。
  */
 export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; command: CliCommand } {
   const positionals: string[] = [];
@@ -117,6 +122,7 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   let verbose = false;
   let logPath: string | undefined;
   let noTruncate = false;
+  let repeatGuard = true;
 
   let index = 0;
   while (index < argv.length) {
@@ -189,6 +195,11 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       continue;
     }
 
+    if (token === NO_REPEAT_GUARD_FLAG) {
+      repeatGuard = false;
+      continue;
+    }
+
     if (token.startsWith("--")) throw usageError(`未知参数：${token}`);
     positionals.push(token);
   }
@@ -211,6 +222,7 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       verbose,
       logPath,
       noTruncate,
+      repeatGuard,
     },
     command,
   };
@@ -345,6 +357,7 @@ function createRuntimeFactory(
       maxSteps: wiring.config.maxSteps,
       maxToolCalls: wiring.config.maxToolCalls,
       pricing: wiring.pricing,
+      repeatGuard: wiring.config.repeatGuard,
     };
     if (wiring.clock !== undefined) options.clock = wiring.clock;
     if (input.journal !== undefined) options.onToolCall = createJournalToolHook(input.journal);

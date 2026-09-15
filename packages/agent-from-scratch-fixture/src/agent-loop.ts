@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { canonicalJson } from "./checkpoint.js";
 import {
   type Compactor,
   compactionAsContextSources,
@@ -36,7 +37,7 @@ import {
   type PolicyContext,
   type PolicyDecision,
 } from "./policy.js";
-import { estimateCostUsd, type PriceTable } from "./pricing.js";
+import { estimateCostUsd, formatCostUsd, type PriceTable } from "./pricing.js";
 import {
   createRunCheckpoint,
   type DurableEvent,
@@ -69,6 +70,22 @@ import type {
 export const MAX_PLAN_REVISED_FAILURES = 3;
 /** `plan_revised` 里每类步骤 id 最多列几条，超出写 `…(+N)`。 */
 export const MAX_PLAN_REVISED_STEP_IDS = 10;
+
+/**
+ * 连续相同工具调用（`name` 相同且 `argumentsJson` 规范化后相同）的护栏阈值。
+ *
+ * - 第 `REPEAT_GUARD_FEEDBACK_THRESHOLD` 次：只追加一条 `harness_feedback` 提醒模型，
+ *   仍然执行这次调用——它可能是合法的幂等重试；
+ * - 第 `REPEAT_GUARD_BLOCK_THRESHOLD` 次：不再执行，直接返回结构化失败 observation，
+ *   让剩余预算花在别的动作上。
+ *
+ * 判据只看 `name + 规范化 args`：换了 `path` 的 `apply_patch` 这类"同名不同参数"的重试
+ * 完全不受影响。
+ */
+export const REPEAT_GUARD_FEEDBACK_THRESHOLD = 2;
+export const REPEAT_GUARD_BLOCK_THRESHOLD = 3;
+/** 写进 feedback / observation 的工具名上限：模型可能幻觉出任意长的名字。 */
+export const MAX_REPEAT_GUARD_NAME_CHARACTERS = 80;
 
 /** 触发一次重规划时，最近失败的工具（名字 + error code）。 */
 export interface PlanRevisedFailure {
@@ -251,6 +268,11 @@ export interface AgentLoopOptions {
    * `undefined`，输出层显示 `cost=unknown`——绝不按 0 计。
    */
   pricing?: LoopPricing | undefined;
+  /**
+   * 连续相同工具调用的护栏，**默认开启**（属于 Harness 约束）：第 2 次提醒模型、
+   * 第 3 次直接拦截。`false` 时回到旧行为——完全相同的调用也照常执行。
+   */
+  repeatGuard?: boolean | undefined;
 }
 
 /** 续跑时由恢复器注入：上一轮的 responseId 与尚未送达模型的结果。 */
@@ -640,6 +662,146 @@ function recordPlanBlocked(
   context.persistRuntime(state, "plan_blocked", JSON.stringify(describePlanBlocked(state, reason)));
 }
 
+/**
+ * `max_steps` / `max_tool_calls` 的触发点：停止原因必须能回答"卡在哪、模型最后在做什么、
+ * 还差什么"。`plan_blocked` 已经有诊断，这两种预算停止在本事件里补齐同样的信息。
+ */
+export type BudgetExhaustedReason = "max_steps" | "max_tool_calls";
+
+/** `budget_exhausted` 里最多登记多少条未完成步骤：与 `plan_blocked` 共用同一上限。 */
+export const MAX_BUDGET_EXHAUSTED_PENDING_STEPS = MAX_PLAN_BLOCKED_PENDING_STEPS;
+/** `budget_exhausted` 里最多登记多少条最近的工具调用。 */
+export const MAX_BUDGET_EXHAUSTED_RECENT_TOOL_CALLS = 5;
+/** 活动步骤的 `completionEvidence` 是模型文本：必须截断，否则 detail 无界。 */
+export const MAX_BUDGET_EXHAUSTED_EVIDENCE_CHARACTERS = 200;
+
+/** 累计用量投影：原始计数 + `formatCostUsd` 之后的成本（`undefined` 即 `unknown`）。 */
+export interface BudgetExhaustedUsage {
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  cachedInputTokens?: number | undefined;
+  modelCalls: number;
+  toolCalls: number;
+  durationMs: number;
+  estimatedCostUsd?: number | undefined;
+  cost: string;
+}
+
+export interface BudgetExhaustedBudget {
+  modelSteps: number;
+  maxSteps: number;
+  toolCalls: number;
+  maxToolCalls: number;
+}
+
+export interface BudgetExhaustedActiveStep {
+  status: PlanStep["status"];
+  dependsOn: string[];
+  completionEvidence: string;
+}
+
+export interface BudgetExhaustedToolCall {
+  name: string;
+  ok: boolean;
+  errorCode?: string | undefined;
+  /** 与**上一次**工具调用的 `name + 规范化 argsJson` 完全相同。 */
+  repeated: boolean;
+}
+
+/** `budget_exhausted` 事件 detail 的稳定形状：**每个字段都有界**。 */
+export interface BudgetExhaustedDetail {
+  type: "budget_exhausted";
+  reason: BudgetExhaustedReason;
+  budget: BudgetExhaustedBudget;
+  usage: BudgetExhaustedUsage;
+  activeStepId?: string | undefined;
+  activeStep?: BudgetExhaustedActiveStep | undefined;
+  pendingSteps: PlanBlockedPendingStep[];
+  pendingStepsOmitted: number;
+  recentToolCalls: BudgetExhaustedToolCall[];
+  recentToolCallsOmitted: number;
+  /** 本 run 最后一次 `plan_revised` 的原因（没有修订过则省略）。 */
+  lastReplanReason?: string | undefined;
+}
+
+function describeBudgetExhausted(
+  state: AgentState,
+  reason: BudgetExhaustedReason,
+  context: LoopContext,
+  toolCallLog: ToolCallLog,
+): BudgetExhaustedDetail {
+  const { budget, usage } = state;
+  const modelId = context.options.pricing?.modelId;
+  const costUsd =
+    modelId === undefined
+      ? undefined
+      : estimateCostUsd(usage, modelId, context.options.pricing?.table);
+  const { pendingSteps, omitted } = planBlockedPendingSteps(state);
+
+  const detail: BudgetExhaustedDetail = {
+    type: "budget_exhausted",
+    reason,
+    budget: {
+      modelSteps: budget.modelSteps,
+      maxSteps: budget.maxSteps,
+      toolCalls: budget.toolCalls,
+      maxToolCalls: budget.maxToolCalls,
+    },
+    usage: {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      modelCalls: usage.modelCalls,
+      toolCalls: usage.toolCalls,
+      durationMs: usage.durationMs,
+      estimatedCostUsd: costUsd,
+      // 算不出成本时写 `unknown`，绝不写 `$0.000000` 冒充免费。
+      cost: formatCostUsd(costUsd),
+    },
+    pendingSteps,
+    pendingStepsOmitted: omitted,
+    ...toolCallLog.describe(),
+  };
+
+  if (state.activeStepId !== undefined) detail.activeStepId = state.activeStepId;
+  const activeStep = state.plan?.steps.find((step) => step.id === state.activeStepId);
+  if (activeStep !== undefined) {
+    detail.activeStep = {
+      status: activeStep.status,
+      dependsOn: activeStep.dependsOn.slice(0, MAX_PLAN_BLOCKED_PENDING_STEPS),
+      completionEvidence: activeStep.completionEvidence.slice(
+        0,
+        MAX_BUDGET_EXHAUSTED_EVIDENCE_CHARACTERS,
+      ),
+    };
+  }
+  const lastReplan = state.planHistory.at(-1);
+  if (lastReplan !== undefined) detail.lastReplanReason = lastReplan.reason;
+
+  return detail;
+}
+
+/**
+ * 预算停止的统一出口：先登记 `budget_exhausted`（运行时事件，只进内存日志），
+ * 再走常规的 `finishStop`。顺序保证 `state.events` 里诊断在 `run_stopped` 之前。
+ */
+async function stopForBudget(
+  state: AgentState,
+  reason: BudgetExhaustedReason,
+  context: LoopContext,
+  toolCallLog: ToolCallLog,
+): Promise<AgentResult> {
+  // 先把墙钟时间补齐，detail 里的 `durationMs` 才是"到停止为止"的真实耗时；
+  // `finishStop` 随后会再标记一次，只补上两次之间的极短一段。
+  context.usage.markElapsed();
+  context.persistRuntime(
+    state,
+    "budget_exhausted",
+    JSON.stringify(describeBudgetExhausted(state, reason, context, toolCallLog)),
+  );
+  return finishStop(state, reason, context);
+}
+
 /** 停止事件同时是权威状态变更与 durable 事件，两者 payload 必须逐字节一致。 */
 function writeStatusEvent(state: AgentState, reason: StopReason, now: Date): AgentState {
   const recorded = appendEvent(
@@ -787,6 +949,102 @@ async function recordToolObservation(input: {
   state.validations.push(validation);
 }
 
+function boundedToolName(name: string): string {
+  return name.length <= MAX_REPEAT_GUARD_NAME_CHARACTERS
+    ? name
+    : `${name.slice(0, MAX_REPEAT_GUARD_NAME_CHARACTERS)}...`;
+}
+
+/** 第 2 次完全相同的调用：明确告诉模型"你在重复"，而不是让它自己察觉。 */
+function repeatGuardFeedback(call: ToolCall): string {
+  return `你刚刚用完全相同的参数再次调用了 \`${boundedToolName(call.name)}\`；请先阅读上一次的 observation，或换一个动作；不要重复同一调用。`;
+}
+
+/** 第 3 次完全相同的调用：不执行工具，只回一条结构化失败，让模型换动作。 */
+function repeatedCallObservation(call: ToolCall): ToolObservation {
+  return {
+    type: "observation",
+    callId: call.callId,
+    ok: false,
+    effect: "unknown",
+    errorCode: "repeated_tool_call",
+    output: JSON.stringify({
+      ok: false,
+      error: "repeated_tool_call",
+      message: `同一个工具（${boundedToolName(call.name)}）与完全相同的参数已经连续调用 ${REPEAT_GUARD_BLOCK_THRESHOLD} 次，这次不再执行；请阅读上一次的 observation，或换一个动作。`,
+    }),
+  };
+}
+
+/**
+ * 规范化后的调用指纹：JSON key 顺序不同、语义相同的参数视为同一次调用。
+ * 解析失败时退回原文（非法 JSON 会在 executor 里变成 `invalid_json` 观察）。
+ */
+function toolCallSignature(call: ToolCall): string {
+  let normalized = call.argumentsJson;
+  try {
+    normalized = canonicalJson(JSON.parse(call.argumentsJson));
+  } catch {
+    normalized = call.argumentsJson;
+  }
+  return `${call.name}\u0000${normalized}`;
+}
+
+/** 登记一次工具调用结果时用到的字段（waiting 没有 observation，记 `ok: false`）。 */
+interface RecordedToolOutcome {
+  ok: boolean;
+  errorCode?: string | undefined;
+}
+
+/**
+ * 有界的工具调用记录：既是"连续相同调用"守卫的计数器，也是预算停止诊断的数据源。
+ *
+ * 连续计数只在 `countConsecutive` 里推进（执行之前判定），结果在 `record` 里登记。
+ * 模型某轮完全不调工具时调用 `resetConsecutive`：否则"失败一次 → 被 Harness 打回 →
+ * 重试同一动作"会被误判成原地打转。
+ */
+class ToolCallLog {
+  private readonly recent: BudgetExhaustedToolCall[] = [];
+  private total = 0;
+  private previousSignature: string | undefined;
+  private consecutive = 0;
+
+  /** 返回这次调用是连续第几次完全相同的调用（1 = 与上一次不同）。 */
+  countConsecutive(call: ToolCall): number {
+    const signature = toolCallSignature(call);
+    this.consecutive = signature === this.previousSignature ? this.consecutive + 1 : 1;
+    this.previousSignature = signature;
+    return this.consecutive;
+  }
+
+  record(call: ToolCall, outcome: RecordedToolOutcome, repeated: boolean): void {
+    this.total += 1;
+    const entry: BudgetExhaustedToolCall = {
+      name: call.name,
+      ok: outcome.ok,
+      repeated,
+    };
+    if (outcome.errorCode !== undefined) entry.errorCode = outcome.errorCode;
+    this.recent.push(entry);
+    if (this.recent.length > MAX_BUDGET_EXHAUSTED_RECENT_TOOL_CALLS) this.recent.shift();
+  }
+
+  resetConsecutive(): void {
+    this.previousSignature = undefined;
+    this.consecutive = 0;
+  }
+
+  describe(): {
+    recentToolCalls: BudgetExhaustedToolCall[];
+    recentToolCallsOmitted: number;
+  } {
+    return {
+      recentToolCalls: this.recent.map((entry) => ({ ...entry })),
+      recentToolCallsOmitted: Math.max(0, this.total - this.recent.length),
+    };
+  }
+}
+
 function recentObservations(state: AgentState): string[] {
   return state.contextSources
     .filter((source) => source.kind === "tool_observation")
@@ -895,6 +1153,10 @@ async function runLoopFromState(
   /** 本段里失败过的工具（最多保留最近 `MAX_PLAN_REVISED_FAILURES` 条）与失败总数。 */
   let recentToolFailures: PlanRevisedFailure[] = [];
   let toolFailureCount = 0;
+  /** 连续相同调用的守卫与预算停止诊断共用的有界记录。 */
+  const toolCallLog = new ToolCallLog();
+  /** 默认开启；只有显式 `repeatGuard: false`（CLI 的 `--no-repeat-guard`）才关闭。 */
+  const repeatGuardEnabled = options.repeatGuard !== false;
 
   const rawTailSize = options.compaction?.rawTailSize ?? 12;
   const estimateTokens = options.compaction?.estimateInputTokens ?? estimateInputTokens;
@@ -973,7 +1235,7 @@ async function runLoopFromState(
   while (state.status === "running") {
     if (options.signal?.aborted) return finishStop(state, "cancelled", context);
     if (state.budget.modelSteps >= state.budget.maxSteps) {
-      return finishStop(state, "max_steps", context);
+      return stopForBudget(state, "max_steps", context, toolCallLog);
     }
 
     let plan: TaskPlan | undefined = state.plan;
@@ -1154,6 +1416,9 @@ async function runLoopFromState(
     // 用量在模型边界就记下：即使随后因持久化失败/取消停止，这一轮的 token 也不会丢。
     context.usage.recordModelCall(turn.usage);
     context.emit(state, { type: "model_completed", step: modelStepCount });
+    // 这一轮完全没有请求工具：连续相同调用的计数清零。否则"工具失败一次 → 被 Harness
+    // 打回 → 重试同一动作"会被误判成原地打转。
+    if (turn.toolCalls.length === 0) toolCallLog.resetConsecutive();
     if (
       !(await context.persist(state, {
         type: "model_completed",
@@ -1214,7 +1479,7 @@ async function runLoopFromState(
 
     // 同一批调用要么整体有预算，要么一个都不执行。
     if (state.budget.toolCalls + turn.toolCalls.length > state.budget.maxToolCalls) {
-      return finishStop(state, "max_tool_calls", context);
+      return stopForBudget(state, "max_tool_calls", context, toolCallLog);
     }
     if (!activeStep) {
       recordPlanBlocked(state, "no_active_step", context);
@@ -1251,26 +1516,48 @@ async function runLoopFromState(
 
       const hook = options.onToolCall;
       const hookStartedAt = hook === undefined ? undefined : context.now();
-      const result = await executeToolCall({
-        call,
-        registry: options.tools,
-        cwd: state.cwd,
-        timeoutMs: options.toolTimeoutMs,
-        policy: options.policy,
-        approvals: context.approvals,
-        runId: state.runId,
-        writeLease: context.writeLease,
-        skills: state.skills,
-        sandbox: options.sandbox,
-        requireSandbox: options.requireSandbox,
-        signal: options.signal,
-        now: context.now(),
-        emit: (event) => {
-          context.persistRuntime(state, event.type, JSON.stringify(event));
-        },
-      });
+
+      // 连续相同调用（name + 规范化 args）的护栏：第 2 次先提醒，第 3 次直接拦截。
+      const consecutive = toolCallLog.countConsecutive(call);
+      if (repeatGuardEnabled && consecutive === REPEAT_GUARD_FEEDBACK_THRESHOLD) {
+        state.contextSources.push({
+          id: `repeat-guard-${call.callId}`,
+          kind: "harness_feedback",
+          label: "repeated tool call",
+          content: repeatGuardFeedback(call),
+          priority: 100,
+        });
+      }
+      const blockedRepeat = repeatGuardEnabled && consecutive >= REPEAT_GUARD_BLOCK_THRESHOLD;
+
+      const result = blockedRepeat
+        ? repeatedCallObservation(call)
+        : await executeToolCall({
+            call,
+            registry: options.tools,
+            cwd: state.cwd,
+            timeoutMs: options.toolTimeoutMs,
+            policy: options.policy,
+            approvals: context.approvals,
+            runId: state.runId,
+            writeLease: context.writeLease,
+            skills: state.skills,
+            sandbox: options.sandbox,
+            requireSandbox: options.requireSandbox,
+            signal: options.signal,
+            now: context.now(),
+            emit: (event) => {
+              context.persistRuntime(state, event.type, JSON.stringify(event));
+            },
+          });
+      // 被拦截的调用仍然是模型发出的工具调用：预算与用量照记，模型才会看到 observation。
       state.budget.toolCalls += 1;
       context.usage.recordToolCall();
+      toolCallLog.record(
+        call,
+        result.type === "observation" ? result : { ok: false },
+        consecutive >= REPEAT_GUARD_FEEDBACK_THRESHOLD,
+      );
 
       if (hook !== undefined) {
         const durationMs =

@@ -112,6 +112,7 @@ describe("parseAgentArgs", () => {
       verbose: false,
       logPath: undefined,
       noTruncate: false,
+      repeatGuard: true,
     });
 
     expect(parseAgentArgs(["resume", "run-1"]).command).toEqual({
@@ -159,7 +160,20 @@ describe("parseAgentArgs", () => {
       verbose: false,
       logPath: undefined,
       noTruncate: false,
+      repeatGuard: true,
     });
+  });
+
+  it("--no-repeat-guard 关闭重复调用守卫，且可放在子命令前后", () => {
+    expect(parseAgentArgs(["run", "任务"]).config.repeatGuard).toBe(true);
+
+    const after = parseAgentArgs(["run", "任务", "--no-repeat-guard"]);
+    expect(after.config.repeatGuard).toBe(false);
+    expect(after.command).toEqual({ command: "run", task: "任务" });
+
+    const before = parseAgentArgs(["--no-repeat-guard", "run", "任务"]);
+    expect(before.config.repeatGuard).toBe(false);
+    expect(before.command).toEqual({ command: "run", task: "任务" });
   });
 
   it("parses --verbose before or after the subcommand, and tolerates repeats", () => {
@@ -525,21 +539,29 @@ describe("--verbose", () => {
   /**
    * 计划反复修订却没有任何步骤完成：Loop 会以 `blocked_plan` 停止。
    * 这个 fixture 因此能在全离线条件下产生真实的 `plan_blocked` 事件。
+   *
+   * 每次调用刻意使用**不同参数**：这个 fixture 关心的是重规划抖动，而不是重复调用；
+   * 完全相同的调用现在会被 `repeatGuard` 拦下（见 agent-loop 的重复调用守卫）。
    */
   function blockedRun() {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const draft = makeDraft({ steps: [{ id: "step-1", title: "读取 package.json" }] });
-    const echoObservation = JSON.stringify({ ok: true, data: { echoed: "hi" } });
-    const evaluations = [1, 2, 3, 4].map(() => ({
+    const observationFor = (index: number): string =>
+      JSON.stringify({ ok: true, data: { echoed: `hi-${index}` } });
+    const evaluations = [1, 2, 3, 4].map((index) => ({
       completed: false,
-      evidence: [echoObservation],
+      evidence: [observationFor(index)],
       passedCriteria: [] as string[],
       replanReason: "failed_assumption" as const,
     }));
     const model = new FakeModelDriver(
       [1, 2, 3, 4].map((index) =>
-        turnWithTools({ callId: `call-${index}`, name: "echo", argumentsJson: '{"value":"hi"}' }),
+        turnWithTools({
+          callId: `call-${index}`,
+          name: "echo",
+          argumentsJson: JSON.stringify({ value: `hi-${index}` }),
+        }),
       ),
     );
 
@@ -583,12 +605,167 @@ describe("--verbose", () => {
     expect(stderr.at(-1)).toContain('"stopReason":"blocked_plan"');
   });
 
+  /**
+   * 预算耗尽（`max_steps` / `max_tool_calls`）也必须能回答"卡在哪、最后做了什么、
+   * 还差什么"：一次运行里同时出现 `[summary] stopped:` / `stopped detail:` / `hint:`
+   * 与既有的 `[summary] usage` 行。
+   */
+  function budgetRun(input: { calls?: Array<{ callId: string; argumentsJson: string }> } = {}) {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const draft = makeDraft({
+      steps: [
+        { id: "step-1", title: "读取 package.json" },
+        { id: "step-2", title: "总结发现的脚本" },
+      ],
+    });
+    const calls = input.calls ?? [{ callId: "call-1", argumentsJson: '{"value":"hi"}' }];
+    const model = new FakeModelDriver([
+      turnWithTools(
+        ...calls.map((call) => ({
+          callId: call.callId,
+          name: "echo",
+          argumentsJson: call.argumentsJson,
+        })),
+      ),
+    ]);
+
+    return createDeepSeekAgentCli({
+      env: {},
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        planner: new ScriptedPlanner(draft, [notCompleted()]),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+      },
+    }).then((cli) => ({ cli, stdout, stderr }));
+  }
+
+  it("max_steps 停止时同一次输出里有 stopped / detail / hint 与 usage 行", async () => {
+    const { cli, stderr } = await budgetRun();
+
+    const code = await cli(["run", "读取 package.json", "--verbose", "--max-steps", "1"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("[summary] stopped: max_steps (modelSteps=1/1, toolCalls=1/32)");
+    expect(joined).toContain("[summary] stopped detail: active=step-1(status=in_progress)");
+    expect(joined).toContain("last tools=echo(ok)");
+    expect(joined).toContain("pending=step-1, step-2");
+    expect(joined).toContain("[summary] hint: 预算耗尽但计划未完成，可提高 --max-steps 或拆分任务");
+    // 既有的 usage 行必须与诊断在同一次输出里，且 hint 收尾。
+    expect(joined).toContain("[summary] usage modelCalls=1 toolCalls=1");
+    expect(joined.indexOf("[summary] hint:")).toBeGreaterThan(joined.indexOf("[summary] usage"));
+  });
+
+  it("重复调用的 max_steps 运行给出重复提示，并把 budget_exhausted 写进 JSONL", async () => {
+    const directory = await makeTempDir("agent-budget-");
+    try {
+      const logPath = join(directory, "journal.jsonl");
+      const { cli, stderr } = await budgetRun({
+        calls: [1, 2, 3].map((index) => ({
+          callId: `call-${index}`,
+          argumentsJson: '{"value":"hi"}',
+        })),
+      });
+
+      const code = await cli([
+        "run",
+        "读取 package.json",
+        "--verbose",
+        "--log",
+        logPath,
+        "--max-steps",
+        "1",
+      ]);
+
+      expect(code).toBe(EXIT_CODES.failed);
+      const joined = stderr.join("\n");
+      expect(joined).toContain("[summary] stopped: max_steps");
+      expect(joined).toContain("repeated=echo x2");
+      expect(joined).toContain("[summary] hint: 模型在重复同一个工具调用，考虑检查 observation");
+      expect(joined).toContain("[budget] exhausted reason=max_steps");
+
+      const records = (await readFile(logPath, "utf8"))
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const budget = records.find((record) => record["kind"] === "budget_exhausted");
+      expect(budget).toBeDefined();
+      expect(budget?.["reason"]).toBe("max_steps");
+      expect(budget?.["budget"]).toEqual({
+        modelSteps: 1,
+        maxSteps: 1,
+        toolCalls: 3,
+        maxToolCalls: 32,
+      });
+      expect(Array.isArray(budget?.["recentToolCalls"])).toBe(true);
+      expect(budget?.["lastReplanReason"]).toBeUndefined();
+    } finally {
+      await removeTempDir(directory);
+    }
+  });
+
+  /** 计数工具：整条 CLI 链路里断言 `--no-repeat-guard` 真的改变行为。 */
+  function repeatGuardRun() {
+    const executed: string[] = [];
+    const tool = defineTool({
+      name: "count_echo",
+      description: "Echo a value and count every execution.",
+      effect: "read",
+      schema: z.object({ value: z.string().min(1) }).strict(),
+      async execute(input) {
+        executed.push(input.value);
+        return { echoed: input.value };
+      },
+    });
+    const turns = [1, 2, 3].map((index) =>
+      turnWithTools({
+        callId: `call-${index}`,
+        name: "count_echo",
+        argumentsJson: '{"value":"same"}',
+      }),
+    );
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    return createDeepSeekAgentCli({
+      env: {},
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model: new FakeModelDriver(turns),
+        planner: new ScriptedPlanner(makeDraft({}), [
+          notCompleted(),
+          notCompleted(),
+          notCompleted(),
+        ]),
+        tools: createRegistry(tool),
+        store: new InMemoryRunStore(),
+      },
+    }).then((cli) => ({ cli, executed, stderr }));
+  }
+
+  it("--no-repeat-guard 关闭守卫后，重复的同一调用照常执行", async () => {
+    const guarded = await repeatGuardRun();
+    await guarded.cli(["run", "任务", "--max-steps", "3"]);
+    expect(guarded.executed).toEqual(["same", "same"]);
+
+    const unguarded = await repeatGuardRun();
+    const code = await unguarded.cli(["run", "任务", "--max-steps", "3", "--no-repeat-guard"]);
+    expect(code).toBe(EXIT_CODES.failed);
+    expect(unguarded.executed).toEqual(["same", "same", "same"]);
+  });
+
   it("对超长 observation 与过多观测条数都做有界处理", async () => {
     const blob = "x".repeat(1500);
+    // 每次调用刻意使用不同参数，避免触发重复调用守卫（这个用例只验证有界输出）。
     const calls = Array.from({ length: 25 }, (_, index) => ({
       callId: `call-${index + 1}`,
       name: "huge",
-      argumentsJson: '{"size":1500}',
+      argumentsJson: JSON.stringify({ size: 1500 - index }),
     }));
     const stdout: string[] = [];
     const stderr: string[] = [];

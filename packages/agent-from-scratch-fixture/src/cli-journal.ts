@@ -1,6 +1,6 @@
 import { closeSync, openSync, writeSync } from "node:fs";
 
-import type { PlanRevisedDetail } from "./agent-loop.js";
+import type { BudgetExhaustedDetail, PlanRevisedDetail } from "./agent-loop.js";
 import { isRecord } from "./checkpoint.js";
 import type { ToolExecutionResult } from "./execute-tool.js";
 import type { ModelDriver, ModelTurn, ModelUsage, ToolCall } from "./model.js";
@@ -157,6 +157,23 @@ export function formatRunUsageLine(entry: JournalRunUsage): string {
 }
 
 /**
+ * `budget_exhausted` 的可读摘要行：一行回答"为什么停、卡在哪、还差多少"。
+ * 字段全部来自有界的事件 detail。
+ */
+export function formatBudgetExhaustedLine(entry: BudgetExhaustedDetail): string {
+  const pending = entry.pendingSteps.length + entry.pendingStepsOmitted;
+  return [
+    "[budget] exhausted",
+    `reason=${entry.reason}`,
+    `modelSteps=${entry.budget.modelSteps}/${entry.budget.maxSteps}`,
+    `toolCalls=${entry.budget.toolCalls}/${entry.budget.maxToolCalls}`,
+    `cost=${entry.usage.cost}`,
+    `active=${entry.activeStepId ?? "none"}`,
+    `pending=${pending}`,
+  ].join(" ");
+}
+
+/**
  * 完整运行日志。统一做「stderr 可读行 + 可选 JSONL 文件」双写，并统一应用时间戳与截断。
  *
  * 只有 `--verbose` 打开时才是活动对象；关闭时 `createJournal` 返回 no-op，
@@ -176,6 +193,11 @@ export interface Journal {
    * verbose observer 的 `[event] plan_revised ...` 负责，这里不重复打印同一件事。
    */
   planRevised(entry: JournalPlanRevised): void;
+  /**
+   * 预算耗尽（`max_steps` / `max_tool_calls`）的诊断：stderr 一行可读摘要 +
+   * JSONL（`kind: "budget_exhausted"`，字段与 Loop 写出的事件 detail 一致）。
+   */
+  budgetExhausted(entry: BudgetExhaustedDetail): void;
   close(): void;
 }
 
@@ -217,6 +239,7 @@ function createNoopJournal(): Journal {
     toolResult: () => undefined,
     usage: () => undefined,
     planRevised: () => undefined,
+    budgetExhausted: () => undefined,
     close: () => undefined,
   };
 }
@@ -487,6 +510,11 @@ export function createJournal(options: JournalOptions): Journal {
         reason: entry.reason,
         detail: entry.detail,
       });
+    },
+
+    budgetExhausted(entry) {
+      writeRecord({ kind: "budget_exhausted", at: now().toISOString(), ...entry });
+      writeLine(formatBudgetExhaustedLine(entry));
     },
 
     close() {
