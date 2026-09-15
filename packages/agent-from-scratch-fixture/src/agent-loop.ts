@@ -331,6 +331,12 @@ function createLoopContext(options: AgentLoopOptions): LoopContext {
   };
 }
 
+/**
+ * 教程明确提醒"每轮都重新生成计划会抖动、浪费 token"。
+ * 连续多轮只修订计划却没有任何步骤完成，说明计划在打转：停下来报告，而不是继续烧 token。
+ */
+const MAX_REPLANS_WITHOUT_PROGRESS = 3;
+
 function statusForStop(reason: StopReason): AgentState["status"] {
   if (reason === "cancelled") return "cancelled";
   if (reason === "blocked_plan") return "blocked";
@@ -566,6 +572,8 @@ export async function runAgentLoopFromState(
   let pendingOutputs: FunctionCallOutput[] = resume.outputs ?? [];
   let consecutiveToolFailures = 0;
   let lastReplannedVersion = -1;
+  /** 连续"修订了计划但没有任何步骤完成"的次数。 */
+  let replansWithoutProgress = 0;
   let lastPersistedPlanVersion = -1;
   let consecutiveCompactionFailures = 0;
 
@@ -613,6 +621,7 @@ export async function runAgentLoopFromState(
         if (progress.completed) {
           plan = completeStep(plan, activeStep.id, progress.evidence.join("\n"));
           state.activeStepId = undefined;
+          replansWithoutProgress = 0;
         }
         state.plan = plan;
         await persistPlan(plan);
@@ -669,6 +678,14 @@ export async function runAgentLoopFromState(
       });
       consecutiveToolFailures = 0;
       context.emit(state, { type: "plan_revised", version: plan.version, reason: replanReason });
+      if (++replansWithoutProgress > MAX_REPLANS_WITHOUT_PROGRESS) {
+        context.persistRuntime(
+          state,
+          "replan_thrash",
+          JSON.stringify({ attempts: replansWithoutProgress, reason: replanReason }),
+        );
+        return finishStop(state, "blocked_plan", context);
+      }
       await persistPlan(plan);
       continue;
     }
@@ -949,6 +966,7 @@ export async function runAgentLoopFromState(
     if (progress.completed) {
       plan = completeStep(plan, activeStep.id, progress.evidence.join("\n"));
       state.activeStepId = undefined;
+      replansWithoutProgress = 0;
     }
     state.plan = plan;
 
@@ -972,6 +990,14 @@ export async function runAgentLoopFromState(
         reason: progress.replanReason,
       });
       state.activeStepId = undefined;
+      if (++replansWithoutProgress > MAX_REPLANS_WITHOUT_PROGRESS) {
+        context.persistRuntime(
+          state,
+          "replan_thrash",
+          JSON.stringify({ attempts: replansWithoutProgress, reason: progress.replanReason }),
+        );
+        return finishStop(state, "blocked_plan", context);
+      }
     }
 
     // 工具批次完成且计划/证据已更新：这是崩溃恢复的安全边界。
