@@ -1,5 +1,5 @@
 import { cache } from "react";
-import { SKILL_STAGES, SKILL_STAGE_BY_SLUG, type SkillStage } from "./catalog";
+import { SKILL_STAGE_BY_SLUG, SKILL_STAGES, type SkillStage } from "./catalog";
 
 const REPOSITORY_URL = "https://github.com/linonward/skills";
 const RAW_BASE_URL = "https://raw.githubusercontent.com/linonward/skills/main";

@@ -1,11 +1,11 @@
+import { ArrowLeft, ExternalLink } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowLeft, ExternalLink } from "lucide-react";
 import { notFound } from "next/navigation";
+import { CopyButton } from "@/components/copy-button";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";
 import { SkillMarkdown } from "@/components/skill-markdown";
-import { CopyButton } from "@/components/copy-button";
 import { getSkill } from "@/lib/github-skills";
 import { getSkillInstallCommand } from "@/lib/install-commands";
 

@@ -1,6 +1,6 @@
 import {
-  emDash,
   ellipsis,
+  emDash,
   inputRules,
   smartQuotes,
   textblockTypeInputRule,

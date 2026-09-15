@@ -1,5 +1,4 @@
-import type { Metadata } from "next";
-import type { Viewport } from "next";
+import type { Metadata, Viewport } from "next";
 import { SiteHeader } from "@/components/site-header";
 import { siteConfig } from "@/lib/site";
 import "./globals.css";

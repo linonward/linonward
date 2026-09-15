@@ -13,8 +13,8 @@
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm format:check",
     "check:branch": "node scripts/check-branch.mjs",
     "dev": "turbo run dev",
-    "format": "biome format --write .",
-    "format:check": "biome format .",
+    "format": "biome check --write .",
+    "format:check": "biome check .",
     "lint": "eslint eslint.config.mjs commitlint.config.mjs scripts --max-warnings=0 && turbo run lint",
     "prepare": "husky",
     "test": "turbo run test",
@@ -36,8 +36,8 @@
   "lint-staged": {
     "*.{js,mjs,cjs,ts,mts,cts}": [
       "eslint --fix --max-warnings=0",
-      "biome format --write"
+      "biome check --write"
     ],
-    "*.{json,jsonc}": "biome format --write"
+    "*.{json,jsonc}": "biome check --write"
   }
 }

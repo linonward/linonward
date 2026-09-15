@@ -3,9 +3,9 @@ import {
   Clock3,
   FileQuestion,
   Lightbulb,
+  type LucideIcon,
   MessageSquareText,
   Target,
-  type LucideIcon,
 } from "lucide-react";
 
 type IconItem = readonly [string, string, LucideIcon];

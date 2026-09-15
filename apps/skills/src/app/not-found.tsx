@@ -1,5 +1,5 @@
-import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
 import { SiteHeader } from "@/components/site-header";
 
 export default function NotFound() {

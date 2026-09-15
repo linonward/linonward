@@ -1,8 +1,8 @@
-import { NodeSelection } from "prosemirror-state";
 import type { EditorState } from "prosemirror-state";
+import { NodeSelection } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
-import { useCallback, useRef, useState } from "react";
 import type { RefObject } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import type { ImageAttributes, ImageDraft } from "../imageTypes";
 

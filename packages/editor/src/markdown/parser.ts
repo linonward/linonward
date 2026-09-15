@@ -1,8 +1,8 @@
 import {
-  MarkdownParser,
-  MarkdownSerializer,
   defaultMarkdownParser,
   defaultMarkdownSerializer,
+  MarkdownParser,
+  MarkdownSerializer,
 } from "prosemirror-markdown";
 import type { Node as PMNode } from "prosemirror-model";
 
