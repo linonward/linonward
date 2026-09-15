@@ -3,12 +3,12 @@ import { describe, expect, it } from "vitest";
 import { runAgentLoop } from "../src/agent-loop.js";
 import {
   CLI_USAGE,
+  type CliRuntime,
+  type CliRuntimeInput,
   EXIT_CODES,
   exitCodeFor,
   parseCliArgs,
   runCli,
-  type CliRuntime,
-  type CliRuntimeInput,
 } from "../src/index.js";
 import { InMemoryTraceSink } from "../src/trace.js";
 import type { AgentResult, AgentState, StopReason } from "../src/types.js";

@@ -4,8 +4,8 @@ import {
   createResponsesHttpClient,
   createResponsesModel,
   DEEPSEEK_DEFAULTS,
-  resolveDeepSeekConfig,
   ResponsesHttpError,
+  resolveDeepSeekConfig,
 } from "../src/responses-http.js";
 
 const FAKE_KEY = "sk-test-not-a-real-key";

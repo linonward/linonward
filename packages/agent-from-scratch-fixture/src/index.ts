@@ -2,41 +2,28 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { runAgentLoop, type AgentLoopEvent, type AgentLoopOptions } from "./agent-loop.js";
+import { type AgentLoopEvent, type AgentLoopOptions, runAgentLoop } from "./agent-loop.js";
 import { canonicalJson } from "./checkpoint.js";
 import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
-import type { Sandbox } from "./sandbox.js";
 import {
+  type AgentRuntime,
   fromDurableState,
   loopOptionsFromRuntime,
-  resumeAgentRun,
   restoreRun,
+  resumeAgentRun,
   toDurableState,
-  type AgentRuntime,
 } from "./recovery.js";
 import { createRunCheckpoint, type RunStore } from "./run-store.js";
+import type { Sandbox } from "./sandbox.js";
 import { createInitialState } from "./state.js";
 import { InMemoryWriteLease, type WriteLease } from "./tool.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import { InMemoryTraceSink, type TraceSink } from "./trace.js";
 import type { AgentResult, Clock, UserInputAnswer, ValidationSpec } from "./types.js";
 
-export {
-  MACOS_SEATBELT_EXECUTABLE,
-  SandboxError,
-  SEATBELT_WRITABLE_DEVICES,
-  buildBubblewrapArgs,
-  buildSeatbeltProfile,
-  detectSandbox,
-  linuxBubblewrapSandbox,
-  macOsSeatbeltSandbox,
-  noSandbox,
-  seatbeltWritableRoots,
-  wrapWithSandbox,
-} from "./sandbox.js";
 export type {
   Sandbox,
   SandboxCommand,
@@ -44,6 +31,19 @@ export type {
   SandboxGateOptions,
   SandboxGuarantee,
   SandboxPolicy,
+} from "./sandbox.js";
+export {
+  buildBubblewrapArgs,
+  buildSeatbeltProfile,
+  detectSandbox,
+  linuxBubblewrapSandbox,
+  MACOS_SEATBELT_EXECUTABLE,
+  macOsSeatbeltSandbox,
+  noSandbox,
+  SandboxError,
+  SEATBELT_WRITABLE_DEVICES,
+  seatbeltWritableRoots,
+  wrapWithSandbox,
 } from "./sandbox.js";
 
 export type CliCommand =

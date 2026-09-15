@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildModelRequest,
+  type ContextSource,
   selectContext,
   summarizeSources,
-  type ContextSource,
 } from "../src/context.js";
 
 function source(overrides: Partial<ContextSource> & { id: string }): ContextSource {

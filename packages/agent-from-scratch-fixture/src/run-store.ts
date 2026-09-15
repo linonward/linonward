@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, readdir, rm } from "node:fs/promises";
+import { readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { atomicWriteJson, canonicalJson, isRecord, sha256 } from "./checkpoint.js";

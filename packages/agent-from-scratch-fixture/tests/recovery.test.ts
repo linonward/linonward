@@ -1,12 +1,12 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-
+import { type AgentLoopOptions, runAgentLoop, runAgentLoopFromState } from "../src/agent-loop.js";
 import { atomicWriteJson } from "../src/checkpoint.js";
 import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
-import { runAgentLoop, runAgentLoopFromState, type AgentLoopOptions } from "../src/agent-loop.js";
-import { defineTool } from "../src/tool.js";
+import type { Planner } from "../src/planner.js";
 import {
+  type AgentRuntime,
   assertContiguousSequences,
   findToolIntentsWithoutResults,
   firstValidCheckpoint,
@@ -14,28 +14,26 @@ import {
   reduceDurableEvent,
   restoreRun,
   resumeAgentRun,
+  type ToolStateVerifier,
   toDurableState,
   verifyEventChecksum,
-  type AgentRuntime,
-  type ToolStateVerifier,
 } from "../src/recovery.js";
 import {
-  InMemoryRunStore,
-  LocalFileRunStore,
   createEventRecord,
   createRunCheckpoint,
-  isEventRecord,
   type DurableEvent,
   type EventRecord,
+  InMemoryRunStore,
+  isEventRecord,
+  LocalFileRunStore,
   type RunLease,
   type RunStore,
 } from "../src/run-store.js";
-import type { Planner } from "../src/planner.js";
 import { createInitialState } from "../src/state.js";
+import { defineTool } from "../src/tool.js";
 import { InMemoryTraceSink } from "../src/trace.js";
 import type { AgentState, Clock, DurableAgentState } from "../src/types.js";
 import {
-  ScriptedPlanner,
   completeWith,
   createRegistry,
   criterion,
@@ -45,6 +43,7 @@ import {
   makeTempDir,
   planStep,
   removeTempDir,
+  ScriptedPlanner,
 } from "./support.js";
 
 const runId = "run-recovery-1";

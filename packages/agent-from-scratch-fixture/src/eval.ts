@@ -1,6 +1,6 @@
 import { isRecord } from "./checkpoint.js";
-import type { AgentState } from "./types.js";
 import type { RunUsage } from "./trace.js";
+import type { AgentState } from "./types.js";
 
 export type EvaluationOutcome = "passed" | "failed" | "correctly_blocked" | "inconclusive";
 

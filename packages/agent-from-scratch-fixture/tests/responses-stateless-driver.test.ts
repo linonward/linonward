@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import type { ModelRequest } from "../src/context.js";
-import { toModelTurn, type ResponsesResultLike, type ToolDefinition } from "../src/model.js";
-import { createStatelessResponsesDriver } from "../src/responses-stateless-driver.js";
+import { type ResponsesResultLike, type ToolDefinition, toModelTurn } from "../src/model.js";
 import type { ResponsesHttpBody } from "../src/responses-http.js";
+import { createStatelessResponsesDriver } from "../src/responses-stateless-driver.js";
 
 const MODEL_ID = "deepseek-v4-flash";
 

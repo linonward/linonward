@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { z } from "zod";
 
-import { wrapWithSandbox, type SandboxPolicy } from "../sandbox.js";
+import { type SandboxPolicy, wrapWithSandbox } from "../sandbox.js";
 import { defineTool, type ToolContext } from "../tool.js";
 
 export const RUN_COMMAND_TIMEOUT_MS = 60_000;

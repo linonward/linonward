@@ -2,15 +2,30 @@ import { randomUUID } from "node:crypto";
 
 import type { AgentLoopEvent, AgentLoopOptions, LoopCompactionOptions } from "./agent-loop.js";
 import { isPersistenceFailure, runAgentLoopFromState } from "./agent-loop.js";
+import { fromDurableState, toDurableState } from "./durable-state.js";
 import { waitForUserInput } from "./interaction.js";
 import type { FunctionCallOutput, ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
+import {
+  CHECKPOINT_HISTORY_LIMIT,
+  CHECKPOINT_SCHEMA_VERSION,
+  checkpointChecksum,
+  createRunCheckpoint,
+  type DurableEvent,
+  type EventRecord,
+  eventRecordChecksum,
+  isEventRecord,
+  isRunCheckpoint,
+  type PersistedToolCall,
+  type RunCheckpoint,
+  type RunLease,
+  type RunStore,
+} from "./run-store.js";
 import type { Sandbox } from "./sandbox.js";
-import type { ToolRegistry } from "./tool-registry.js";
 import type { WriteLease } from "./tool.js";
+import type { ToolRegistry } from "./tool-registry.js";
 import type { TraceSink } from "./trace.js";
-import { fromDurableState, toDurableState } from "./durable-state.js";
 import type {
   AgentResult,
   AgentState,
@@ -21,21 +36,6 @@ import type {
   UserInputRequest,
   ValidationSpec,
 } from "./types.js";
-import {
-  CHECKPOINT_HISTORY_LIMIT,
-  CHECKPOINT_SCHEMA_VERSION,
-  checkpointChecksum,
-  createRunCheckpoint,
-  eventRecordChecksum,
-  isEventRecord,
-  isRunCheckpoint,
-  type DurableEvent,
-  type EventRecord,
-  type PersistedToolCall,
-  type RunCheckpoint,
-  type RunLease,
-  type RunStore,
-} from "./run-store.js";
 
 /** 工具声明自己的恢复策略；未知调用绝不能因为"多数时候没事"就标记完成。 */
 export interface ToolStateVerifier {

@@ -5,12 +5,13 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { isRecord } from "../src/checkpoint.js";
 import {
-  MAX_OBSERVATION_CHARACTERS,
   executeToolCall,
+  MAX_OBSERVATION_CHARACTERS,
   type ToolExecutionResult,
 } from "../src/execute-tool.js";
 import { FakeModel } from "../src/fake-model.js";
 import { runMinimalAgent } from "../src/harness.js";
+import type { ToolCall } from "../src/model.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
 import { PreApprovingLedger } from "../src/run-task.js";
 import {
@@ -23,7 +24,6 @@ import { applyPatchTool } from "../src/tools/apply-patch.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { runCommandTool } from "../src/tools/run-command.js";
 import { searchTextTool } from "../src/tools/search-text.js";
-import type { ToolCall } from "../src/model.js";
 import {
   createRegistry,
   echoTool,

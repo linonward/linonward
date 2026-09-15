@@ -1,5 +1,5 @@
-import { buildModelRequest } from "./context.js";
 import type { ContextSource, ModelRequest } from "./context.js";
+import { buildModelRequest } from "./context.js";
 import type { Model } from "./model.js";
 import { appendEvent, canTransition, createInitialState, transitionState } from "./state.js";
 import type { AgentResult, AgentState, Clock, StopReason } from "./types.js";

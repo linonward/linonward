@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertCapstonePassed,
+  type CapstoneCase,
   parseCapstoneCases,
   runCapstoneSuite,
   summarizeCapstone,
-  type CapstoneCase,
 } from "../src/capstone.js";
 import type { EvaluationCase, EvaluationResult } from "../src/eval.js";
 import { emptyUsage } from "../src/trace.js";

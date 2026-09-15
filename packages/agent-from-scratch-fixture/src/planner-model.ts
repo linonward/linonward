@@ -4,10 +4,10 @@ import type { Model } from "./model.js";
 import type { ReplanReason } from "./plan.js";
 import {
   createModelPlanCreator,
-  validatePlan,
   type PlanDraft,
   type PlanEvaluation,
   type Planner,
+  validatePlan,
 } from "./planner.js";
 import type { AcceptanceCriterion } from "./types.js";
 

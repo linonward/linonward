@@ -3,16 +3,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { runAgentLoop, summarizeRun, type AgentLoopEvent } from "./agent-loop.js";
+import { type AgentLoopEvent, runAgentLoop, summarizeRun } from "./agent-loop.js";
 import type { Compactor } from "./compaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import { createModelPlanner } from "./planner-model.js";
 import {
-  InMemoryApprovalLedger,
   type ApprovalGrant,
   type ApprovalLedger,
   type ApprovalRequest,
+  InMemoryApprovalLedger,
   type PolicyContext,
 } from "./policy.js";
 import {
@@ -25,10 +25,10 @@ import { LocalFileRunStore, type RunLease, type RunStore } from "./run-store.js"
 import { detectSandbox, type Sandbox } from "./sandbox.js";
 import { InMemoryWriteLease } from "./tool.js";
 import { ToolRegistry } from "./tool-registry.js";
-import { readFileTool } from "./tools/read-file.js";
-import { searchTextTool } from "./tools/search-text.js";
 import { applyPatchTool } from "./tools/apply-patch.js";
+import { readFileTool } from "./tools/read-file.js";
 import { runCommandTool } from "./tools/run-command.js";
+import { searchTextTool } from "./tools/search-text.js";
 import { InMemoryTraceSink, type TraceEvent, type TraceSink } from "./trace.js";
 import type { AgentResult, Clock, ValidationSpec } from "./types.js";
 

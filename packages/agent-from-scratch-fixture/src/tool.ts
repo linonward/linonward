@@ -1,4 +1,4 @@
-import { z, type ZodType } from "zod";
+import { type ZodType, z } from "zod";
 
 import type { Sandbox, SandboxPolicy } from "./sandbox.js";
 import type { AgentEventInput, SkillState } from "./types.js";

@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   countInconclusive,
+  type EvaluationCase,
+  type EvaluationResult,
   gradeOutcome,
   parseEvaluationCases,
   runEvaluation,
-  type EvaluationCase,
-  type EvaluationResult,
 } from "../src/eval.js";
 import { emptyUsage } from "../src/trace.js";
 

@@ -1,18 +1,17 @@
 import { randomUUID } from "node:crypto";
-
-import { buildModelRequest, summarizeSources, type ContextSource } from "./context.js";
 import {
-  DELETED_FILE_HASH,
-  checkCompletion,
-  describeMissingProgress,
-  hashChangedFiles,
-} from "./completion.js";
-import {
+  type Compactor,
   compactionAsContextSources,
   maybeCompactContext,
   projectCompactedContext,
-  type Compactor,
 } from "./compaction.js";
+import {
+  checkCompletion,
+  DELETED_FILE_HASH,
+  describeMissingProgress,
+  hashChangedFiles,
+} from "./completion.js";
+import { buildModelRequest, type ContextSource, summarizeSources } from "./context.js";
 import { toDurableState } from "./durable-state.js";
 import { executeToolCall, type ToolObservation } from "./execute-tool.js";
 import { waitForUserInput } from "./interaction.js";
@@ -31,14 +30,14 @@ import {
   startStep,
 } from "./plan.js";
 import type { Planner } from "./planner.js";
-import { InMemoryApprovalLedger, type ApprovalLedger, type PolicyContext } from "./policy.js";
-import type { Sandbox } from "./sandbox.js";
+import { type ApprovalLedger, InMemoryApprovalLedger, type PolicyContext } from "./policy.js";
 import {
   createRunCheckpoint,
   type DurableEvent,
   type RunLease,
   type RunStore,
 } from "./run-store.js";
+import type { Sandbox } from "./sandbox.js";
 import {
   activeSkillContextSources,
   discoverSkills,
