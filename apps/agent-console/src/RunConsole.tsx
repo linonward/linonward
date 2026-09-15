@@ -23,6 +23,8 @@ export interface RunConsoleProps {
   onAnswer(input: { requestId: string; text: string }): void;
   /** 清空当前运行并去掉地址栏里的 `?run=`，回到全新状态。 */
   onNew(): void;
+  /** 中止正在执行的运行；运行停在等待回答时没有可中止的东西。 */
+  onCancel(): void;
 }
 
 /**
@@ -41,6 +43,7 @@ export function RunConsole({
   onStop,
   onAnswer,
   onNew,
+  onCancel,
 }: RunConsoleProps): ReactElement {
   const endRef = useRef<HTMLDivElement | null>(null);
   const rounds = view.rounds.length;
@@ -52,6 +55,10 @@ export function RunConsole({
     if (node === null) return;
     node.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [paused, rounds, logLines]);
+
+  // 服务端确认"正在执行"时允许中止；刚提交、还没有第一份 checkpoint 时用"正在接收流"兜底
+  // （那时快照还不存在）。停在等待回答的运行会先收到 done，因此按钮自动禁用。
+  const cancellable = snapshot?.cancellable === true || streaming;
 
   const question = pendingQuestion(view);
   // 时间线里没有待答请求时才回落到快照里的那条：两者不会重复渲染同一个请求。
@@ -73,6 +80,9 @@ export function RunConsole({
         </span>
         <button type="button" onClick={onTogglePause}>
           {paused ? "恢复自动滚动" : "暂停自动滚动"}
+        </button>
+        <button type="button" onClick={onCancel} disabled={!cancellable}>
+          中止运行
         </button>
         <button type="button" onClick={onStop} disabled={!streaming}>
           断开实时流

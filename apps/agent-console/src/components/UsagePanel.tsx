@@ -71,6 +71,18 @@ export function UsagePanel({ view }: { view: RunView }): ReactElement {
       <h3>预算</h3>
       <BudgetBar label="模型步数" current={budget.modelSteps} max={budget.maxSteps} />
       <BudgetBar label="工具调用" current={budget.toolCalls} max={budget.maxToolCalls} />
+      {budget.maxCostUsd === undefined ? null : (
+        <Row
+          label="花费上限"
+          value={`$${usage.costUsd === undefined ? "unknown" : usage.costUsd.toFixed(6)} / $${budget.maxCostUsd}`}
+        />
+      )}
+      {budget.maxWallMs === undefined ? null : (
+        <Row
+          label="墙钟上限"
+          value={`${formatDuration(usage.wallMs)} / ${formatDuration(budget.maxWallMs)}`}
+        />
+      )}
     </aside>
   );
 }

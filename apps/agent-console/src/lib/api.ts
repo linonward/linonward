@@ -20,6 +20,10 @@ export interface RunFormValues {
   allowedArgv: string[][];
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）：留空即不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：留空即不限制。 */
+  maxWallMs?: number | undefined;
   approveAllowed: boolean;
   requireSandbox: boolean;
   repeatGuard: boolean;
@@ -66,6 +70,8 @@ export async function startRun(values: RunFormValues): Promise<{ runId: string }
     allowedArgv: values.allowedArgv,
     maxSteps: values.maxSteps,
     maxToolCalls: values.maxToolCalls,
+    maxCostUsd: values.maxCostUsd,
+    maxWallMs: values.maxWallMs,
     approveAllowed: values.approveAllowed,
     requireSandbox: values.requireSandbox,
     repeatGuard: values.repeatGuard,
@@ -80,6 +86,11 @@ export async function startRun(values: RunFormValues): Promise<{ runId: string }
 
 export async function sendAnswer(runId: string, requestId: string, text: string): Promise<void> {
   await postJson(`/api/runs/${encodeURIComponent(runId)}/answer`, { requestId, text });
+}
+
+/** 中止正在执行的运行：abort 会传到模型调用与工具（含整个进程组）。 */
+export async function cancelRun(runId: string): Promise<void> {
+  await postJson(`/api/runs/${encodeURIComponent(runId)}/cancel`, {});
 }
 
 /**

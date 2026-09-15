@@ -65,6 +65,8 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | `--allow <command> [args...]` | 把**一条完整 argv** 加入 `run_command` 白名单，可重复。`--allow node --version` 只放行 `node --version` 这条精确 argv；收集会持续到下一个已识别的 CLI flag |
 | `--require-sandbox` | 显式要求隔离：没有可用沙箱时 `run_command` 拒绝执行而不是无隔离运行 |
 | `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
+| `--max-cost-usd <amount>` | 花费上限（美元，按价目表估算）。越过即停（`max_cost`）；设了上限却算不出成本时同样停下 |
+| `--max-wall-ms <ms>` | 墙钟上限：越过即停（`max_wall_ms`） |
 | `--max-steps <n>` | 模型步数上限，默认 `16` |
 | `--max-tool-calls <n>` | 工具调用上限，默认 `32` |
 | `--verbose` | 在 stderr 上追加**完整运行日志**：模型的真实输入与输出（system prompt 全文、每条输入消息全文、`finalText` 全文、`toolCalls` 的 `argumentsJson` 全文）、完整工具链（每个调用的 `argsJson` 与 observation `output` 全文、`ok` / `effect` / `errorCode` 与策略决定），以及既有的每个 Loop 事件一行（`[event] ...`）与运行结束汇总（`[summary] ...`）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
@@ -438,6 +440,9 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `ModelDriver` / `Planner` / `ToolRegistry`（`tests/agent-cli.test.ts` 用
   `FakeModelDriver` 驱动 `run` / `resume` / `answer` 三条命令，全程离线）。
   真实通路另外提供 `src/run-task.ts` 的 `runRealTask`——它是装配函数，不是 CLI 子命令。
+- **预算有两类**：`--max-steps` / `--max-tool-calls` 管"做了多少次"，`--max-cost-usd` /
+  `--max-wall-ms` 管"花了多少、跑了多久"。后者在每次模型调用后判定，因此**当轮的工具不会
+  再被派发**；一次调用本身可能把花费推过上限，体现在诊断里就是 `spent` 略高于 `maxCostUsd`。
 - **真实运行默认不自动批准命令**。`runRealTask` 只有在显式打开
   `autoApproveAllowedCommands` 时才会自动批准策略放行的 `run_command`（e2e 测试这么用）；
   默认仍会停在 `approval_required`。无论哪种情况，`allowedArgv` 都是硬边界。

@@ -13,6 +13,8 @@ interface FormState {
   allowedArgvLines: string[];
   maxSteps: string;
   maxToolCalls: string;
+  maxCostUsd: string;
+  maxWallMs: string;
   approveAllowed: boolean;
   requireSandbox: boolean;
   repeatGuard: boolean;
@@ -25,6 +27,8 @@ const INITIAL: FormState = {
   allowedArgvLines: [""],
   maxSteps: "16",
   maxToolCalls: "32",
+  maxCostUsd: "",
+  maxWallMs: "",
   approveAllowed: false,
   requireSandbox: false,
   repeatGuard: true,
@@ -34,6 +38,14 @@ const INITIAL: FormState = {
 function positiveInteger(value: string, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** 可选正数：留空 = 不限制；写了非法值当没写（服务端也会再校验一次）。 */
+function optionalPositiveNumber(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 /** 顶部表单：任务、cwd、`--allow` 白名单、预算、三个开关与规划模型。 */
@@ -63,6 +75,8 @@ export function RunForm({ busy, onSubmit }: RunFormProps): ReactElement {
           allowedArgv: parseAllowedArgvLines(form.allowedArgvLines),
           maxSteps: positiveInteger(form.maxSteps, 16),
           maxToolCalls: positiveInteger(form.maxToolCalls, 32),
+          maxCostUsd: optionalPositiveNumber(form.maxCostUsd),
+          maxWallMs: optionalPositiveNumber(form.maxWallMs),
           approveAllowed: form.approveAllowed,
           requireSandbox: form.requireSandbox,
           repeatGuard: form.repeatGuard,
@@ -142,6 +156,28 @@ export function RunForm({ busy, onSubmit }: RunFormProps): ReactElement {
           inputMode="numeric"
           value={form.maxToolCalls}
           onChange={(event) => update({ maxToolCalls: event.target.value })}
+        />
+      </label>
+
+      <label className="field">
+        <span>花费上限 USD（留空 = 不限制）</span>
+        <input
+          name="maxCostUsd"
+          inputMode="decimal"
+          value={form.maxCostUsd}
+          placeholder="0.5"
+          onChange={(event) => update({ maxCostUsd: event.target.value })}
+        />
+      </label>
+
+      <label className="field">
+        <span>墙钟上限 ms（留空 = 不限制）</span>
+        <input
+          name="maxWallMs"
+          inputMode="numeric"
+          value={form.maxWallMs}
+          placeholder="300000"
+          onChange={(event) => update({ maxWallMs: event.target.value })}
         />
       </label>
 

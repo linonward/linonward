@@ -52,8 +52,18 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `GET` | `/api/runs` | 最近的运行列表（读磁盘 checkpoint）：`[{ runId, task?, savedAt?, status?, stopReason?, live }]`。 |
 | `GET` | `/api/runs/:runId` | 最新 checkpoint 快照：`status` / `stopReason` / `budget` / `usage` / `changedFiles` / `validations` / `plan` / `messages` / `pending`（等待回答的请求）。 |
 | `POST` | `/api/runs/:runId/answer` | body `{ requestId, text }`：审批 / 澄清后继续运行。 |
+| `POST` | `/api/runs/:runId/cancel` | 中止正在执行的运行（`abort` 一路传到模型调用与工具，含整个进程组）。运行停在等待回答时返回 409：没有正在跑的任务。 |
 
 服务只监听 `127.0.0.1`，没有鉴权（本地工具）。
+
+## 花费与时间的硬上限
+
+表单里的「花费上限 USD」与「墙钟上限 ms」直接对应 Loop 的 `budget.maxCostUsd` / `maxWallMs`：
+
+- 每次模型调用之后立刻判定，**当轮的工具不会再被派发**；停止原因是 `max_cost` / `max_wall_ms`，
+  诊断里带上限与实际花费（`spent=`）或耗时（`wallMs=`）。
+- 设了花费上限却算不出成本（模型不在价目表里）时**同样停下**：`cost=unknown` 不等于没花钱。
+- 「中止运行」按钮只在服务端确认运行正在执行时可用；等待回答的运行没有可中止的任务（409）。
 
 ## 刷新 / 重开 / 继续一次运行
 

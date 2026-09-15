@@ -2,6 +2,7 @@ import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } 
 import { RunForm } from "./components/RunForm.js";
 import { RunList } from "./components/RunList.js";
 import {
+  cancelRun,
   fetchSnapshot,
   listRuns,
   openRunStream,
@@ -68,36 +69,47 @@ export function App(): ReactElement {
    * EventSource 看不到 HTTP 状态码，所以 404 与网络中断都只表现为 `error`：
    * 这里主动去问一次快照——有快照说明"频道没了但运行还在磁盘上"，没有才是真的断了。
    */
-  const connect = useCallback((id: string, after: number): void => {
-    closeRef.current?.();
-    closeRef.current = openRunStream(id, after, {
-      onRecord: (record, seq) => {
-        lastSeqRef.current = Math.max(lastSeqRef.current, seq);
-        setRecords((previous) => [...previous, record]);
-      },
-      onDone: () => {
-        setPhase("done");
-      },
-      onError: (message) => {
-        void fetchSnapshot(id)
-          .then((restored) => {
-            if (restored === undefined) {
+  const connect = useCallback(
+    (id: string, after: number): void => {
+      closeRef.current?.();
+      closeRef.current = openRunStream(id, after, {
+        onRecord: (record, seq) => {
+          lastSeqRef.current = Math.max(lastSeqRef.current, seq);
+          setRecords((previous) => [...previous, record]);
+        },
+        onDone: () => {
+          setPhase("done");
+          // 结束后再拉一次快照：状态、用量与"能否中止"都以权威检查点为准，
+          // 而不是停在开始那一刻的旧值上。
+          void fetchSnapshot(id)
+            .then((latest) => {
+              if (latest !== undefined) setSnapshot(latest);
+            })
+            .catch(() => undefined);
+          refreshRuns();
+        },
+        onError: (message) => {
+          void fetchSnapshot(id)
+            .then((restored) => {
+              if (restored === undefined) {
+                setError(message);
+                setPhase("error");
+                return;
+              }
+              setSnapshot(restored);
+              setStreamUnavailable(true);
+              setError(undefined);
+              setPhase("done");
+            })
+            .catch(() => {
               setError(message);
               setPhase("error");
-              return;
-            }
-            setSnapshot(restored);
-            setStreamUnavailable(true);
-            setError(undefined);
-            setPhase("done");
-          })
-          .catch(() => {
-            setError(message);
-            setPhase("error");
-          });
-      },
-    });
-  }, []);
+            });
+        },
+      });
+    },
+    [refreshRuns],
+  );
 
   /** 打开一次运行：先读 checkpoint，再（如果频道还在）接上实时流。 */
   const open = useCallback(
@@ -166,6 +178,17 @@ export function App(): ReactElement {
       });
   };
 
+  const handleCancel = (): void => {
+    if (runId === undefined) return;
+    cancelRun(runId)
+      .then(() => {
+        setError(undefined);
+      })
+      .catch((cause: unknown) => {
+        setError(messageOf(cause));
+      });
+  };
+
   const handleNew = (): void => {
     closeRef.current?.();
     setRunId(undefined);
@@ -207,6 +230,7 @@ export function App(): ReactElement {
         }}
         onAnswer={handleAnswer}
         onNew={handleNew}
+        onCancel={handleCancel}
       />
     </div>
   );

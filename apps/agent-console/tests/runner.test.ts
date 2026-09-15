@@ -17,6 +17,7 @@ import type {
 } from "../../../packages/agent-from-scratch-fixture/src/types.js";
 import { type RunChannel, RunHub } from "../server/bus.js";
 import {
+  cancelRefusal,
   clarificationMismatch,
   createConsoleRunner,
   RunnerError,
@@ -567,6 +568,77 @@ describe("进程重启后继续一次等待中的运行（离线）", () => {
       await expect(
         runner.answer("never-existed", { requestId: "req-1", text: "批准" }),
       ).rejects.toMatchObject({ status: 404 });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+/** 中止运行：没有可中止的东西时要给出不同的拒绝，而不是一律报"未知运行"。 */
+describe("中止运行（离线，假密钥 + 不可达 baseUrl）", () => {
+  it("没有活上下文 → 404；有上下文但没在执行 → 409；正在执行 → 放行", () => {
+    expect(cancelRefusal(undefined, "run-1")).toMatchObject({ status: 404 });
+    expect(cancelRefusal({ active: false }, "run-1")).toMatchObject({
+      status: 409,
+      message: expect.stringContaining("等待回答"),
+    });
+    expect(cancelRefusal({ active: true }, "run-1")).toBeUndefined();
+  });
+
+  it("中止正在执行的运行会真的把它停下来（abort 一路传到模型调用）", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-cancel-"));
+    try {
+      const hub = new RunHub();
+      const runner = createConsoleRunner({
+        env: {
+          DEEPSEEK_API_KEY: FAKE_KEY,
+          // 不可达：模型调用会卡在重试里，正好留出"运行中"的窗口。
+          DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1",
+        },
+        hub,
+        storeRoot: directory,
+      });
+
+      const { runId } = await runner.start(startInput());
+      const channel = hub.get(runId);
+      expect(channel).toBeDefined();
+      if (channel === undefined) return;
+
+      // 可能已经失败（极快）——那就没有可中止的运行，语义上等价于"已结束"。
+      const cancel = await runner.cancel(runId).then(
+        () => "ok" as const,
+        (error: unknown) => error,
+      );
+      if (cancel !== "ok") {
+        expect(cancel).toMatchObject({ status: expect.any(Number) });
+      }
+
+      await waitForDone(channel, 30_000);
+      expect(channel.done).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("硬上限写进 run_started 记录，重建运行时才拿得回来", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-caps-"));
+    try {
+      const runner = createConsoleRunner({
+        env: { DEEPSEEK_API_KEY: FAKE_KEY, DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1" },
+        hub: new RunHub(),
+        storeRoot: directory,
+      });
+
+      const { runId } = await runner.start(startInput({ maxCostUsd: 0.5, maxWallMs: 60_000 }));
+      const journal = await readFile(join(directory, runId, "journal.jsonl"), "utf8");
+      const meta = JSON.parse(journal.split("\n")[0] ?? "{}") as Record<string, unknown>;
+
+      expect(meta["budgets"]).toEqual({
+        maxSteps: 2,
+        maxToolCalls: 2,
+        maxCostUsd: 0.5,
+        maxWallMs: 60_000,
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

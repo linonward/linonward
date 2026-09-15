@@ -10,11 +10,13 @@ interface FakeRunner {
   runner: ConsoleRunner;
   starts: StartRunInput[];
   answers: Array<{ runId: string; requestId: string; text: string }>;
+  cancels: string[];
 }
 
 function createFakeRunner(overrides: Partial<ConsoleRunner> = {}): FakeRunner {
   const starts: StartRunInput[] = [];
   const answers: Array<{ runId: string; requestId: string; text: string }> = [];
+  const cancels: string[] = [];
   const runner: ConsoleRunner = {
     start:
       overrides.start ??
@@ -33,6 +35,11 @@ function createFakeRunner(overrides: Partial<ConsoleRunner> = {}): FakeRunner {
         if (runId !== "run-1") return undefined;
         return { runId, status: "completed", stopReason: "final_answer", changedFiles: ["a.txt"] };
       }),
+    cancel:
+      overrides.cancel ??
+      (async (runId) => {
+        cancels.push(runId);
+      }),
     list:
       overrides.list ??
       (async () => [
@@ -45,7 +52,7 @@ function createFakeRunner(overrides: Partial<ConsoleRunner> = {}): FakeRunner {
         },
       ]),
   };
-  return { runner, starts, answers };
+  return { runner, starts, answers, cancels };
 }
 
 /** 起一个临时监听：真实 HTTP 路由 + 注入的假 runner，不碰网络也不碰密钥。 */
@@ -86,6 +93,7 @@ describe("matchRoute", () => {
     expect(matchRoute("GET", "/api/runs/abc/stream")).toEqual({ name: "stream", runId: "abc" });
     expect(matchRoute("GET", "/api/runs/abc")).toEqual({ name: "snapshot", runId: "abc" });
     expect(matchRoute("POST", "/api/runs/abc/answer")).toEqual({ name: "answer", runId: "abc" });
+    expect(matchRoute("POST", "/api/runs/abc/cancel")).toEqual({ name: "cancel", runId: "abc" });
   });
 
   it("方法与路径不匹配时返回 undefined", () => {
@@ -94,6 +102,7 @@ describe("matchRoute", () => {
     expect(matchRoute("DELETE", "/api/runs/abc")).toBeUndefined();
     expect(matchRoute("GET", "/api")).toBeUndefined();
     expect(matchRoute("POST", "/api/runs")).toBeUndefined();
+    expect(matchRoute("GET", "/api/runs/abc/cancel")).toBeUndefined();
   });
 });
 
@@ -253,6 +262,56 @@ describe("API 路由（注入假 runner）", () => {
 
         const missing = await fetch(`${base}/api/runs/nope`);
         expect(missing.status).toBe(404);
+      },
+    );
+  });
+
+  it("POST /api/runs/:runId/cancel 中止运行，未知运行把 runner 的 4xx 透传出来", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const response = await fetch(`${base}/api/runs/run-1/cancel`, { method: "POST" });
+        expect(response.status).toBe(200);
+        expect(fake.cancels).toEqual(["run-1"]);
+      },
+    );
+
+    const rejecting = createFakeRunner({
+      cancel: async () => {
+        throw new RunnerError(409, "没有正在执行的任务");
+      },
+    });
+    await withServer(
+      { runner: rejecting.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const response = await fetch(`${base}/api/runs/run-1/cancel`, { method: "POST" });
+        expect(response.status).toBe(409);
+        await expect(response.json()).resolves.toEqual({ error: "没有正在执行的任务" });
+      },
+    );
+  });
+
+  it("POST /api/run 透传硬上限，非法上限是 400", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const response = await fetch(`${base}/api/run`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task: "x", maxCostUsd: 0.5, maxWallMs: 60_000 }),
+        });
+        expect(response.status).toBe(200);
+        expect(fake.starts[0]).toMatchObject({ maxCostUsd: 0.5, maxWallMs: 60_000 });
+
+        const bad = await fetch(`${base}/api/run`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task: "x", maxCostUsd: -1 }),
+        });
+        expect(bad.status).toBe(400);
+        await expect(bad.json()).resolves.toEqual({ error: "maxCostUsd 需要正数" });
       },
     );
   });

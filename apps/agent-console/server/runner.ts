@@ -83,6 +83,10 @@ export interface StartRunInput {
   allowedArgv: string[][];
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）：缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：缺省不限制。 */
+  maxWallMs?: number | undefined;
   approveAllowed: boolean;
   requireSandbox: boolean;
   repeatGuard: boolean;
@@ -113,6 +117,8 @@ export interface RunSnapshot {
   validations?: unknown;
   plan?: unknown;
   messages?: unknown;
+  /** 这个运行当前是否正在执行（决定界面上的"中止运行"是否可用）。 */
+  cancellable?: boolean | undefined;
   /**
    * 等待回答的请求（审批 / 澄清）。刷新页面后实时流可能已经不存在，
    * 界面靠它把输入框重建出来，否则这次运行就永远卡在那里了。
@@ -142,6 +148,8 @@ export interface RunSummary {
 export interface ConsoleRunner {
   start(input: StartRunInput): Promise<{ runId: string }>;
   answer(runId: string, input: { requestId: string; text: string }): Promise<void>;
+  /** 中止正在执行的运行：abort 会一路传到模型调用与工具（含整个进程组）。 */
+  cancel(runId: string): Promise<void>;
   snapshot(runId: string): Promise<RunSnapshot | undefined>;
   list(limit?: number): Promise<RunSummary[]>;
 }
@@ -161,6 +169,10 @@ interface RunContext {
   base: AgentCliOptions;
   cliInput: CliRuntimeInput;
   runtime: AgentRuntime;
+  /** 中止信号：一路传到模型调用与工具；`cancel` 只需要 abort 它。 */
+  controller: AbortController;
+  /** 是否有正在执行的循环（`waiting` 时为 false，此时没有东西可中止）。 */
+  active: boolean;
   ownerId: string;
   pricing: LoopPricing;
   store: LocalFileRunStore;
@@ -276,6 +288,29 @@ function resolveDeepSeek(
   return { config: resolved, pricing: { modelId: resolved.model, table } };
 }
 
+/**
+ * 能不能中止一次运行：返回 `undefined` 表示可以，否则是给调用方的可读 4xx。
+ *
+ * 单独成函数是为了让"没有上下文"与"有上下文但没在执行"这两种拒绝都能被离线测到——
+ * 它们的处理方式不同：前者是 404（进程重启后已经没有可中止的东西），后者是 409
+ * （运行正停在等待回答，没有正在跑的任务）。
+ */
+export function cancelRefusal(
+  context: { active: boolean } | undefined,
+  runId: string,
+): RunnerError | undefined {
+  if (context === undefined) {
+    return new RunnerError(404, `没有正在执行的运行：${runId}（进程重启后请重新发起）`);
+  }
+  if (!context.active) {
+    return new RunnerError(
+      409,
+      `这次运行没有正在执行的任务（当前状态是"等待回答"或已结束），无需中止`,
+    );
+  }
+  return undefined;
+}
+
 /** 真实运行器：`POST /api/run` 与 `POST /answer` 背后的实现。 */
 export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunner {
   const env = options.env;
@@ -368,10 +403,11 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       onToolCall: createJournalToolHook(journal),
     };
 
+    const controller = new AbortController();
     const cliInput: CliRuntimeInput = {
       cwd: run.cwd,
       skillsDirectory,
-      signal: new AbortController().signal,
+      signal: controller.signal,
       onEvent,
       journal,
     };
@@ -384,6 +420,8 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       base,
       cliInput,
       runtime: createAgentRuntime(base, cliInput),
+      controller,
+      active: false,
       ownerId: randomUUID(),
       pricing,
       store,
@@ -417,6 +455,17 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       allowedArgv: meta?.allowedArgv ?? [],
       maxSteps: budgets?.maxSteps ?? checkpoint.state.budget.maxSteps,
       maxToolCalls: budgets?.maxToolCalls ?? checkpoint.state.budget.maxToolCalls,
+      // 上限同样按"记录在案"恢复；旧 journal 没有这两个字段时退回不限。
+      ...(budgets?.maxCostUsd !== undefined
+        ? { maxCostUsd: budgets.maxCostUsd }
+        : checkpoint.state.budget.maxCostUsd !== undefined
+          ? { maxCostUsd: checkpoint.state.budget.maxCostUsd }
+          : {}),
+      ...(budgets?.maxWallMs !== undefined
+        ? { maxWallMs: budgets.maxWallMs }
+        : checkpoint.state.budget.maxWallMs !== undefined
+          ? { maxWallMs: checkpoint.state.budget.maxWallMs }
+          : {}),
       approveAllowed: meta?.approveAllowed === true,
       requireSandbox: meta?.requireSandbox ?? false,
       repeatGuard: true,
@@ -433,6 +482,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
   }
 
   function closeContext(context: RunContext): void {
+    context.active = false;
     context.tailer.stop();
     context.journal.close();
     contexts.delete(context.runId);
@@ -441,6 +491,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
   /** 运行结束的收尾：先冲掉 journal 增量，再推 `run_stopped`，最后关闭频道。 */
   function settle(context: RunContext, result: AgentResult): void {
     const at = new Date().toISOString();
+    context.active = false;
     context.journal.usage(runUsageEntry(result, context.pricing));
 
     const budget = readBudgetExhaustedDetail(result.state);
@@ -475,6 +526,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
 
   function failContext(context: RunContext, error: unknown): void {
     const at = new Date().toISOString();
+    context.active = false;
     context.tailer.flush();
     context.channel.push({
       kind: "run_error",
@@ -512,20 +564,31 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       const state = createInitialState(
         input.task,
         input.cwd,
-        { maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls },
+        {
+          maxSteps: input.maxSteps,
+          maxToolCalls: input.maxToolCalls,
+          ...(input.maxCostUsd !== undefined ? { maxCostUsd: input.maxCostUsd } : {}),
+          ...(input.maxWallMs !== undefined ? { maxWallMs: input.maxWallMs } : {}),
+        },
         { runId },
       );
       context.journal.runMeta({
         command: "run",
         task: input.task,
         cwd: input.cwd,
-        budgets: { maxSteps: input.maxSteps, maxToolCalls: input.maxToolCalls },
+        budgets: {
+          maxSteps: input.maxSteps,
+          maxToolCalls: input.maxToolCalls,
+          ...(input.maxCostUsd !== undefined ? { maxCostUsd: input.maxCostUsd } : {}),
+          ...(input.maxWallMs !== undefined ? { maxWallMs: input.maxWallMs } : {}),
+        },
         allowedArgv: input.allowedArgv,
         requireSandbox: input.requireSandbox,
         approveAllowed: input.approveAllowed,
         modelId: context.modelId,
       });
 
+      context.active = true;
       try {
         const lease = await store.acquireLease(runId, context.ownerId, CLI_LEASE_TTL_MS);
         void runFromState(context, input.task, state, lease)
@@ -556,6 +619,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       }
 
       context.channel.reopen();
+      context.active = true;
       const runtime = createAgentCliRuntime(context.base)(context.cliInput);
 
       void runtime
@@ -568,6 +632,20 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
         .catch((error: unknown) => failContext(context, error));
     },
 
+    /**
+     * 中止一次运行。
+     *
+     * `abort` 会传到模型调用与工具层（`run_command` 因此会回收整个进程组），循环随即以
+     * `cancelled` 停止并落检查点。**等待回答的运行没有可中止的东西**：它只是一个停下的
+     * 检查点，因此返回 409 说明原因，而不是假装成功。
+     */
+    async cancel(runId) {
+      const context = contexts.get(runId);
+      const refusal = cancelRefusal(context, runId);
+      if (refusal !== undefined) throw refusal;
+      context?.controller.abort();
+    },
+
     async snapshot(runId) {
       const history = await store.loadCheckpointHistory(runId, 1);
       const checkpoint = history.at(0);
@@ -575,6 +653,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
 
       const state = checkpoint.state;
       const snapshot: RunSnapshot = {
+        cancellable: contexts.get(runId)?.active === true,
         runId: checkpoint.runId,
         status: state.status,
         budget: state.budget,

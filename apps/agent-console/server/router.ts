@@ -27,7 +27,8 @@ export type RouteMatch =
   | { name: "start" }
   | { name: "stream"; runId: string }
   | { name: "snapshot"; runId: string }
-  | { name: "answer"; runId: string };
+  | { name: "answer"; runId: string }
+  | { name: "cancel"; runId: string };
 
 /** 纯路由匹配：只做方法与路径的判断，方便离线单测。 */
 export function matchRoute(method: string, pathname: string): RouteMatch | undefined {
@@ -35,7 +36,7 @@ export function matchRoute(method: string, pathname: string): RouteMatch | undef
   if (method === "GET" && pathname === "/api/runs") return { name: "runs" };
   if (method === "POST" && pathname === "/api/run") return { name: "start" };
 
-  const match = /^\/api\/runs\/([^/]+)(\/stream|\/answer)?$/.exec(pathname);
+  const match = /^\/api\/runs\/([^/]+)(\/stream|\/answer|\/cancel)?$/.exec(pathname);
   if (match === null) return undefined;
   const rawId = match[1];
   if (rawId === undefined) return undefined;
@@ -50,6 +51,7 @@ export function matchRoute(method: string, pathname: string): RouteMatch | undef
   const suffix = match[2];
   if (suffix === "/stream") return method === "GET" ? { name: "stream", runId } : undefined;
   if (suffix === "/answer") return method === "POST" ? { name: "answer", runId } : undefined;
+  if (suffix === "/cancel") return method === "POST" ? { name: "cancel", runId } : undefined;
   return method === "GET" ? { name: "snapshot", runId } : undefined;
 }
 
@@ -58,6 +60,16 @@ function readPositiveInt(record: JournalRecord, key: string, fallback: number): 
   if (value === undefined) return fallback;
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
     throw new RunnerError(400, `${key} 需要正整数`);
+  }
+  return value;
+}
+
+/** 可选的正数（金额用，允许小数）：给错值时立刻 4xx，而不是静默忽略上限。 */
+function readOptionalPositiveNumber(record: JournalRecord, key: string): number | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new RunnerError(400, `${key} 需要正数`);
   }
   return value;
 }
@@ -106,6 +118,13 @@ export function parseRunInput(value: unknown, defaultCwd: string): StartRunInput
 
   const plannerModel = readString(value, "plannerModel")?.trim();
   if (plannerModel !== undefined && plannerModel.length > 0) input.plannerModel = plannerModel;
+
+  // 硬上限：缺省即不限制，给了非法值就是 400——静默忽略上限比报错危险得多。
+  const maxCostUsd = readOptionalPositiveNumber(value, "maxCostUsd");
+  if (maxCostUsd !== undefined) input.maxCostUsd = maxCostUsd;
+  const maxWallMs = readOptionalPositiveNumber(value, "maxWallMs");
+  if (maxWallMs !== undefined) input.maxWallMs = maxWallMs;
+
   return input;
 }
 
@@ -271,6 +290,11 @@ export function createRequestHandler(
             return;
           }
           sendJson(response, 200, snapshot);
+          return;
+        }
+        case "cancel": {
+          await options.runner.cancel(route.runId);
+          sendJson(response, 200, { ok: true });
           return;
         }
         case "answer": {

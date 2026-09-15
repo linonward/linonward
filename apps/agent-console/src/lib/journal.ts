@@ -144,7 +144,14 @@ export interface RunStartView {
   task?: string | undefined;
   cwd?: string | undefined;
   modelId?: string | undefined;
-  budgets?: { maxSteps?: number | undefined; maxToolCalls?: number | undefined } | undefined;
+  budgets?:
+    | {
+        maxSteps?: number | undefined;
+        maxToolCalls?: number | undefined;
+        maxCostUsd?: number | undefined;
+        maxWallMs?: number | undefined;
+      }
+    | undefined;
   allowedArgv: string[][];
   requireSandbox?: boolean | undefined;
 }
@@ -170,6 +177,10 @@ export interface BudgetView {
   maxSteps?: number | undefined;
   toolCalls: number;
   maxToolCalls?: number | undefined;
+  /** 花费上限（美元）：未设置即不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：未设置即不限制。 */
+  maxWallMs?: number | undefined;
 }
 
 export interface StopView {
@@ -274,6 +285,8 @@ function readStart(record: JournalRecord): RunStartView {
     start.budgets = {
       maxSteps: readNumber(budgets, "maxSteps"),
       maxToolCalls: readNumber(budgets, "maxToolCalls"),
+      maxCostUsd: readNumber(budgets, "maxCostUsd"),
+      maxWallMs: readNumber(budgets, "maxWallMs"),
     };
   }
   return start;
@@ -307,6 +320,10 @@ function readBudgetFromDetail(detail: JournalRecord): BudgetView | undefined {
   if (maxSteps !== undefined) view.maxSteps = maxSteps;
   const maxToolCalls = readNumber(budget, "maxToolCalls");
   if (maxToolCalls !== undefined) view.maxToolCalls = maxToolCalls;
+  const maxCostUsd = readNumber(budget, "maxCostUsd");
+  if (maxCostUsd !== undefined) view.maxCostUsd = maxCostUsd;
+  const maxWallMs = readNumber(budget, "maxWallMs");
+  if (maxWallMs !== undefined) view.maxWallMs = maxWallMs;
   return view;
 }
 
@@ -631,6 +648,10 @@ export function projectRun(runId: string, records: readonly JournalRecord[]): Ru
   };
   if (maxSteps !== undefined) derivedBudget.maxSteps = maxSteps;
   if (maxToolCalls !== undefined) derivedBudget.maxToolCalls = maxToolCalls;
+  const maxCostUsd = start?.budgets?.maxCostUsd;
+  const maxWallMs = start?.budgets?.maxWallMs;
+  if (maxCostUsd !== undefined) derivedBudget.maxCostUsd = maxCostUsd;
+  if (maxWallMs !== undefined) derivedBudget.maxWallMs = maxWallMs;
 
   const view: RunView = {
     runId,
