@@ -23,12 +23,36 @@ function collector(): { lines: string[]; write: (line: string) => void } {
   return { lines, write: (line) => void lines.push(line) };
 }
 
+/**
+ * DeepSeek（与 OpenAI 同形）的 reasoning item：正文分片是
+ * `{ type: "reasoning_text", text }`——**字段名是 `text`**，和普通 message 分片一致。
+ * 真实抓包的形状见下方 `recordedReasoningPayload`。
+ */
 function reasoningItem(...parts: string[]): ResponsesResultLike["output"][number] {
   return {
     type: "reasoning",
-    content: parts.map((text) => ({ type: "reasoning_text", reasoning_text: text })),
+    content: parts.map((text) => ({ type: "reasoning_text", text })),
   };
 }
+
+/**
+ * 真实抓包（`POST https://api.deepseek.com/v1/responses`，`deepseek-v4-pro`，
+ * 带 `tools` 的一轮）里的 reasoning item。刻意保留 provider 自己的字段顺序与
+ * `summary` / `encrypted_content` 噪声，防止解析逻辑再次对着臆想的字段名写。
+ */
+const recordedReasoningPayload = {
+  type: "reasoning",
+  id: "f08a962c-53ba-4b02-822a-76c69cae1744",
+  status: "completed",
+  content: [
+    {
+      type: "reasoning_text",
+      text: 'We need answer user asks "Report which package manager this repository uses." Need investigate repo.',
+    },
+  ],
+  summary: [],
+  encrypted_content: "00863080-42ab-4186-9829-f841d1da6981-0",
+};
 
 describe("ModelTurn.reasoning", () => {
   it("从 reasoning items 聚合可见推理，且与 finalText 严格分离", () => {
@@ -63,7 +87,7 @@ describe("ModelTurn.reasoning", () => {
     expect(Object.hasOwn(turn, "reasoning")).toBe(false);
   });
 
-  it("只有空 reasoning_text 时同样视为缺失", () => {
+  it("只有空推理文本时同样视为缺失", () => {
     const response: ResponsesResultLike = {
       id: "response-3",
       output_text: "",
@@ -76,13 +100,44 @@ describe("ModelTurn.reasoning", () => {
     ).toBeUndefined();
   });
 
+  it("解析真实抓包的 reasoning item（正文在 text 字段，summary 为空）", () => {
+    const turn = toModelTurn({
+      id: "response-recorded",
+      output_text: "",
+      output: [recordedReasoningPayload],
+    });
+
+    expect(turn.reasoning).toEqual([
+      'We need answer user asks "Report which package manager this repository uses." Need investigate repo.',
+    ]);
+  });
+
+  it("网关把正文放在 reasoning_text 时仍然接受（防御性兼容）", () => {
+    expect(
+      collectReasoning([
+        { type: "reasoning", content: [{ type: "reasoning_text", reasoning_text: "兼容分片。" }] },
+      ]),
+    ).toEqual(["兼容分片。"]);
+  });
+
+  it("summary_text 分片不算思维链正文，不会被误当成推理", () => {
+    expect(
+      collectReasoning([
+        {
+          type: "reasoning",
+          content: [{ type: "summary_text", text: "这是摘要，不是正文。" }],
+        },
+      ]),
+    ).toBeUndefined();
+  });
+
   it("归一化层保留 reasoning item 的 content，最后进入 ModelTurn.reasoning", async () => {
     const payload = {
       id: "response-4",
       output: [
         {
           type: "reasoning",
-          content: [{ type: "reasoning_text", reasoning_text: "检查仓库结构。" }],
+          content: [{ type: "reasoning_text", text: "检查仓库结构。" }],
         },
         {
           type: "message",

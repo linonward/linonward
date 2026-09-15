@@ -67,7 +67,8 @@ export interface ResponseOutputItem {
 }
 
 /**
- * `message` item 的 `output_text` 与 `reasoning` item 的 `reasoning_text` 共用这个分片形状。
+ * `message` item 的 `output_text` 与 `reasoning` item 的 `reasoning_text` 分片共用
+ * `text` 字段：正文靠 `type` 区分，不靠字段名。
  * 直接复用 `model.ts` 的定义，避免归一化层与 `toModelTurn` 对同一份 provider 形状各写一遍。
  */
 export type ResponseContentPart = ModelResponseContentPart;

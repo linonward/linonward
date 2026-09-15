@@ -1,7 +1,7 @@
 # @linonward/agent-console
 
 把 `packages/agent-from-scratch-fixture` 的**一次真实运行**实时呈现出来的本地 Web 界面——
-包括模型的**思维链**（`reasoning` items 的 `content[].reasoning_text`）。
+包括模型的**思维链**（`reasoning` items 的 `content[].text`，分片类型 `reasoning_text`）。
 
 界面本身完全离线：真实模型请求只发生在本地 API 服务进程里，密钥只在那个进程的
 `process.env` / `.env` 中读取，既不会渲染到页面，也不会写进任何响应或日志。
