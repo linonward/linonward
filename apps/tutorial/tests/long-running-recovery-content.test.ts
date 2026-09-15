@@ -1,17 +1,13 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-const lessonPath = fileURLToPath(
-  new URL("../src/content/long-running-recovery.mdx", import.meta.url),
-);
+import { codeText, lessonSource, listProp, stepIds } from "./support/lesson-source";
+
+const source = lessonSource("long-running-recovery");
+const code = codeText(source);
 
 describe("long-running recovery lesson", () => {
-  it("teaches durable checkpoints, event replay, leases, and safe tool recovery", () => {
-    const source = readFileSync(lessonPath, "utf8");
-
-    for (const stepId of [
+  it("keeps the anchors of durable checkpoints, replay, leases, and safe recovery", () => {
+    expect(stepIds(source)).toEqual([
       "separate-runtime-and-durable-state",
       "define-recovery-records",
       "write-atomic-checkpoints",
@@ -19,10 +15,10 @@ describe("long-running recovery lesson", () => {
       "restore-and-replay",
       "resume-agent-loop",
       "test-crash-recovery",
-    ]) {
-      expect(source).toContain(`id="${stepId}"`);
-    }
+    ]);
+  });
 
+  it("keeps the durable record, fencing, and idempotency contract in code", () => {
     for (const marker of [
       "RunCheckpoint",
       "schemaVersion",
@@ -36,7 +32,16 @@ describe("long-running recovery lesson", () => {
       "lease.epoch",
       "eventsThroughCheckpoint",
     ]) {
-      expect(source).toContain(marker);
+      expect(code, `recovery lesson should keep ${marker}`).toContain(marker);
     }
+  });
+
+  it("declares the run store, checkpoint, and recovery modules", () => {
+    const files = listProp(source, "LessonOverview", "files");
+
+    expect(files).toContain("src/run-store.ts");
+    expect(files).toContain("src/checkpoint.ts");
+    expect(files).toContain("src/recovery.ts");
+    expect(files).toContain("tests/recovery.test.ts");
   });
 });

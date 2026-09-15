@@ -2,19 +2,24 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { TutorialShell } from "@/components/tutorial-shell";
-import { chapters, getChapter } from "@/lib/chapters";
+import { chapters, getChapter, type AnyChapter } from "@/lib/chapters";
+import { extensionChapters, getExtensionChapter } from "@/lib/extensions";
 
 interface ChapterPageProps {
   params: Promise<{ slug: string }>;
 }
 
 export function generateStaticParams() {
-  return chapters.map((chapter) => ({ slug: chapter.slug }));
+  return [...chapters, ...extensionChapters].map((chapter) => ({ slug: chapter.slug }));
+}
+
+function findChapter(slug: string): AnyChapter | undefined {
+  return getChapter(slug) ?? getExtensionChapter(slug);
 }
 
 export async function generateMetadata({ params }: ChapterPageProps): Promise<Metadata> {
   const { slug } = await params;
-  const chapter = getChapter(slug);
+  const chapter = findChapter(slug);
 
   if (!chapter) {
     return {};
@@ -28,7 +33,7 @@ export async function generateMetadata({ params }: ChapterPageProps): Promise<Me
 
 export default async function ChapterPage({ params }: ChapterPageProps) {
   const { slug } = await params;
-  const chapter = getChapter(slug);
+  const chapter = findChapter(slug);
 
   if (!chapter) {
     notFound();

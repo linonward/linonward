@@ -1,0 +1,21 @@
+{
+  "name": "@linonward/agent-from-scratch-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Executable reference implementation of the apps/tutorial agent-from-scratch project.",
+  "scripts": {
+    "lint": "eslint src tests --max-warnings=0",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "yaml": "2.9.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.4",
+    "typescript": "6.0.3",
+    "vitest": "5.0.0"
+  }
+}

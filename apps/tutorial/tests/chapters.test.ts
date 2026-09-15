@@ -1,12 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  chapters,
-  getChapter,
-  getChapterNeighbors,
-  tutorialExtensions,
-  tutorialGoal,
-} from "../src/lib/chapters";
+import { chapters, getChapter, getChapterNeighbors, tutorialGoal } from "../src/lib/chapters";
+import { tutorialExtensions } from "../src/lib/extensions";
 
 describe("chapter catalog", () => {
   it("declares the tutorial-wide goal separately from chapter goals", () => {

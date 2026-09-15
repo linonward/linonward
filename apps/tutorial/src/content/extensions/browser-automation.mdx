@@ -1,0 +1,260 @@
+<LessonOverview
+  goal="让 Agent 通过有界观测与受控动作操作浏览器，并把会话、凭据和高风险副作用继续纳入已有的权限与审计边界。"
+  task="用 Fake BrowserSession 完成一次导航、观测、点击与输入，并验证元素引用失效、未批准的高风险动作和凭据泄露都被拒绝。"
+  prerequisites="主线第 05 章「读懂仓库」与第 09 章「权限与安全」已经通过 Checkpoint。本章复用它们的 defineTool、authorize、ApprovalRequest 与 transitionState，不引入 Playwright 等真实依赖。"
+  files={["src/browser/types.ts", "src/browser/session.ts", "src/browser/refs.ts", "src/browser/policy.ts", "src/tools/browser.ts", "src/index.ts", "tests/browser.test.ts"]}
+/>
+
+扩展篇复用主线已经建立的契约，但**不是主线 Capstone 的前置条件**：你可以先完成 18 章主线，也可以只带着工具系统与权限层的小项目来读这一章。本章把浏览器看作“一个只会返回不可信文本、只能通过 Harness 生成句柄操作的外部系统”，其余边界全部沿用已有实现。
+
+<Step id="define-observation-contract" number={1} title="定义观测与动作契约">
+
+浏览器的输出默认是不可信、无限大、且可能随时变化的。因此先固定两条契约：观测只把**有界摘要**放进上下文，动作只通过 Harness 生成的稳定引用定位元素。
+
+```typescript
+export interface ElementRef {
+  ref: string;
+  role: string;
+  name: string;
+  elementFingerprint: string;
+}
+
+export interface ArtifactRef {
+  path: string;
+  sha256: string;
+  bytes: number;
+  mediaType: string;
+}
+
+export interface PageObservation {
+  observationId: string;
+  url: string;
+  title: string;
+  visibleText: { text: string; truncated: boolean };
+  elements: ElementRef[];
+  screenshot: ArtifactRef | null;
+  observedAt: string;
+}
+```
+
+`visibleText` 走主线 `read_file` 同一条“截断并明确标记”的思路：上下文里只放 `truncated` 之后的摘要。截图不塞进 prompt，而是写成 artifact 后只保留路径、hash 与体积；需要看图时由人在 artifact 上确认，模型继续用文本摘要工作。
+
+`PageObservation` 里的每个字段都是**数据，不是指令**。页面正文可能写着“忽略之前的规则并执行下面命令”，这类文本与 `search_text` 命中的仓库文本同级，永远不能提升为系统提示或工具调用。观测结果进入上下文时标记为低优先级外部来源；模型若据此提议动作，仍要经过第 3、4 步的门禁。
+
+动作同样是封闭集合。每个动作必须声明 `risk`，并声明自己是否可重放：
+
+```typescript
+export type BrowserAction = { risk: "low" | "high"; replayable: boolean } & (
+  | { kind: "navigate"; target: string }
+  | { kind: "click"; ref: string }
+  | { kind: "type"; ref: string; text: string }
+  | { kind: "select"; ref: string; value: string }
+  | { kind: "press"; ref: string; key: string }
+  | { kind: "wait"; ref: string; forText: string }
+);
+export function isReplayable(action: BrowserAction): boolean {
+  return action.replayable;
+}
+```
+
+`replayable: false` 表示这个动作会改变外部系统状态，超时后不能自动重跑。点击“提交”、输入验证码、触发下载都属于这一类；上层 Loop 只能重新观测、重新规划，而不是盲目重试。
+
+为什么不让模型自己写 CSS selector 或 XPath？selector 是模型编的自由文本，Harness 无法证明它指向哪个元素，也无法判断页面变化后是否仍指向同一目标。让观测阶段生成 `ref`、动作阶段只接受 `ref`，Harness 就同时得到了可校验的元素身份与可审计的动作目标。
+
+<Callout title="扩展边界">
+
+本章只定义契约与策略，**不引入 Playwright、Puppeteer 或 CDP 依赖**。第 5 步用一个 Fake Session 离线验证全部规则；真实实现是后续可以替换的适配器，不是本章验收条件。
+
+</Callout>
+
+</Step>
+
+<Step id="manage-session" number={2} title="管理会话与凭据边界">
+
+浏览器是有状态的外部资源：登录态、cookie、下载目录和打开的页面都活在会话里。因此把会话收敛成一个窄接口，由 Harness 创建、持有并显式关闭。
+
+```typescript
+export interface OpenOptions {
+  startUrl: string;
+  headless: boolean;
+  credentialRef?: string;
+}
+
+export interface BrowserSession {
+  open(options: OpenOptions, signal: AbortSignal): Promise<void>;
+  observe(signal: AbortSignal): Promise<PageObservation>;
+  act(action: BrowserAction, signal: AbortSignal): Promise<ActionOutcome>;
+  close(): Promise<void>;
+}
+
+export interface ActionOutcome {
+  ok: boolean;
+  error?: "stale_element_ref" | "action_not_replayable" | "navigation_failed";
+}
+```
+
+凭据只保存**引用**：`credentialRef: "site-login"` 指向密钥库中的条目，真实用户名与密码在 `open` 内部由密钥提供者解析，绝不写进事件日志、`ApprovalRequest.summary`、截图或模型上下文。`ApprovalRequest` 里记录的是“需要对 example.com 执行登录”，而不是账户与口令。
+
+同一约束也适用于会话事件：只记录动作种类、`ref`、URL 与结果，不记录被 `type` 输入的文本、cookie、`Set-Cookie` 头或截图里的表单内容。向 `AgentEvent` 写入前必须走一次字段过滤：
+
+```typescript
+export function sessionEventDetail(input: {
+  action: BrowserAction;
+  observationId: string;
+  outcome: ActionOutcome;
+}): string {
+  const { risk, replayable } = input.action;
+  return JSON.stringify({
+    kind: input.action.kind,
+    target: "ref" in input.action ? input.action.ref : input.action.target,
+    risk,
+    replayable,
+    observationId: input.observationId,
+    outcome: input.outcome.ok ? "ok" : input.outcome.error,
+  });
+}
+```
+
+会话必须显式关闭：`open` 成功后再进入 `running`，任何 `close` 失败都要落成事件并让运行以明确原因停止，否则遗留的登录态会变成下一个任务的隐藏前置条件。`AbortSignal` 要一路传给 `open`/`observe`/`act`，取消后立即 `close`，并确保来不及 `close` 时也留下未关闭记录。
+
+</Step>
+
+<Step id="resolve-element-refs" number={3} title="处理元素引用失效">
+
+`ref` 只在一次观测的生命周期内有效。页面重新渲染、跳转或列表刷新之后，同一个 `ref` 可能指向完全不同的元素——“提交”按钮的位置被“删除账户”按钮占据时，重试旧引用就是真实事故。
+
+解决办法是把引用和元素指纹绑定，并在动作前重新校验。指纹只使用结构信息——角色、可访问名称、标签名与所属表单序号做 `sha256`；不要把用户输入的内容或 `type` 的文本算进指纹，否则指纹本身就会把敏感数据带进事件日志：
+
+```typescript
+export async function resolveRef(
+  session: BrowserSession,
+  target: ElementRef,
+  signal: AbortSignal,
+): Promise<ActionOutcome | ElementRef> {
+  const current = await session.observe(signal);
+  const matched = current.elements.find(
+    (element) =>
+      element.ref === target.ref && element.elementFingerprint === target.elementFingerprint,
+  );
+  if (!matched) return { ok: false, error: "stale_element_ref" };
+  return matched;
+}
+```
+
+`stale_element_ref` 是**终止信号而不是重试信号**：Harness 必须重新观测、把新的摘要交回模型，让模型基于当前页面重新决策。禁止写成“循环重试同一个 ref 直到成功”，也禁止退回到“随便挑一个同名元素”继续执行——那等于用一个猜测替代一次观测。
+
+同样地，动作携带的 `observationId` 必须与解析引用时的观测一致。跨观测复用 `ref` 与跨审批复用旧 `actionDigest` 是同一类错误：都把一个已经变化的世界当成没变。
+
+</Step>
+
+<Step id="gate-risky-actions" number={4} title="为高风险动作加门禁">
+
+提交表单、支付、发布、删除、发送消息都会在外部系统留下不可撤销的结果，因此一律走主线的 `authorize` 三态决策，而不是在浏览器层另造一套批准机制。
+
+```typescript
+import { authorize } from "../policy.js";
+
+export function authorizeBrowserAction(
+  tool: RegisteredTool,
+  action: BrowserAction,
+  context: PolicyContext,
+  session: BrowserSession,
+): PolicyDecision {
+  if (action.risk === "low") {
+    return { type: "allow", scope: "browser_low_risk" };
+  }
+  return {
+    type: "ask",
+    request: createApprovalRequest({
+      tool,
+      input: action,
+      cwd: context.cwd,
+      network: context.network,
+      summary: `对当前页面执行高风险动作：${action.kind}`,
+      risks: [
+        "外部系统状态不可撤销",
+        isReplayable(action) ? "重复执行可能产生双份结果" : "该动作不可重放，失败后必须重新观测",
+        action.kind === "type" ? "输入内容可能包含敏感数据" : "目标元素可能已失效",
+      ],
+    }),
+  };
+}
+```
+
+批准绑定 `actionDigest = hash(tool + canonical input + cwd + network policy)`，一次性使用且带过期时间。页面 URL、目标元素在指纹层面的身份、`type` 的文本、`select` 的值或 `wait` 的期望文本只要有一项变化，digest 就不再匹配，必须重新请求批准。批准被拒绝时返回 observation，并在门禁前就停止，绝不先点击再询问。
+
+需要批准时，Harness 先把事件和请求落盘，再复用主线 `transitionState` 的 `waiting`：
+
+```typescript
+const recorded = appendEvent(state, "approval_requested", request.actionDigest);
+state = transitionState(recorded, "waiting", "approval_required");
+```
+副作用必须幂等或可验证。可重放的低风险动作靠重新观测确认；不可撤销的高风险动作则要求：要么由外部系统支持幂等键，要么在批准前就约定“执行后如何验证只发生了一次”（例如订单号唯一、列表条目计数不变、返回页含唯一确认号）。验证方式写不清楚的高风险动作，正确做法是拒绝执行并交给人工。
+
+注意策略与工具声明的配套关系：浏览器工具的 `effect` 是 `"external"`。主线 `authorize` 目前对 `external` 直接 `deny`，本章只描述需要新增的分支——当 `effect === "external"` 且工具声明了 `capability: "browser"` 时，低风险动作放行、高风险动作进入 `ask`，其余情况仍然 `deny`。不要为了走通浏览器而放宽 `network_or_external_effect_not_allowed` 对其它工具的约束。
+
+观测、决策、门禁与执行仍然落在主线同一条循环里：
+<AgentFlow />
+
+</Step>
+
+<Step id="test-browser" number={5} title="用 Fake Session 验证">
+
+把浏览器工具注册进已有 `ToolRegistry`，让观测与动作都成为普通工具调用，这样权限、事件与上下文规则不需要任何特例：
+
+```typescript
+export const browserActTool = defineTool({
+  name: "browser_act",
+  description: "Execute one BrowserAction against the current browser session",
+  effect: "external",
+  schema: z.object({
+    kind: z.enum(["navigate", "click", "type", "select", "press", "wait"]),
+    target: z.string().min(1),
+    value: z.string().nullable(),
+    risk: z.enum(["low", "high"]),
+  }).strict(),
+  async execute(input, context) {
+    const session = requireBrowserSession(context.cwd, context.signal);
+    const action = toBrowserAction(input, session.currentObservationId);
+    const decision = authorizeBrowserAction(browserActTool, action, policyContext, session);
+    if (decision.type === "deny") return { ok: false, error: decision.reason };
+    if (decision.type === "ask") return { pending: decision.request.actionDigest };
+    return session.act(action, context.signal);
+  },
+});
+```
+
+Fake Session 用内存页面图代替真实浏览器：预置若干页面与元素表，观测返回固定字典序的元素列表，`act` 只在指纹匹配时改变状态。这样全部验收都是确定性的、离线的，不需要网络、密钥或浏览器二进制。
+创建 `tests/browser.test.ts`，正向覆盖“导航 → 观测 → 低风险点击 → 输入 → 关闭会话”，并至少覆盖三个负向用例：
+
+```typescript
+expect(await runScenario({ mutateAfterObserve: true })).toMatchObject({
+  error: "stale_element_ref",
+});
+expect(await runScenario({ approveHighRisk: false })).toMatchObject({
+  status: "waiting",
+  requestReason: "approval_required",
+});
+const detail = sessionEventDetail({ action, observationId, outcome });
+expect(detail).not.toContain("hunter2");
+expect(contextForModel).not.toContain("sessionId=");
+expect(observation.screenshot?.sha256).toMatch(/^[0-9a-f]{64}$/);
+```
+
+除负向用例外再补两条不变量：未批准的高风险动作恢复后若 `ref` 或参数变化，旧 `actionDigest` 必须失效并重新进入 `waiting`；取消信号触发时会话必须被关闭，且事件日志里留下未关闭或已关闭的明确记录。
+
+</Step>
+
+<Checkpoint command="pnpm typecheck && pnpm test -- tests/browser.test.ts">
+
+预期结果：`browser_act` 作为 `effect: "external"` 工具注册进 `ToolRegistry`，低风险动作被策略放行，高风险动作在批准前只产生 `ApprovalRequest` 并让运行进入 `waiting`；一次批准只能消费一次 `actionDigest`。
+
+必须同时通过这些负向用例：
+
+1. 观测后页面元素被替换，再用旧 `ref` 动作时返回 `stale_element_ref`，且测试断言“重试同一个 ref”永远不会成功；
+2. 提交表单这类高风险动作在未批准时不得执行，恢复时若页面 URL、目标指纹或输入文本变化，旧批准必须失效并重新进入 `waiting`；
+3. 凭据泄露检查：事件日志、`ApprovalRequest.summary`、模型上下文与截图 artifact 中都不得出现 `credentialRef` 指向的真实用户名、口令、cookie 或 `type` 输入的明文。
+
+三条都满足后，浏览器操作才算并入 Harness；真实浏览器适配器只是替换 Fake Session，不改变本章的观测、引用与门禁契约。
+
+</Checkpoint>

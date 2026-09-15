@@ -1,15 +1,13 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
-const lessonPath = fileURLToPath(new URL("../src/content/context-compaction.mdx", import.meta.url));
+import { codeText, lessonSource, listProp, stepIds } from "./support/lesson-source";
+
+const source = lessonSource("context-compaction");
+const code = codeText(source);
 
 describe("context compaction lesson", () => {
-  it("teaches a loss-aware compaction path and connects it to the loop", () => {
-    const source = readFileSync(lessonPath, "utf8");
-
-    for (const stepId of [
+  it("keeps the anchors of a loss-aware compaction path", () => {
+    expect(stepIds(source)).toEqual([
       "define-compaction-contract",
       "choose-compaction-boundary",
       "build-compaction-snapshot",
@@ -17,10 +15,10 @@ describe("context compaction lesson", () => {
       "replace-history-with-snapshot",
       "connect-compaction-to-loop",
       "test-compaction",
-    ]) {
-      expect(source).toContain(`id="${stepId}"`);
-    }
+    ]);
+  });
 
+  it("keeps the snapshot, boundary, and provider-compaction contract in code", () => {
     for (const marker of [
       "CompactionSnapshot",
       "maybeCompactContext",
@@ -34,7 +32,14 @@ describe("context compaction lesson", () => {
       "assertCompletedWorkEqual",
       "selectRawTailBoundary",
     ]) {
-      expect(source).toContain(marker);
+      expect(code, `compaction lesson should keep ${marker}`).toContain(marker);
     }
+  });
+
+  it("declares the compaction module and its test file", () => {
+    const files = listProp(source, "LessonOverview", "files");
+
+    expect(files).toContain("src/compaction.ts");
+    expect(files).toContain("tests/compaction.test.ts");
   });
 });

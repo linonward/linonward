@@ -1,0 +1,266 @@
+<LessonOverview
+  goal="在主线边界内接入可增量更新的知识库：文档被确定性切分与索引，检索结果作为不可信数据注入上下文，回答必须引用本轮真实 chunk，检索质量可离线评测。"
+  task="为本地 Markdown 知识库建立索引，回答一个问题，并证明引用的 chunkId 来自本轮检索。"
+  prerequisites="主线 02 上下文与 Prompt、14 可观测性与评测已经通过 Checkpoint：ContextSource、selectContext、buildModelRequest、TraceSink 与 runEvaluation 已可用。"
+  files={[
+    "src/documents.ts",
+    "src/index-store.ts",
+    "src/retrieval.ts",
+    "src/citations.ts",
+    "evals/retrieval.jsonl",
+    "tests/retrieval.test.ts",
+  ]}
+/>
+
+RAG 常被讲成"把文档塞进向量库"。在 Harness 视角下，它是一串**可验证的数据流**：文档先变成稳定的 chunk 契约，chunk 进入可增量更新的索引，检索结果带着来源与预算进入 `<context_sources>`，回答再被绑定到本轮真实 chunk。
+
+<Callout title="扩展篇定位">
+
+本章是扩展内容，**不是主线 Capstone 的前置条件**。Capstone 不依赖本章任何文件；跳过 RAG 也能完整走完主线。这里不重复主线已建立的上下文优先级、Trace 与评测骨架，只说明检索如何挂接它们。
+
+</Callout>
+
+<Step id="define-document-contract" number={1} title="定义文档与切分契约">
+
+创建 `src/documents.ts`。切分单元只保存可复现的事实：来自哪个文档、在原文中的偏移、内容本身与内容哈希。
+
+```typescript
+export interface DocumentChunk {
+  docId: string;
+  chunkId: string;
+  path: string;
+  content: string;
+  sha256: string;
+  offset: number;
+}
+
+export interface ChunkingPolicy {
+  version: string;
+  maxCharacters: number;
+  overlapCharacters: number;
+}
+
+export function chunkDocument(
+  doc: { docId: string; path: string; content: string },
+  policy: ChunkingPolicy,
+): DocumentChunk[] {
+  const chunks: DocumentChunk[] = [];
+  const step = policy.maxCharacters - policy.overlapCharacters;
+  for (let offset = 0; offset < doc.content.length; offset += step) {
+    const content = doc.content.slice(offset, offset + policy.maxCharacters);
+    const hash = sha256(content);
+    chunks.push({
+      docId: doc.docId,
+      chunkId: `${doc.docId}:${offset}:${hash}`,
+      path: doc.path,
+      content,
+      sha256: hash,
+      offset,
+    });
+  }
+
+  return chunks;
+}
+```
+
+`chunkId` 由 `docId + offset + sha256(content)` 派生，**不能是随机数或自增序号**：随机 ID 让"同一文档两次索引得到相同结果"无法成立，重跑评测必然全量变化；自增序号则在文档中间插入一段文字后把后续 chunk 全部挤到新编号，索引会误判为整篇被替换。用内容哈希做 ID，未改变的 chunk 保持稳定，只有真正受影响的窗口变化。
+
+切分策略（窗口大小、重叠长度、`policy.version`）必须随索引保存。改变 `maxCharacters` 等于改变全部 ID，要提升版本并按迁移处理，而不能新旧混用。
+
+</Step>
+
+<Step id="build-index" number={2} title="建立可增量更新的索引">
+
+创建 `src/index-store.ts`。索引对外只暴露 `upsert`、`remove`、`search` 三个操作；向量由 `Embedder` 端口产生，索引本身只比对向量，不关心它来自哪里。
+
+```typescript
+export interface ChunkIndex {
+  upsert(chunks: DocumentChunk[]): Promise<void>;
+  remove(docId: string): Promise<void>;
+  search(query: string, limit: number): Promise<{ chunk: DocumentChunk; score: number }[]>;
+}
+
+export interface Embedder {
+  modelVersion: string;
+  dimensions: number;
+  embed(texts: string[]): Promise<number[][]>;
+}
+
+export function createHashingEmbedder(dimensions = 256): Embedder {
+  return {
+    modelVersion: "offline-hashing-v1",
+    dimensions,
+    async embed(texts) {
+      return texts.map((text) => {
+        const vector = new Array<number>(dimensions).fill(0);
+        for (const token of text.toLowerCase().split(/\s+/).filter(Boolean)) {
+          vector[hashToBucket(token, dimensions)] += 1;
+        }
+        return normalize(vector);
+      });
+    },
+  };
+}
+```
+
+这是**测试替身**，不是生产方案：固定维度的词袋/哈希向量没有语义泛化，同义词与改写提问都召不回来。生产环境要换真实 embedding，并把模型名称与版本写进索引元数据与 Trace，否则无法解释"换 embedding 后召回率为什么变了"；`dimensions` 与 `modelVersion` 要一起版本化，升级后旧向量只能重建。
+
+"文档哈希未变则复用"是增量更新的核心：索引保存每个 `docId` 的文档哈希与 chunk ID 列表；重索引时先比文档哈希，未变直接跳过，变化时逐个 `chunkId` 比较，只对新出现的 chunk 调用 `embed`。
+
+```typescript
+export async function reindexDocument(options: {
+  index: ChunkIndex;
+  embedder: Embedder;
+  document: { docId: string; path: string; content: string };
+  previous: { sha256: string; chunkIds: string[] } | undefined;
+  policy: ChunkingPolicy;
+}): Promise<{ reused: number; embedded: number }> {
+  const documentHash = sha256(options.document.content);
+  if (options.previous?.sha256 === documentHash) {
+    return { reused: options.previous.chunkIds.length, embedded: 0 };
+  }
+
+  const chunks = chunkDocument(options.document, options.policy);
+  const previousIds = new Set(options.previous?.chunkIds ?? []);
+  const fresh = chunks.filter((chunk) => !previousIds.has(chunk.chunkId));
+  await options.index.upsert(chunks);
+  return { reused: chunks.length - fresh.length, embedded: fresh.length };
+}
+```
+
+</Step>
+
+<Step id="retrieve-and-inject" number={3} title="检索并注入上下文">
+
+检索结果是模型从**外部内容**带回来的文本，必须按不可信数据处理。先扩展主线声明合并的来源种类：
+
+```typescript
+export interface ContextKindMap {
+  retrieved_chunk: true;
+}
+```
+
+条数上限与字符预算都由 Harness 在组装阶段强制执行：
+
+```typescript
+export interface RetrievalBudget {
+  maxChunks: number;
+  maxCharacters: number;
+}
+
+export async function retrieveAsContextSources(options: {
+  query: string;
+  index: ChunkIndex;
+  budget: RetrievalBudget;
+}): Promise<{ sources: ContextSource[]; truncated: boolean }> {
+  const ranked = await options.index.search(options.query, options.budget.maxChunks);
+  const sources: ContextSource[] = [];
+  let used = 0;
+  let truncated = false;
+
+  for (const [rank, result] of ranked.entries()) {
+    const body = result.chunk.content;
+    if (used + body.length > options.budget.maxCharacters) {
+      truncated = true;
+      break;
+    }
+    used += body.length;
+    sources.push({
+      id: result.chunk.chunkId,
+      kind: "retrieved_chunk",
+      label: result.chunk.path,
+      content: `chunkId: ${result.chunk.chunkId}\nrank: ${rank + 1}\n${body}`,
+      priority: 85,
+    });
+  }
+
+  return { sources, truncated };
+}
+```
+
+`priority: 85` 让检索片段落在主线的排序阶梯里：高于历史工具输出，使本轮检索比旧 observation 更值得保留；低于计划、已激活 Skill 与用户输入，因此预算紧张时先丢弃检索片段，而不是当前计划或安全约定。
+
+```text
+100  harness_feedback   完成被拒等 Harness 反馈
+ 99  task_plan          当前计划与活跃 Step
+ 98  user_input         用户澄清答案
+ 96  skill_instructions 已激活 Skill 的完整指令
+ 95  compaction_snapshot 压缩快照
+ 94  skill_resource     已加载的 Skill 资源
+ 90  skill_catalog      可用 Skill 摘要
+ 85  retrieved_chunk    本轮检索片段（本章新增）
+ 80  tool_observation   历史工具输出
+```
+
+这张表就是主线各章已经建立的优先级阶梯，本章只插入 `retrieved_chunk` 一档：新增来源必须找到自己的位置，而不是覆盖别人的排序。
+
+裁剪结果必须可观测：超预算时标记 `truncated: true`，并发出 `retrieval_truncated` 事件，让评测与 UI 区分"没检索到"和"检索到了但被预算丢掉"。注入仍走 `buildModelRequest`，检索内容留在标注为不可信数据的 `<context_sources>` 区块内。
+
+</Step>
+
+<Step id="enforce-citations" number={4} title="强制引用来源">
+
+只有检索还不够。模型必须在回答里为每个结论标注 `chunkId`，Harness 再校验这些 ID **真实存在且来自本轮检索**——这正是主线"证据必须来自本轮 observation"那条规则在 RAG 上的等价形式。
+
+```typescript
+export function assertCitationsComeFromRetrieval(
+  citationIds: string[],
+  evidence: { runId: string; retrievedChunkIds: string[] },
+): void {
+  if (citationIds.length === 0) throw new Error("answer_has_no_citation");
+
+  const allowed = new Set(evidence.retrievedChunkIds);
+  for (const chunkId of citationIds) {
+    if (!allowed.has(chunkId)) throw new Error(`citation_not_in_this_round: ${chunkId}`);
+  }
+}
+```
+
+`allowed` 只能由**本轮** `retrieveAsContextSources` 产出的 ID 构造，不能查全量索引；否则模型可以引用"库里存在但本轮没给它的" chunk，用检索之外的内容冒充证据。
+
+被拒绝的回答需要可恢复路径：发出 `citation_rejected` 事件并附带无效 ID，要求模型基于已提供的 `<context_sources>` 重新作答，而不是编造来源。连续拒绝达到上限时按主线预算规则停止并报告 `blocked`。`retrieval_truncated` 与 `citation_rejected` 都只是新的 `AgentEvent` 类型，不改动主线字段。
+
+</Step>
+
+<Step id="evaluate-retrieval" number={5} title="评测检索与引用质量">
+
+在 `evals/retrieval.jsonl` 中放固定用例：`expectedChunkIds` 是要被召回的目标，`citationMustBeValid` 断言这条用例至少给出一个有效引用。
+
+```json
+{"id":"chunking-policy","query":"切分策略改变后 chunkId 会怎样？","expectedChunkIds":["docs/rag.md:0:ab12"],"citationMustBeValid":true}
+{"id":"no-answer-case","query":"知识库里没有提到的问题","expectedChunkIds":[],"citationMustBeValid":false}
+```
+
+用主线 `runEvaluation` 的 case/result 形状承载它，只增加检索特有指标，不另起一套 runner：
+
+```typescript
+export function gradeRetrieval(
+  testCase: { id: string; query: string; expectedChunkIds: string[]; citationMustBeValid: boolean },
+  retrieved: string[],
+): { recallAtK: number; hit: boolean; citationValid: boolean; retrievedChunkIds: string[] } {
+  const top = retrieved.slice(0, 5);
+  const matched = testCase.expectedChunkIds.filter((id) => top.includes(id));
+  const expected = testCase.expectedChunkIds.length;
+
+  return {
+    recallAtK: expected === 0 ? 1 : matched.length / expected,
+    hit: matched.length > 0,
+    citationValid: testCase.citationMustBeValid && matched.length > 0,
+    retrievedChunkIds: top,
+  };
+}
+```
+
+把 `gradeRetrieval` 的结果映射成主线 `EvaluationResult` 的 `outcome`，即可复用主线报告的成功率与失败 case 汇总。**检索质量必须和回答质量分开评**：`recall@k` 低说明正确 chunk 根本没进上下文，此时再优化 Prompt 没有意义；recall 高而引用无效，问题则出在生成或 Prompt 契约，而不是索引。混成一个分数就无法判断该改检索还是该改模型。
+
+`TraceSink` 记录每次检索的 query、命中的 chunkId、score、条数、是否 `truncated` 与 embedding `modelVersion`；评测只引用这些事件，不重跑工作区。最小指标集是 `recall@k`、命中率（至少命中一个的用例比例）与引用有效性（回答里的 chunkId 全部来自本轮检索的比例）。
+
+</Step>
+
+<Checkpoint command='pnpm typecheck && pnpm test -- tests/retrieval.test.ts'>
+
+预期结果：类型检查通过，`tests/retrieval.test.ts` 全绿。测试必须覆盖三件事——同一文档重复切分两次得到完全相同的 `chunkId` 列表；文档哈希未变时 `reindexDocument` 返回 `embedded: 0`；注入后的 `<context_sources>` 中每个来源的 `kind` 都是 `retrieved_chunk`，且 `selectContext` 在预算不足时优先丢弃它而不是工作区规则。
+
+至少断言两个负向用例：其一，回答引用一个本轮没有检索到、但索引里存在的 `chunkId`，`assertCitationsComeFromRetrieval` 必须抛出 `citation_not_in_this_round`；其二，构造超出 `maxCharacters` 的检索结果，确认 `truncated` 为 `true`、被丢弃的 chunk 不再出现在 `sources` 中，且 Trace 里能读到 `retrieval_truncated` 事件。对 `evals/retrieval.jsonl` 运行一次离线评测：用 `createHashingEmbedder` 作为测试替身，确认 `recall@k`、命中率与引用有效性被单独报告，且 `no-answer-case` 这类空期望用例不会把无召回误判成失败。全程不访问网络、不需要 API Key。
+
+</Checkpoint>
