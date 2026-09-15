@@ -1,4 +1,5 @@
 import type { ContextSource } from "./context.js";
+import type { RunUsage } from "./trace.js";
 
 /**
  * 可以注入的时钟。教程里所有需要“现在”的地方都接受它，
@@ -194,6 +195,12 @@ export interface AgentState {
   constraints: string[];
   skills: SkillState;
   compaction: CompactionState;
+  /**
+   * 运行累计用量（token / 缓存命中 / 调用计数 / 墙钟时间 / 估算成本）。
+   * 放在权威状态里而不是 `AgentResult` 上：它随检查点一起持久化，
+   * `resume` 后继续累计，而不是从 0 重新开始。
+   */
+  usage: RunUsage;
 }
 
 export interface AgentResult {
@@ -249,4 +256,9 @@ export interface DurableAgentState {
   nextEventSequence: number;
   stopReason: string | undefined;
   providerCursor?: ProviderCursor | undefined;
+  /**
+   * 累计用量。**可选**：这份投影要兼容更早写下的检查点——缺字段的旧检查点
+   * 由 `fromDurableState` 补成 `emptyUsage()`，而不是让恢复直接失败。
+   */
+  usage?: RunUsage | undefined;
 }

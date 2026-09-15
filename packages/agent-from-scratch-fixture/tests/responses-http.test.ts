@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ModelUsage } from "../src/model.js";
 import {
   createResponsesHttpClient,
   createResponsesModel,
@@ -268,5 +269,77 @@ describe("DeepSeek Responses HTTP client", () => {
     expect(requests[0]?.body["model"]).toBe(DEEPSEEK_DEFAULTS.model);
     expect(requests[0]?.body["instructions"]).toBe("plan please");
     expect(requests[0]?.body).not.toHaveProperty("tools");
+  });
+
+  /**
+   * 字段名以官方 Responses 文档为准：
+   * `usage.input_tokens` / `output_tokens` / `total_tokens`，
+   * 缓存命中在 `usage.input_tokens_details.cached_tokens`。
+   */
+  it("normalizes provider usage into camelCase token counts", async () => {
+    const { impl } = fakeFetch([
+      successResponse({
+        ...ANSWER_PAYLOAD,
+        usage: {
+          input_tokens: 1234,
+          input_tokens_details: { cached_tokens: 1024 },
+          output_tokens: 256,
+          output_tokens_details: { reasoning_tokens: 128 },
+          total_tokens: 1490,
+        },
+      }),
+    ]);
+    const client = createResponsesHttpClient({ apiKey: FAKE_KEY, fetchImpl: impl });
+
+    const result = await client.responses.create({ model: DEEPSEEK_DEFAULTS.model });
+
+    expect(result.usage).toEqual({
+      inputTokens: 1234,
+      outputTokens: 256,
+      cachedInputTokens: 1024,
+      totalTokens: 1490,
+    });
+  });
+
+  it("keeps missing usage fields missing instead of fabricating zeros", async () => {
+    const { impl } = fakeFetch([
+      // 只有 input 计数：其余字段必须保持"缺失"，不能补 0。
+      successResponse({ ...ANSWER_PAYLOAD, usage: { input_tokens: 7 } }),
+      // 完全没有 usage：结果里就不该有 usage。
+      successResponse(ANSWER_PAYLOAD),
+      // 形状不认识：同样视为缺失。
+      successResponse({ ...ANSWER_PAYLOAD, usage: "n/a" }),
+    ]);
+    const client = createResponsesHttpClient({ apiKey: FAKE_KEY, fetchImpl: impl });
+
+    const partial = await client.responses.create({ model: DEEPSEEK_DEFAULTS.model });
+    expect(partial.usage).toEqual({ inputTokens: 7 });
+    expect(partial.usage?.outputTokens).toBeUndefined();
+    expect(partial.usage?.cachedInputTokens).toBeUndefined();
+
+    const absent = await client.responses.create({ model: DEEPSEEK_DEFAULTS.model });
+    expect(absent.usage).toBeUndefined();
+
+    const malformed = await client.responses.create({ model: DEEPSEEK_DEFAULTS.model });
+    expect(malformed.usage).toBeUndefined();
+  });
+
+  it("hands planner usage to the caller through onUsage (undefined when absent)", async () => {
+    const reported: Array<ModelUsage | undefined> = [];
+    const { impl } = fakeFetch([
+      successResponse({ ...ANSWER_PAYLOAD, usage: { input_tokens: 7, output_tokens: 3 } }),
+      successResponse(ANSWER_PAYLOAD),
+    ]);
+    const client = createResponsesHttpClient({ apiKey: FAKE_KEY, fetchImpl: impl });
+    const model = createResponsesModel({
+      client,
+      modelId: DEEPSEEK_DEFAULTS.model,
+      onUsage: (usage) => void reported.push(usage),
+    });
+
+    await model.generate({ instructions: "a", input: [] });
+    await model.generate({ instructions: "b", input: [] });
+
+    expect(reported).toEqual([{ inputTokens: 7, outputTokens: 3 }, undefined]);
   });
 });

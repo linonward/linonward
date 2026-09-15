@@ -2,13 +2,25 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { type AgentLoopEvent, runAgentLoop } from "./agent-loop.js";
+import {
+  type AgentLoopEvent,
+  type AgentLoopOptions,
+  type LoopPricing,
+  runAgentLoop,
+} from "./agent-loop.js";
 import { canonicalJson } from "./checkpoint.js";
-import { createVerboseObserver } from "./cli-verbose.js";
+import {
+  formatBudgetExhaustedLine,
+  formatRunUsageLine,
+  type Journal,
+  type JournalRunUsage,
+} from "./cli-journal.js";
+import { createVerboseObserver, readBudgetExhaustedDetail } from "./cli-verbose.js";
 import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
+import { describeCostBasis } from "./pricing.js";
 import {
   type AgentRuntime,
   fromDurableState,
@@ -108,6 +120,8 @@ export interface CliRuntimeInput {
   skillsDirectory: string;
   signal: AbortSignal;
   onEvent: (event: AgentLoopEvent) => void;
+  /** 完整日志：装配层据此接上工具钩子；未提供时零开销。 */
+  journal?: Journal | undefined;
 }
 
 export interface CliDependencies {
@@ -126,6 +140,52 @@ export interface CliRunOptions {
    * 与运行结束汇总。stdout 始终只放最终答案，管道因此保持可用。
    */
   verbose?: boolean | undefined;
+  /**
+   * 完整运行日志：由装配层创建（`createJournal`），`runCli` 把它透传给运行时输入，
+   * 使工具链钩子与模型驱动装饰器共享同一个 journal。未提供时零开销。
+   */
+  journal?: Journal | undefined;
+  /**
+   * 成本估算接线（模型 id + 价目表）。只影响 `[usage]` 汇总行与 `--log` 里的
+   * `cost` / `prices` 字段；缺失时输出 `cost=unknown`。
+   */
+  pricing?: LoopPricing | undefined;
+}
+
+/**
+ * 写进 stderr 事件流的事件形状：**默认路径逐字节不变**。
+ *
+ * `plan_revised.detail` 只出现在 `--verbose` 的 `[event]` 行与 `--log` 的 JSONL 里；
+ * canonicalJson 事件流始终只有既有字段（`type` / `version` / `reason`）。
+ */
+function eventForEventStream(event: AgentLoopEvent): AgentLoopEvent {
+  if (event.type !== "plan_revised" || event.detail === undefined) return event;
+  return { type: "plan_revised", version: event.version, reason: event.reason };
+}
+
+/** 运行结束的累计用量：token 未知即 `unknown`，成本算不出即 `cost=unknown`。 */
+export function runUsageEntry(
+  result: AgentResult,
+  pricing?: LoopPricing | undefined,
+): JournalRunUsage {
+  const { usage } = result.state;
+  const modelId = pricing?.modelId;
+  const table = pricing?.table;
+  return {
+    scope: "run",
+    modelCalls: usage.modelCalls,
+    toolCalls: usage.toolCalls,
+    wallMs: usage.durationMs,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cachedInputTokens: usage.cachedInputTokens,
+    costUsd: usage.estimatedCostUsd,
+    prices: table === undefined ? undefined : { asOf: table.asOf, source: table.source },
+    costBasis:
+      modelId === undefined || table === undefined
+        ? undefined
+        : describeCostBasis(usage, modelId, table),
+  };
 }
 
 /**
@@ -162,9 +222,18 @@ export async function runCli(
       skillsDirectory: resolve(cwd, "skills"),
       signal: controller.signal,
       onEvent: (event) => {
-        io.stderr(canonicalJson(event));
+        io.stderr(canonicalJson(eventForEventStream(event)));
         observer?.onEvent(event);
+        // `plan_revised` 的详情只进 JSONL：可读行由上面的 `[event] ...` 负责。
+        if (event.type === "plan_revised" && options.journal?.active === true) {
+          options.journal.planRevised({
+            version: event.version,
+            reason: event.reason,
+            detail: event.detail,
+          });
+        }
       },
+      journal: options.journal,
     });
 
     let result: AgentResult;
@@ -190,7 +259,20 @@ export async function runCli(
         mutationRevision: result.state.mutationRevision,
       }),
     );
+    // 用量只在 `--verbose` / `--log` 打开时输出：默认路径的每一行都保持原样。
     observer?.finish(result);
+    if (options.verbose === true) {
+      const entry = runUsageEntry(result, options.pricing);
+      if (options.journal?.active === true) options.journal.usage(entry);
+      else io.stderr(formatRunUsageLine(entry));
+
+      // 预算耗尽的诊断：JSONL（`kind: "budget_exhausted"`）+ 一行可读摘要。
+      const budget = readBudgetExhaustedDetail(result.state);
+      if (budget !== undefined) {
+        if (options.journal?.active === true) options.journal.budgetExhausted(budget);
+        else io.stderr(formatBudgetExhaustedLine(budget));
+      }
+    }
     return exitCodeFor(result);
   } finally {
     process.removeListener("SIGINT", onSignal);
@@ -217,6 +299,12 @@ export interface AgentCliOptions {
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
+  /** 完整日志的工具钩子；由装配层接到 journal。 */
+  onToolCall?: AgentLoopOptions["onToolCall"];
+  /** 成本估算接线；由装配层从模型 id + 价目表解析。 */
+  pricing?: LoopPricing | undefined;
+  /** 连续相同工具调用的护栏；缺省开启，`false` 时透传给 Loop 关闭。 */
+  repeatGuard?: boolean | undefined;
 }
 
 export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput): AgentRuntime {
@@ -237,6 +325,9 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     validationSpecs: base.validationSpecs,
     signal: input.signal,
     onEvent: input.onEvent,
+    onToolCall: base.onToolCall,
+    pricing: base.pricing,
+    repeatGuard: base.repeatGuard,
   };
 }
 

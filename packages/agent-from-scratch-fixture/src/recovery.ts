@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentLoopEvent, AgentLoopOptions, LoopCompactionOptions } from "./agent-loop.js";
+import type {
+  AgentLoopEvent,
+  AgentLoopOptions,
+  LoopCompactionOptions,
+  LoopPricing,
+} from "./agent-loop.js";
 import { isPersistenceFailure, runAgentLoopFromState } from "./agent-loop.js";
 import { fromDurableState, toDurableState } from "./durable-state.js";
 import { waitForUserInput } from "./interaction.js";
@@ -73,6 +78,12 @@ export interface AgentRuntime {
   verifiers?: Record<string, ToolStateVerifier> | undefined;
   signal?: AbortSignal | undefined;
   onEvent?: ((event: AgentLoopEvent) => void) | undefined;
+  /** 完整日志的工具钩子；透传给 `AgentLoopOptions.onToolCall`。 */
+  onToolCall?: AgentLoopOptions["onToolCall"];
+  /** 成本估算接线；透传给 `AgentLoopOptions.pricing`（缺省 → `cost=unknown`）。 */
+  pricing?: LoopPricing | undefined;
+  /** 连续相同工具调用的护栏；透传给 `AgentLoopOptions.repeatGuard`（缺省 → 开启）。 */
+  repeatGuard?: boolean | undefined;
 }
 
 export { CONTEXT_KINDS, fromDurableState, isContextKind, toDurableState } from "./durable-state.js";
@@ -335,6 +346,9 @@ export function loopOptionsFromRuntime(
     clock: runtime.clock,
     signal: runtime.signal,
     onEvent: runtime.onEvent,
+    onToolCall: runtime.onToolCall,
+    pricing: runtime.pricing,
+    repeatGuard: runtime.repeatGuard,
     compaction: runtime.compaction,
     persistence: lease ? { store: runtime.store, lease } : undefined,
   };

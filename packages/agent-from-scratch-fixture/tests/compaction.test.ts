@@ -385,16 +385,24 @@ function loopOptions(
 
 const blob = "x".repeat(1_200);
 
+/**
+ * 每次调用带上不同的前缀，避免触发重复调用守卫（这个 fixture 验证的是压缩，
+ * 而不是重复调用）。`blob` 仍然是每条 observation 的子串，既有断言不变。
+ */
+function markedBlob(index: number): string {
+  return `${index}:${blob}`;
+}
+
 describe("agent loop compaction wiring", () => {
   it("compacts inside the loop and projects snapshot plus raw tail into the next request", async () => {
     const cwd = await tempDir();
     const driver = new FakeModelDriver([
       turnWithTools(
-        historyCall("call-1", blob),
-        historyCall("call-2", blob),
-        historyCall("call-3", blob),
+        historyCall("call-1", markedBlob(1)),
+        historyCall("call-2", markedBlob(2)),
+        historyCall("call-3", markedBlob(3)),
       ),
-      turnWithTools(historyCall("call-4", blob)),
+      turnWithTools(historyCall("call-4", markedBlob(4))),
       textTurn("已经完成。", "response-final"),
     ]);
     const planner = new ScriptedPlanner(
@@ -405,8 +413,15 @@ describe("agent loop compaction wiring", () => {
         ],
       }),
       [
-        completeWith([historyObservation(blob)], ["criterion-1"]),
-        completeWith([historyObservation(blob)], []),
+        completeWith(
+          [
+            historyObservation(markedBlob(1)),
+            historyObservation(markedBlob(2)),
+            historyObservation(markedBlob(3)),
+          ],
+          ["criterion-1"],
+        ),
+        completeWith([historyObservation(markedBlob(4))], []),
       ],
     );
 

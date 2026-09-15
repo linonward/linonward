@@ -1,4 +1,5 @@
-import type { Model, ResponsesClientLike, ResponsesResultLike } from "./model.js";
+import type { Model, ModelUsage, NormalizedModelResponse, ResponsesClientLike } from "./model.js";
+import { parseModelUsage } from "./model.js";
 
 /**
  * DeepSeek 的 Responses API 与 OpenAI 的 Responses API 名称相同，但语义不同：
@@ -64,8 +65,11 @@ export interface ResponseContentPart {
   text?: string;
 }
 
-/** 归一化结果：`id` 保留、`output` 原样映射、`output_text` 从 message 块聚合。 */
-export type ResponseResult = ResponsesResultLike;
+/**
+ * 归一化结果：`id` 保留、`output` 原样映射、`output_text` 从 message 块聚合、
+ * `usage` 用 `parseModelUsage` 宽松解析（缺字段就是缺失，不伪造 0）。
+ */
+export type ResponseResult = NormalizedModelResponse;
 
 export interface ResponsesHttpOptions {
   apiKey: string;
@@ -183,11 +187,15 @@ function normalizeResult(value: unknown): ResponseResult {
     ? outputValue.filter(isOutputItem)
     : [];
 
-  return {
+  const result: ResponseResult = {
     id: typeof value["id"] === "string" ? value["id"] : "",
     output,
     output_text: aggregateOutputText(output),
   };
+  // provider 没给 usage（或只给了无法识别的形状）时不写这个字段：缺失就是缺失。
+  const usage = parseModelUsage(value["usage"]);
+  if (usage !== undefined) result.usage = usage;
+  return result;
 }
 
 function parseRetryAfterMs(response: Response): number | undefined {
@@ -279,12 +287,19 @@ export function createResponsesHttpClient(options: ResponsesHttpOptions): Respon
   };
 }
 
-/** 供 Planner 使用：一次 `generate` 就是一次无状态请求，返回聚合文本。 */
+/**
+ * 供 Planner 使用：一次 `generate` 就是一次无状态请求，返回聚合文本。
+ *
+ * `Model.generate` 的契约只返回 `string`，因此归一化后的 `usage` 通过 `onUsage`
+ * 回调**带出来**（未提供时行为与不采集 usage 时逐字节一致）；没有 usage 时回调收到
+ * `undefined`，调用方必须记 `unknown` 而不是 0。
+ */
 export function createResponsesModel(options: {
   client: ResponsesClientLike;
   modelId: string;
+  onUsage?: ((usage: ModelUsage | undefined) => void) | undefined;
 }): Model {
-  const { client, modelId } = options;
+  const { client, modelId, onUsage } = options;
 
   return {
     async generate(request) {
@@ -293,6 +308,7 @@ export function createResponsesModel(options: {
         instructions: request.instructions,
         input: request.input,
       });
+      onUsage?.(response.usage);
       return response.output_text;
     },
   };

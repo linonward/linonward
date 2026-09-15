@@ -44,6 +44,7 @@ CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntim
 cd packages/agent-from-scratch-fixture
 pnpm agent run "读取 package.json，告诉我这个项目用哪个包管理器，并列出 scripts 里的命令" --cwd /tmp/demo --allow node --version
 pnpm agent --verbose run "读取 package.json，简述这个项目的用途" --cwd /tmp/demo
+pnpm agent --verbose --log run.jsonl run "读取 package.json" --cwd /tmp/demo
 pnpm agent resume <run-id>
 pnpm agent answer <run-id> <request-id> "用 pnpm"
 ```
@@ -66,11 +67,121 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
 | `--max-steps <n>` | 模型步数上限，默认 `16` |
 | `--max-tool-calls <n>` | 工具调用上限，默认 `32` |
-| `--verbose` | 在 stderr 上追加详细输出：每个 Loop 事件一行（`[event] run_started runId=...`）、每次工具观测的有界摘要（工具名 + `callId` + `ok` + 截断预览）与运行结束汇总（`runId` / `status` / `stopReason` / `budget` / `changedFiles` / `validations` / trace 事件类型序列）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
+| `--verbose` | 在 stderr 上追加**完整运行日志**：模型的真实输入与输出（system prompt 全文、每条输入消息全文、`finalText` 全文、`toolCalls` 的 `argumentsJson` 全文）、完整工具链（每个调用的 `argsJson` 与 observation `output` 全文、`ok` / `effect` / `errorCode` 与策略决定），以及既有的每个 Loop 事件一行（`[event] ...`）与运行结束汇总（`[summary] ...`）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
+| `--log <path>` | 把 `--verbose` 的同一条日志额外以 **JSONL** 追加写入文件（每行一个 JSON 对象，带 `kind` / `at` / `durationMs`），文件不存在则创建。只在 `--verbose` 打开时生效；`--verbose` 关闭时不会创建任何日志文件 |
+| `--no-truncate` | 关闭单条内容默认 `20000` 字符的上限；打开时会在 stderr 顶部打印一行警告。只在 `--verbose` 打开时生效 |
+| `--no-repeat-guard` | 关闭"连续相同工具调用"护栏（**默认开启**，属于 Harness 约束）。第 `2` 次 `name + 规范化 args` 完全相同的调用会追加一条 `harness_feedback`（priority `100`）提醒模型；第 `3` 次不再执行，直接返回结构化 `repeated_tool_call` observation 并记为失败尝试。同名但参数不同的正常重试不受影响 |
 
-`--verbose` 的输出是**有界**的：单条详情最多 `200` 字符，工具观测最多列 `20` 条（更早的折叠成
-`[verbose] omitted N earlier observation(s)`），汇总里的 `changedFiles` / trace 列表同样有上限。
-stdout 永远只有最终答案，因此 `pnpm agent --verbose run "..." > answer.txt` 依然可用。
+`--verbose` 的日志分为两类：
+
+- **完整日志**（每条带 ISO 时间戳与耗时）：`[run] ...` 运行元信息（task / cwd / budgets /
+  `allowedArgv` / `requireSandbox` / 模型 id，**不含密钥**）、`[model] request ...` 与
+  `[model] response ...`（第几轮 + `start` / `continue`）、`[tool] call ...` 与
+  `[tool] result ...`（参数与结果全文，失败时带 `error=<code>` 与截断后的 `reason=`），
+  以及每次模型调用一行 `[usage] ...`。模型 I/O 由 `createJournalModelDriver` 装饰真实
+  （或注入的假）`ModelDriver` 采集；工具链由 Loop 的 `onToolCall` 钩子采集。
+- **有界摘要**（保持既有能力不变）：`[event] ...`、`[tool] <name> callId=... chars=... preview=...`
+  与 `[summary] ...`，单条最多 `200` 字符（失败原因 `120` 字符）、工具观测最多列 `20` 条（更早的
+  折叠成 `[verbose] omitted N earlier observation(s)`）。
+
+完整日志里的单条内容默认最多 `20000` 字符，超出写 `…truncated(原长度 N)`；`--no-truncate`
+才会写全文。`--verbose` 关闭时连 journal 都不会创建（默认路径零额外开销、stderr 逐字节不变）。
+stdout 永远只有最终答案，因此 `pnpm agent --verbose --log run.jsonl run "..." > answer.txt`
+依然可用。
+
+### 用量与成本（token / 缓存命中 / 耗时 / 估算成本）
+
+`--verbose`（含 `--log`）会输出三类用量信息，**默认路径一行都不多**：
+
+```text
+[usage] step=1 phase=start in=1234 out=256 cached=1024 durationMs=0 model=deepseek-v4-flash cost=$0.000445
+[summary] usage modelCalls=2 toolCalls=1 in=3282 out=320 cached=2560 wallMs=10 cost=$0.000776
+[usage] run: modelCalls=2 toolCalls=1 in=3282 out=320 cached=2560 wallMs=10 cost=$0.000776 (prices asOf=2026-08-23, source=https://api-docs.deepseek.com/quick_start/pricing (peak rates; off-peak is half); cache hits billed separately)
+```
+
+- **每次模型调用一行** `[usage]`：token、缓存命中、该次调用耗时、模型 id 与按次估算成本。
+- **运行结束一行** `[usage] run:`：调用计数、token 合计、整轮墙钟时间（`wallMs`）、估算成本，
+  以及价目表的 `asOf` / `source` 与计价口径。
+- **`[summary] usage`**：有界汇总里的同一组数字。
+
+同一批记录同时写进 `--log` 的 JSONL（`kind: "usage"`，`scope: "model"` / `"run"`）。
+**未知就是 `unknown`**：provider 没返回 `usage`（或没返回某个字段）时，`addUsage` 会让合计保持
+未知，输出 `in=unknown`；JSONL 里该字段直接**缺失**（不写 0、不写 null）。成本同理：模型不在价目表
+里、或 token 未知时显示 `cost=unknown`，**绝不显示 `$0.000000` 冒充免费**。
+
+用量累加在 `AgentState.usage`（`RunUsage`）上，而**不是** `AgentResult`：
+
+- 它随检查点一起持久化（`DurableAgentState.usage` → `toDurableState` / `fromDurableState`），
+  因此 `answer` / `resume` 之后是**接着涨**，而不是从 0 重来（`tests/agent-cli.test.ts` 有一条
+  run → answer 的断言：`modelCalls=1 in=100` → `modelCalls=3 in=600`）。
+- 旧检查点没有这个字段时按"已知的 0"补齐（`emptyUsage()`），老 run 仍然可以恢复。
+- 已知的降级：**规划器（`createModelPlanner`）的 token 不计入**。规划调用发生在 `Planner`
+  接口背后，本 fixture 还没有把它的 usage 汇入 Loop 的累加器；`createResponsesModel` 提供了
+  `onUsage` 回调，接入方可以自行收集。
+
+### 估算成本怎么算（版本化、可配置、可追溯）
+
+`src/pricing.ts` 负责成本估算：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DEEPSEEK_PRICE_TABLE_JSON` | 内联 JSON 价目表，**优先级最高**（`{"asOf":"...","models":{...}}`） |
+| `DEEPSEEK_PRICE_TABLE` | 指向 JSON 价目表文件；两个都设置时内联 JSON 生效 |
+
+两个都为空时用内置表。**解析失败一律报可读错误**（含字段路径）而不是静默退回内置表——
+`DEEPSEEK_PRICE_TABLE_JSON='{not json'` 会让 CLI 在装配期就失败，避免"我以为按内部价算的"。
+
+内置表来自官方 "Models & Pricing"（文档镜像快照 `asOf=2026-08-23`，
+`source=https://api-docs.deepseek.com/quick_start/pricing`），只覆盖表格里的三个模型
+（`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`）。官方对每个价格都给了
+peak / off-peak 两档（off-peak 恰好是 peak 的一半），内置表取 **peak 作为上界**，并把口径写进
+`source`：它是量级估算，不是账单。
+
+计价口径：`input_tokens` 是总量、`cached_tokens` 是它的子集，所以表里有独立缓存价时只对未命中的
+输入按 cache miss 价计费；表里没有缓存价时缓存部分并入 input 价（`describeCostBasis` 会在
+`[usage] run:` 行注明是哪种）。`cached_tokens` 未知时按 cache miss 计（上界），同样有注明。
+
+### `plan_revised` 说清"为什么改、改了什么"
+
+反复修订计划曾经只打印一行 `reason`，看不出计划到底变了什么、是谁触发的。现在每次修订都带**有界**
+详情（`PlanRevisedDetail`）：
+
+```text
+[event] plan_revised version=2 reason=failed_assumption added=step-2 removed=(none) renamed=step-1 dependsChanged=0 failed=boom:tool_error
+```
+
+- **计划差异**：新增 / 删除 / 标题变化的步骤 id、依赖变化的步骤数。每类最多列 `10` 条，超出写
+  `…(+N)`（每条 id 同样走 `200` 字符截断）；依赖按集合比较，顺序变化不算"改了什么"。
+- **触发证据**：最近失败的工具（名字 + `error=<code>`），最多 `3` 条，超出写 `…(+N)`。
+- **JSONL**：`--log` 里多出一条 `kind: "plan_revised"` 记录，`detail` 字段携带同一份结构化差异
+  （`addedSteps` / `removedSteps` / `renamedSteps` / `dependencyChanges` / `recentFailures` …）。
+- **默认路径不变**：canonicalJson 事件流仍然只有 `type` / `version` / `reason`；`detail` 只出现在
+  `--verbose` 的 `[event]` 行与 `--log` 的 JSONL 里（`tests/agent-cli.test.ts` 逐字节断言）。
+
+工具失败的 `[tool]` 行也补齐了原因：`ok=false` 之外还有 `error=<code>`（来自 observation 的
+`error` 字段）与截断到 `120` 字符的 `reason=<message>`；JSONL 的 `kind: "tool_result"` 记录里是
+`error` / `reason` 两个字段。
+
+### 预算耗尽说清"卡在哪、还差什么"
+
+`max_steps` / `max_tool_calls` 停止时，Loop 会先登记一条**有界**的 `budget_exhausted` 运行时事件
+（`reason` / `budget` / `usage`（含 `formatCostUsd` 后的 `cost`）/ 活动步骤 / `pendingSteps` /
+最近 ≤`5` 次工具调用（带 `repeated`）/ `lastReplanReason`），`--verbose` 的汇总据此追加：
+
+```text
+[summary] stopped: max_steps (modelSteps=16/16, toolCalls=22/32)
+[summary] stopped detail: active=step-3(status=in_progress); last tools=read_file(ok), apply_patch(file_changed); repeated=apply_patch x2; pending=step-3, step-4(+1)
+[summary] hint: 模型在重复同一个工具调用，考虑检查 observation 是否足以让它继续，或提高 --max-tool-calls / 换更强模型
+```
+
+`hint` 依事实生成：有重复调用时提示检查 observation / 提高 `--max-tool-calls`；否则若计划仍未完成，
+提示提高 `--max-steps` 或拆分任务。`--log` 里多出一条 `kind: "budget_exhausted"` 记录，字段与事件
+`detail` 一致；**默认路径仍然一行都不多**（`budget_exhausted` 只进内存事件日志，不改变 canonicalJson 事件流）。
+
+
+> **日志可能含敏感内容**：完整日志记录模型 payload、工具参数与工具结果的**原文**，仓库文件内容、
+> 命令输出等都会出现在 stderr 与 `--log` 文件里。`--log` 会把这些内容落盘，请自行选择安全路径并
+> 及时清理。日志**绝不**记录环境变量或密钥，只记录模型 payload、工具参数与结果。
 
 `run` 的持久化落在 `AGENT_STORE_ROOT`（默认 `<系统临时目录>/linonward-agent-runs`）下的
 `LocalFileRunStore`：`resume` / `answer` 是独立进程，必须靠这个稳定路径找到同一个 run。
@@ -100,6 +211,8 @@ stdout 永远只有最终答案，因此 `pnpm agent --verbose run "..." > answe
 | `src/planner-model.ts` | 完整 `Planner`（`create` / `revise` / `evaluate`）：JSON 解析健壮化、证据用下标、`completed` 判据收紧、失败带错误有界重试、降级可见 |
 | `src/run-task.ts` | `runRealTask`：把工具注册表、策略、trace、`LocalFileRunStore` + lease、时钟、Skills、压缩装配到 `runAgentLoop` 上 |
 | `src/agent-cli.ts` | `pnpm agent` 的装配层：`parseAgentArgs` 解析 flags，`createDeepSeekAgentCli` 装配真实驱动 / 工具 / 沙箱 / 策略并返回 argv 处理器；全部依赖可注入替身 |
+| `src/cli-journal.ts` | 完整运行日志：`createJournal`（stderr 可读行 + 可选 JSONL 双写、统一时间戳与截断）、`createJournalModelDriver`（装饰 `ModelDriver` 采集真实模型 I/O 与每次调用的 usage）与 `createJournalToolHook`（接 Loop 的 `onToolCall`） |
+| `src/pricing.ts` | 版本化价目表与成本估算：`estimateCostUsd`（未知即 `undefined`，绝不返回 0）、`describeCostBasis`（缓存口径注明）、`BUILTIN_PRICE_TABLE` 与 `DEEPSEEK_PRICE_TABLE(_JSON)` 覆盖 |
 
 ### 环境变量
 
@@ -109,6 +222,8 @@ stdout 永远只有最终答案，因此 `pnpm agent --verbose run "..." > answe
 | `DEEPSEEK_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 兼容网关或代理地址 |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | **循环模型**：多轮工具调用用它。也可用 `deepseek-v4-pro`，或从 `GET /v1/models` 发现 |
 | `DEEPSEEK_PLANNER_MODEL` | 否 | 回落到 `DEEPSEEK_MODEL` | **规划模型**：只给模型版规划器用。规划只输出短 JSON，可以单独选更强的型号 |
+| `DEEPSEEK_PRICE_TABLE` | 否 | 内置表 | 成本估算用的 JSON 价目表文件；见"估算成本怎么算" |
+| `DEEPSEEK_PRICE_TABLE_JSON` | 否 | — | 内联 JSON 价目表，优先级高于 `DEEPSEEK_PRICE_TABLE`；解析失败**报错**而不是退回内置表 |
 
 密钥只从进程环境变量读取：fixture 没有 `dotenv` 依赖；`pnpm agent` 通过
 `node --env-file-if-exists=.env` 在 `.env` 存在时自动加载它，其它入口（例如 `vitest`）
@@ -135,7 +250,7 @@ DEEPSEEK_API_KEY=sk-... DEEPSEEK_PLANNER_MODEL=deepseek-v4-pro pnpm exec vitest 
 
 ```sh
 pnpm turbo run test typecheck lint --filter=@linonward/agent-from-scratch-fixture --force
-# → Test Files 18 passed | 1 skipped (19)；Tests 176 passed | 5 skipped (181)
+# → Test Files 21 passed | 1 skipped (22)；Tests 242 passed | 5 skipped (247)
 #   e2e 文件整体 skipped（缺 key），沙箱集成 2 例默认 skip；tsc --noEmit 与 eslint 零问题
 ```
 
@@ -254,7 +369,8 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
 | `src/responses-stateless-driver.ts` | `tests/responses-stateless-driver.test.ts` | 首轮无 `previous_response_id`、续轮按序重发 `function_call` + `function_call_output` + 新上下文、`tools` 无 `strict` |
 | `src/planner-model.ts` | `tests/planner-model.test.ts` | `extractJsonObject` 三级解析、create/revise/evaluate 的解析与校验、带错误的有界重试、编造证据被丢弃、`completed=true` 但证据为空时降级为 `false` 并给出 notes、计划外 criterion id 被忽略 |
 | `src/run-task.ts` | `tests/run-task.test.ts` | 离线装配：工具 + 持久化 + trace + lease 释放；伪造证据被 Loop 拒绝 |
-| `src/agent-cli.ts` | `tests/agent-cli.test.ts` | 离线：三种命令与全部 flag 的解析、`--allow` 重复收集、非法输入报错含 `AGENT_USAGE`、`FakeModelDriver` 驱动 `run` / `answer` / 恢复、缺 key 指引进 `.env.example` |
+| `src/pricing.ts` | `tests/pricing.test.ts` | 内置表的 `asOf` / `source`、缓存单独计价 vs 并入 input 价、未知模型 / 未知 token → `undefined`（绝不 0）、`DEEPSEEK_PRICE_TABLE(_JSON)` 覆盖与解析失败报错 |
+| `src/agent-cli.ts` | `tests/agent-cli.test.ts` | 离线：三种命令与全部 flag 的解析、`--allow` 重复收集、非法输入报错含 `AGENT_USAGE`、`FakeModelDriver` 驱动 `run` / `answer` / 恢复、缺 key 指引进 `.env.example`；`[usage]` 透传与 `unknown`、成本覆盖、`plan_revised` 详情与默认路径逐字节不变 |
 | 端到端 | `tests/deepseek-e2e.test.ts` | 真实调用，`describe.skipIf(!process.env.DEEPSEEK_API_KEY)` 门控；两条确定性规划器 + 一条真实模型规划器 |
 
 ## 关键不变量

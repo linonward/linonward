@@ -80,6 +80,8 @@ export function createStatelessResponsesDriver(
     });
 
     history = [...history, ...response.output];
+    // `toModelTurn` 同时把归一化后的 `usage` 带到 `ModelTurn` 上：provider 没给
+    // usage 时该字段缺失（`undefined`），Loop 会把它记成 unknown 而不是 0。
     return toModelTurn(response);
   };
 
