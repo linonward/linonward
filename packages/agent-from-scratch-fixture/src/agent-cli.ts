@@ -1,6 +1,7 @@
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-
+import type { LoopPricing } from "./agent-loop.js";
+import { createJournal, createJournalModelDriver, createJournalToolHook } from "./cli-journal.js";
 import {
   type AgentCliOptions,
   type CliCommand,
@@ -17,6 +18,7 @@ import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import { createModelPlanner } from "./planner-model.js";
 import type { PolicyContext } from "./policy.js";
+import { resolvePriceTable } from "./pricing.js";
 import {
   createResponsesHttpClient,
   createResponsesModel,
@@ -37,7 +39,7 @@ import type { ToolRegistry } from "./tool-registry.js";
 import type { Clock } from "./types.js";
 
 export const AGENT_USAGE =
-  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose]";
+  "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose] [--log <path>] [--no-truncate]";
 
 /** 与 `runRealTask` 保持同一组预算默认值：CLI 与真实通路不各自定义一套。 */
 export const AGENT_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
@@ -50,6 +52,8 @@ const APPROVE_ALLOWED_FLAG = "--approve-allowed";
 const MAX_STEPS_FLAG = "--max-steps";
 const MAX_TOOL_CALLS_FLAG = "--max-tool-calls";
 const VERBOSE_FLAG = "--verbose";
+const LOG_FLAG = "--log";
+const NO_TRUNCATE_FLAG = "--no-truncate";
 
 /** `--allow` 收集 argv 时遇到这些开关就停：它们属于 CLI，不属于被允许的命令。 */
 const KNOWN_FLAGS: ReadonlySet<string> = new Set([
@@ -60,6 +64,8 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   MAX_STEPS_FLAG,
   MAX_TOOL_CALLS_FLAG,
   VERBOSE_FLAG,
+  LOG_FLAG,
+  NO_TRUNCATE_FLAG,
 ]);
 
 function usageError(detail: string): Error {
@@ -83,6 +89,10 @@ export interface AgentCliConfig {
   maxToolCalls: number;
   /** 默认关闭：打开后只在 stderr 上追加有界详情，stdout 仍只有最终答案。 */
   verbose: boolean;
+  /** `--log <path>`：把同一条完整日志以 JSONL 追加写入文件。只在 `--verbose` 打开时生效。 */
+  logPath?: string | undefined;
+  /** `--no-truncate`：关闭单条内容 20000 字符上限。只在 `--verbose` 打开时生效。 */
+  noTruncate: boolean;
 }
 
 /**
@@ -90,11 +100,11 @@ export interface AgentCliConfig {
  *
  * 子命令仍交给 `parseCliArgs` 解析（保持与既有 CLI 契约一致）；这里只负责把
  * `--cwd` / `--allow` / `--require-sandbox` / `--approve-allowed` / `--max-steps` /
- * `--max-tool-calls` / `--verbose` 从位置参数里摘出来。`--allow` 每次吞掉一个完整 argv，
- * 直到下一个已识别的 CLI flag 为止，因此可以重复出现。
+ * `--max-tool-calls` / `--verbose` / `--log` / `--no-truncate` 从位置参数里摘出来。
+ * `--allow` 每次吞掉一个完整 argv，直到下一个已识别的 CLI flag 为止，因此可以重复出现。
  *
- * 布尔开关（`--require-sandbox` / `--approve-allowed` / `--verbose`）只看"出现过"，
- * 放在子命令前或后都一样，重复出现也不报错。
+ * 布尔开关（`--require-sandbox` / `--approve-allowed` / `--verbose` / `--no-truncate`）
+ * 只看"出现过"，放在子命令前或后都一样，重复出现也不报错。
  */
 export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; command: CliCommand } {
   const positionals: string[] = [];
@@ -105,6 +115,8 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   let maxSteps = AGENT_DEFAULT_MAX_STEPS;
   let maxToolCalls = AGENT_DEFAULT_MAX_TOOL_CALLS;
   let verbose = false;
+  let logPath: string | undefined;
+  let noTruncate = false;
 
   let index = 0;
   while (index < argv.length) {
@@ -162,6 +174,21 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       continue;
     }
 
+    if (token === LOG_FLAG) {
+      const value = argv[index];
+      if (value === undefined || KNOWN_FLAGS.has(value)) {
+        throw usageError(`${LOG_FLAG} 需要一个文件路径`);
+      }
+      index += 1;
+      logPath = resolve(value);
+      continue;
+    }
+
+    if (token === NO_TRUNCATE_FLAG) {
+      noTruncate = true;
+      continue;
+    }
+
     if (token.startsWith("--")) throw usageError(`未知参数：${token}`);
     positionals.push(token);
   }
@@ -182,6 +209,8 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       maxSteps,
       maxToolCalls,
       verbose,
+      logPath,
+      noTruncate,
     },
     command,
   };
@@ -214,12 +243,18 @@ function createRealModels(config: DeepSeekConfig): { model: ModelDriver; planner
 function resolveModels(
   deps: AgentCliDeps,
   env: NodeJS.ProcessEnv,
-): { model: ModelDriver; planner: Planner } {
+): { model: ModelDriver; planner: Planner; modelId?: string | undefined } {
   if (deps.model !== undefined && deps.planner !== undefined) {
-    return { model: deps.model, planner: deps.planner };
+    // 注入替身时模型 id 只能由调用方给出：没有 id 就没有成本估算（`cost=unknown`）。
+    return { model: deps.model, planner: deps.planner, modelId: deps.modelId };
   }
-  const real = createRealModels(requireDeepSeekConfig(env));
-  return { model: deps.model ?? real.model, planner: deps.planner ?? real.planner };
+  const config = requireDeepSeekConfig(env);
+  const real = createRealModels(config);
+  return {
+    model: deps.model ?? real.model,
+    planner: deps.planner ?? real.planner,
+    modelId: deps.modelId ?? config.model,
+  };
 }
 
 /**
@@ -250,6 +285,11 @@ export interface AgentCliDeps {
   store?: RunStore | undefined;
   storeRoot?: string | undefined;
   clock?: Clock | undefined;
+  /**
+   * 注入替身时用于日志与成本估算的模型 id。真实通路自动取 `DEEPSEEK_MODEL`；
+   * 缺省时 `[usage]` 行显示 `model=unknown` / `cost=unknown`。
+   */
+  modelId?: string | undefined;
   /** 完全替换运行时装配（含 store）；提供时不再解析 DeepSeek 配置。 */
   runtime?: ((input: CliRuntimeInput) => CliRuntime) | undefined;
 }
@@ -267,6 +307,10 @@ interface RealWiring {
   planner: Planner;
   tools: ToolRegistry;
   store: RunStore;
+  /** 真实通路解析出的模型 id（只用于日志，**不含密钥**）；注入替身时为 undefined。 */
+  modelId?: string | undefined;
+  /** 成本估算接线：模型 id + 价目表（内置表或被环境变量覆盖的表）。 */
+  pricing: LoopPricing;
 }
 
 function createRuntimeFactory(
@@ -286,24 +330,27 @@ function createRuntimeFactory(
     network: "disabled",
   };
 
-  const options: AgentCliOptions = {
-    cwd: wiring.config.cwd,
-    skillsDirectory: wiring.skillsDirectory,
-    store: wiring.store,
-    model: wiring.model,
-    planner: wiring.planner,
-    tools: wiring.tools,
-    policy,
-    approvals,
-    sandbox: detectSandbox(),
-    requireSandbox: wiring.config.requireSandbox,
-    maxSteps: wiring.config.maxSteps,
-    maxToolCalls: wiring.config.maxToolCalls,
-  };
-  if (wiring.clock !== undefined) options.clock = wiring.clock;
+  return (input) => {
+    const options: AgentCliOptions = {
+      cwd: wiring.config.cwd,
+      skillsDirectory: wiring.skillsDirectory,
+      store: wiring.store,
+      model: wiring.model,
+      planner: wiring.planner,
+      tools: wiring.tools,
+      policy,
+      approvals,
+      sandbox: detectSandbox(),
+      requireSandbox: wiring.config.requireSandbox,
+      maxSteps: wiring.config.maxSteps,
+      maxToolCalls: wiring.config.maxToolCalls,
+      pricing: wiring.pricing,
+    };
+    if (wiring.clock !== undefined) options.clock = wiring.clock;
+    if (input.journal !== undefined) options.onToolCall = createJournalToolHook(input.journal);
 
-  const factory = createAgentCliRuntime(options);
-  return (input) => factory({ ...input, skillsDirectory: wiring.skillsDirectory });
+    return createAgentCliRuntime(options)({ ...input, skillsDirectory: wiring.skillsDirectory });
+  };
 }
 
 function buildDependencies(input: {
@@ -323,6 +370,7 @@ function buildDependencies(input: {
       planner: wiring.planner,
       tools: wiring.tools,
       store: wiring.store,
+      pricing: wiring.pricing,
       clock: input.clock,
       skillsDirectory: input.skillsDirectory,
     }),
@@ -355,8 +403,12 @@ export async function createDeepSeekAgentCli(
 
   const resolveWiring = (): RealWiring => {
     if (wiring !== undefined) return wiring;
+    const models = resolveModels(deps, env);
     wiring = {
-      ...resolveModels(deps, env),
+      ...models,
+      // 价格表在装配期解析：`DEEPSEEK_PRICE_TABLE(_JSON)` 写错时**立刻**报可读错误，
+      // 而不是静默退回内置表、让操作者以为成本是按自己的内部价算的。
+      pricing: { modelId: models.modelId, table: resolvePriceTable(env) },
       tools: deps.tools ?? createRealTaskRegistry(),
       store: deps.store ?? new LocalFileRunStore(deps.storeRoot ?? defaultStoreRoot(env)),
     };
@@ -372,22 +424,57 @@ export async function createDeepSeekAgentCli(
       return EXIT_CODES.usage;
     }
 
-    const dependencies = buildDependencies({
-      config: parsed.config,
-      runtimeOverride,
-      wiring: runtimeOverride === undefined ? resolveWiring() : undefined,
-      clock: deps.clock,
-      skillsDirectory,
+    // 缺 key 的异常必须直接冒泡（由 scripts/agent.ts 打印），因此 wiring 先于 journal 解析。
+    const realWiring = runtimeOverride === undefined ? resolveWiring() : undefined;
+
+    const journal = createJournal({
+      verbose: parsed.config.verbose,
+      logPath: parsed.config.logPath,
+      truncate: !parsed.config.noTruncate,
+      write: (line) => io.stderr(line),
     });
 
     try {
-      return await runCli(toCliArgv(parsed.command), dependencies, io, {
-        verbose: parsed.config.verbose,
+      journal.runMeta({
+        command: parsed.command.command,
+        task: parsed.command.command === "run" ? parsed.command.task : undefined,
+        cwd: parsed.config.cwd,
+        budgets: { maxSteps: parsed.config.maxSteps, maxToolCalls: parsed.config.maxToolCalls },
+        allowedArgv: parsed.config.allowedArgv,
+        requireSandbox: parsed.config.requireSandbox,
+        modelId: realWiring?.modelId,
       });
-    } catch (error) {
-      // 运行期错误（未知 requestId、没有可恢复的检查点等）折成可读错误与非零退出码。
-      io.stderr(messageOf(error));
-      return EXIT_CODES.failed;
+
+      // 只在日志打开时装饰驱动；关闭时不创建 journal，也不改变模型边界。
+      const wiring =
+        realWiring !== undefined && journal.active
+          ? {
+              ...realWiring,
+              model: createJournalModelDriver(realWiring.model, journal, realWiring.pricing),
+            }
+          : realWiring;
+
+      const dependencies = buildDependencies({
+        config: parsed.config,
+        runtimeOverride,
+        wiring,
+        clock: deps.clock,
+        skillsDirectory,
+      });
+
+      try {
+        return await runCli(toCliArgv(parsed.command), dependencies, io, {
+          verbose: parsed.config.verbose,
+          journal,
+          pricing: realWiring?.pricing,
+        });
+      } catch (error) {
+        // 运行期错误（未知 requestId、没有可恢复的检查点等）折成可读错误与非零退出码。
+        io.stderr(messageOf(error));
+        return EXIT_CODES.failed;
+      }
+    } finally {
+      journal.close();
     }
   };
 }

@@ -13,9 +13,9 @@ import {
 } from "./completion.js";
 import { buildModelRequest, type ContextSource, summarizeSources } from "./context.js";
 import { toDurableState } from "./durable-state.js";
-import { executeToolCall, type ToolObservation } from "./execute-tool.js";
+import { executeToolCall, type ToolExecutionResult, type ToolObservation } from "./execute-tool.js";
 import { waitForUserInput } from "./interaction.js";
-import type { FunctionCallOutput, ModelDriver, ModelTurn, ToolCall } from "./model.js";
+import type { FunctionCallOutput, ModelDriver, ModelTurn, ModelUsage, ToolCall } from "./model.js";
 import {
   allCriteriaPassed,
   allStepsCompleted,
@@ -30,7 +30,13 @@ import {
   startStep,
 } from "./plan.js";
 import type { Planner } from "./planner.js";
-import { type ApprovalLedger, InMemoryApprovalLedger, type PolicyContext } from "./policy.js";
+import {
+  type ApprovalLedger,
+  InMemoryApprovalLedger,
+  type PolicyContext,
+  type PolicyDecision,
+} from "./policy.js";
+import { estimateCostUsd, type PriceTable } from "./pricing.js";
 import {
   createRunCheckpoint,
   type DurableEvent,
@@ -47,7 +53,7 @@ import { appendEvent, canTransition, createInitialState, transitionState } from 
 import { buildSystemPrompt } from "./system-prompt.js";
 import { InMemoryWriteLease, type WriteLease } from "./tool.js";
 import type { ToolRegistry } from "./tool-registry.js";
-import type { TraceSink } from "./trace.js";
+import { addOptionalCounts, type RunUsage, type TraceSink } from "./trace.js";
 import type {
   AgentResult,
   AgentState,
@@ -59,12 +65,129 @@ import type {
   ValidationSpec,
 } from "./types.js";
 
+/** `plan_revised` 里最多带几条触发证据（最近失败的工具）。 */
+export const MAX_PLAN_REVISED_FAILURES = 3;
+/** `plan_revised` 里每类步骤 id 最多列几条，超出写 `…(+N)`。 */
+export const MAX_PLAN_REVISED_STEP_IDS = 10;
+
+/** 触发一次重规划时，最近失败的工具（名字 + error code）。 */
+export interface PlanRevisedFailure {
+  name: string;
+  errorCode?: string | undefined;
+}
+
+/**
+ * `plan_revised` 的**有界**详情：回答操作者的两个问题——"为什么改"与"改了什么"。
+ *
+ * 每类步骤 id 都带上"因上限省略了几条"，因此 `…(+N)` 是精确的，不是"大概还有几条"。
+ */
+export interface PlanRevisedDetail {
+  type: "plan_revised";
+  reason: string;
+  addedSteps: string[];
+  removedSteps: string[];
+  renamedSteps: string[];
+  addedStepsOmitted: number;
+  removedStepsOmitted: number;
+  renamedStepsOmitted: number;
+  /** 依赖列表发生变化的步骤数（不是变化了几条依赖）。 */
+  dependencyChanges: number;
+  recentFailures: PlanRevisedFailure[];
+  recentFailuresOmitted: number;
+}
+
+/** 计划差异：新增 / 删除 / 标题变化 的步骤 id + 依赖变化次数，全部有界。 */
+export function diffPlanSteps(
+  before: TaskPlan,
+  after: TaskPlan,
+): {
+  addedSteps: string[];
+  removedSteps: string[];
+  renamedSteps: string[];
+  addedStepsOmitted: number;
+  removedStepsOmitted: number;
+  renamedStepsOmitted: number;
+  dependencyChanges: number;
+} {
+  const beforeById = new Map(before.steps.map((step) => [step.id, step]));
+  const afterById = new Map(after.steps.map((step) => [step.id, step]));
+
+  const added = after.steps.filter((step) => !beforeById.has(step.id)).map((step) => step.id);
+  const removed = before.steps.filter((step) => !afterById.has(step.id)).map((step) => step.id);
+  // 只有"两边都在、标题变了"才算改名：新增的步骤不算，否则同一个 id 会被数两次。
+  const renamed = after.steps
+    .filter((step) => {
+      const previous = beforeById.get(step.id);
+      return previous !== undefined && previous.title !== step.title;
+    })
+    .map((step) => step.id);
+
+  const dependencyChanges = after.steps.filter((step) => {
+    const previous = beforeById.get(step.id);
+    return previous !== undefined && !sameDependencies(previous.dependsOn, step.dependsOn);
+  }).length;
+
+  const addedSteps = added.slice(0, MAX_PLAN_REVISED_STEP_IDS);
+  const removedSteps = removed.slice(0, MAX_PLAN_REVISED_STEP_IDS);
+  const renamedSteps = renamed.slice(0, MAX_PLAN_REVISED_STEP_IDS);
+  return {
+    addedSteps,
+    removedSteps,
+    renamedSteps,
+    addedStepsOmitted: added.length - addedSteps.length,
+    removedStepsOmitted: removed.length - removedSteps.length,
+    renamedStepsOmitted: renamed.length - renamedSteps.length,
+    dependencyChanges,
+  };
+}
+
+/** 依赖语义上是集合：顺序变化不算"改了什么"。 */
+function sameDependencies(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].toSorted();
+  const sortedRight = [...right].toSorted();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
+function buildPlanRevisedDetail(input: {
+  before: TaskPlan;
+  after: TaskPlan;
+  reason: string;
+  recentFailures: readonly PlanRevisedFailure[];
+  failureCount: number;
+}): PlanRevisedDetail {
+  return {
+    type: "plan_revised",
+    reason: input.reason,
+    ...diffPlanSteps(input.before, input.after),
+    recentFailures: input.recentFailures.map((failure) => ({ ...failure })),
+    recentFailuresOmitted: Math.max(0, input.failureCount - input.recentFailures.length),
+  };
+}
+
 export type AgentLoopEvent =
   | { type: "run_started"; runId: string }
   | { type: "model_started"; step: number }
   | { type: "model_completed"; step: number }
-  | { type: "plan_revised"; version: number; reason: string }
+  | {
+      type: "plan_revised";
+      version: number;
+      reason: string;
+      /** 有界详情（为什么改 / 改了什么 / 触发证据）。缺省时事件形状与以前完全一致。 */
+      detail?: PlanRevisedDetail | undefined;
+    }
   | { type: "run_stopped"; reason: StopReason };
+
+/**
+ * 成本估算接线。
+ *
+ * `modelId` 与 `table` 任一缺失都只表示"算不出成本"，而不是"成本是 0"：
+ * `AgentState.usage.estimatedCostUsd` 会保持 `undefined`，输出 `cost=unknown`。
+ */
+export interface LoopPricing {
+  modelId?: string | undefined;
+  table?: PriceTable | undefined;
+}
 
 /** 上下文压缩接线：阈值来自 usage，安全边界由 `maybeCompactContext` 判定。 */
 export interface LoopCompactionOptions {
@@ -108,9 +231,26 @@ export interface AgentLoopOptions {
   /** 只在新建运行时有意义：持久化调用方要先知道 runId 才能取到 lease。 */
   runId?: string | undefined;
   onEvent?: ((event: AgentLoopEvent) => void) | undefined;
+  /**
+   * 每次工具调用结束后的观测钩子（参数、结果、耗时与策略决定）。
+   * 未提供时行为与今天逐字节一致：连时钟都不会被额外读取。
+   */
+  onToolCall?:
+    | ((input: {
+        call: ToolCall;
+        result: ToolExecutionResult;
+        durationMs: number;
+        policy?: PolicyDecision | undefined;
+      }) => void)
+    | undefined;
   /** 未提供时行为与今天完全一致：不压缩、不写 store。 */
   compaction?: LoopCompactionOptions | undefined;
   persistence?: LoopPersistence | undefined;
+  /**
+   * 成本估算接线（模型 id + 价目表）。未提供时 `usage.estimatedCostUsd` 保持
+   * `undefined`，输出层显示 `cost=unknown`——绝不按 0 计。
+   */
+  pricing?: LoopPricing | undefined;
 }
 
 /** 续跑时由恢复器注入：上一轮的 responseId 与尚未送达模型的结果。 */
@@ -259,6 +399,7 @@ interface LoopContext {
   options: AgentLoopOptions;
   approvals: ApprovalLedger;
   writeLease: WriteLease;
+  usage: UsageTracker;
   emit(state: AgentState, event: AgentLoopEvent): void;
   now(): Date;
   persist(state: AgentState, event: DurableEvent): Promise<boolean>;
@@ -268,7 +409,70 @@ interface LoopContext {
   markDurableFailed(): void;
 }
 
-function createLoopContext(options: AgentLoopOptions): LoopContext {
+/**
+ * 运行用量累加器。
+ *
+ * 累加器是**可变对象**，并且就是 `AgentState.usage` 本身：状态的所有派生副本
+ * （`appendEvent` / `transitionState` 只做展开复制）共享同一个 `usage` 引用，
+ * 因此就地累加对每个 return 点都可见，不需要在十几个出口处逐个回写。
+ *
+ * `durationMs` 是**整轮墙钟时间**，按"段"累加：`markElapsed` 只补上自上次标记以来
+ * 经过的时间（用注入的 `Clock`），重复调用不会重复计时。段式累加让 `resume` 之后
+ * 的墙钟时间接着涨，而不是从 0 重来。
+ */
+interface UsageTracker {
+  /** 一次模型调用：累计 token（缺失即未知）与调用次数。 */
+  recordModelCall(usage: ModelUsage | undefined): void;
+  /** 一次工具调用：只累计次数，耗时归入墙钟时间。 */
+  recordToolCall(): void;
+  /** 把自上次标记以来经过的墙钟时间累加进 `durationMs`。 */
+  markElapsed(): void;
+  /** 收尾：补齐最后一段墙钟时间并重算成本。 */
+  finish(): void;
+}
+
+function createUsageTracker(options: AgentLoopOptions, state: AgentState): UsageTracker {
+  const usage = state.usage;
+  const clockNow = (): Date => options.clock?.now() ?? new Date();
+  let lastMarkMs = clockNow().getTime();
+
+  const recomputeCost = (): void => {
+    const modelId = options.pricing?.modelId;
+    // 没有模型 id（或模型不在价目表里）时保持 `undefined`：输出 `cost=unknown`。
+    usage.estimatedCostUsd =
+      modelId === undefined ? undefined : estimateCostUsd(usage, modelId, options.pricing?.table);
+  };
+
+  const markElapsed = (): void => {
+    const now = clockNow().getTime();
+    usage.durationMs += Math.max(0, now - lastMarkMs);
+    lastMarkMs = now;
+  };
+
+  return {
+    recordModelCall(callUsage) {
+      usage.modelCalls += 1;
+      // 这次调用没报 usage 时增量是 `undefined`，合计随之为未知——绝不当 0 相加。
+      usage.inputTokens = addOptionalCounts(usage.inputTokens, callUsage?.inputTokens);
+      usage.outputTokens = addOptionalCounts(usage.outputTokens, callUsage?.outputTokens);
+      usage.cachedInputTokens = addOptionalCounts(
+        usage.cachedInputTokens,
+        callUsage?.cachedInputTokens,
+      );
+      recomputeCost();
+    },
+    recordToolCall() {
+      usage.toolCalls += 1;
+    },
+    markElapsed,
+    finish() {
+      markElapsed();
+      recomputeCost();
+    },
+  };
+}
+
+function createLoopContext(options: AgentLoopOptions, usage: UsageTracker): LoopContext {
   const approvals = options.approvals ?? new InMemoryApprovalLedger();
   const writeLease = options.writeLease ?? new InMemoryWriteLease();
 
@@ -318,6 +522,7 @@ function createLoopContext(options: AgentLoopOptions): LoopContext {
     options,
     approvals,
     writeLease,
+    usage,
     emit,
     now: () => options.clock?.now() ?? new Date(),
     async persist(state, event) {
@@ -486,6 +691,8 @@ async function finishStop(
   reason: StopReason,
   context: LoopContext,
 ): Promise<AgentResult> {
+  // 停止点是这一段的结束：先把墙钟时间补齐，再写检查点，让持久化的 usage 不含"尾巴"。
+  context.usage.markElapsed();
   const stopped = stop(state, reason, context);
   if (context.options.persistence) {
     const persisted = await context.persist(stopped.state, { type: "run_stopped", reason });
@@ -649,13 +856,31 @@ export async function runAgentLoop(task: string, options: AgentLoopOptions): Pro
  * → 证据校验 → 提前完成被打回 → plan_revised → 停止原因。
  *
  * `runAgentLoopFromState` 不重置预算，也不重新创建任务或计划。
+ *
+ * 用量（token / 缓存命中 / 调用计数 / 墙钟时间 / 估算成本）累加在 `state.usage` 上，
+ * 随检查点持久化，`resume` 后继续累计。这里只在最外层补上"最后一段墙钟时间"：
+ * 停止边界（`finishStop` / 最终答案）已经各自标记过一次，重复标记不会重复计时。
  */
 export async function runAgentLoopFromState(
   state: AgentState,
   options: AgentLoopOptions,
   resume: AgentLoopResume = {},
 ): Promise<AgentResult> {
-  const context = createLoopContext(options);
+  const usage = createUsageTracker(options, state);
+  try {
+    return await runLoopFromState(state, options, resume, usage);
+  } finally {
+    usage.finish();
+  }
+}
+
+async function runLoopFromState(
+  state: AgentState,
+  options: AgentLoopOptions,
+  resume: AgentLoopResume,
+  usageTracker: UsageTracker,
+): Promise<AgentResult> {
+  const context = createLoopContext(options, usageTracker);
   const toolDefinitions = options.tools.definitions();
   const specs = options.validationSpecs ?? [];
 
@@ -667,6 +892,9 @@ export async function runAgentLoopFromState(
   let replansWithoutProgress = 0;
   let lastPersistedPlanVersion = -1;
   let consecutiveCompactionFailures = 0;
+  /** 本段里失败过的工具（最多保留最近 `MAX_PLAN_REVISED_FAILURES` 条）与失败总数。 */
+  let recentToolFailures: PlanRevisedFailure[] = [];
+  let toolFailureCount = 0;
 
   const rawTailSize = options.compaction?.rawTailSize ?? 12;
   const estimateTokens = options.compaction?.estimateInputTokens ?? estimateInputTokens;
@@ -768,6 +996,7 @@ export async function runAgentLoopFromState(
         reason: replanReason,
         observations: recentObservations(state),
       });
+      const previous = plan;
       plan = reconcilePlan(plan, draft, replanReason);
       state.plan = plan;
       state.requiredCriterionIds = plan.acceptanceCriteria.map((criterion) => criterion.id);
@@ -778,7 +1007,18 @@ export async function runAgentLoopFromState(
         changedAt: context.now().toISOString(),
       });
       consecutiveToolFailures = 0;
-      context.emit(state, { type: "plan_revised", version: plan.version, reason: replanReason });
+      context.emit(state, {
+        type: "plan_revised",
+        version: plan.version,
+        reason: replanReason,
+        detail: buildPlanRevisedDetail({
+          before: previous,
+          after: plan,
+          reason: replanReason,
+          recentFailures: recentToolFailures,
+          failureCount: toolFailureCount,
+        }),
+      });
       if (++replansWithoutProgress > MAX_REPLANS_WITHOUT_PROGRESS) {
         context.persistRuntime(
           state,
@@ -911,6 +1151,8 @@ export async function runAgentLoopFromState(
       kind: "model",
       summary: turn.toolCalls.length > 0 ? "模型请求工具" : "模型返回文本",
     });
+    // 用量在模型边界就记下：即使随后因持久化失败/取消停止，这一轮的 token 也不会丢。
+    context.usage.recordModelCall(turn.usage);
     context.emit(state, { type: "model_completed", step: modelStepCount });
     if (
       !(await context.persist(state, {
@@ -961,6 +1203,7 @@ export async function runAgentLoopFromState(
       state.messages.push({ role: "assistant", content: answer });
       const completed = transitionState(state, "completed", "final_answer", context.now());
       context.emit(completed, { type: "run_stopped", reason: "final_answer" });
+      context.usage.markElapsed();
       if (!(await context.persist(completed, { type: "run_stopped", reason: "final_answer" }))) {
         return interruptedResult(completed);
       }
@@ -1006,6 +1249,8 @@ export async function runAgentLoopFromState(
         return interruptedResult(state);
       }
 
+      const hook = options.onToolCall;
+      const hookStartedAt = hook === undefined ? undefined : context.now();
       const result = await executeToolCall({
         call,
         registry: options.tools,
@@ -1025,6 +1270,13 @@ export async function runAgentLoopFromState(
         },
       });
       state.budget.toolCalls += 1;
+      context.usage.recordToolCall();
+
+      if (hook !== undefined) {
+        const durationMs =
+          hookStartedAt === undefined ? 0 : context.now().getTime() - hookStartedAt.getTime();
+        hook({ call, result, durationMs, policy: result.policy });
+      }
 
       if (result.type === "waiting") {
         const waiting = transitionState(state, "waiting", result.reason, context.now());
@@ -1043,7 +1295,14 @@ export async function runAgentLoopFromState(
         observation: result,
         specs,
       });
-      if (!result.ok) batchOk = false;
+      if (!result.ok) {
+        batchOk = false;
+        toolFailureCount += 1;
+        const failure: PlanRevisedFailure = { name: call.name };
+        if (result.errorCode !== undefined) failure.errorCode = result.errorCode;
+        // 只保留最近 N 条触发证据；总数单独记，`…(+N)` 才是精确的。
+        recentToolFailures = [...recentToolFailures, failure].slice(-MAX_PLAN_REVISED_FAILURES);
+      }
 
       if (
         !(await context.persist(state, {
@@ -1088,6 +1347,7 @@ export async function runAgentLoopFromState(
         reason: progress.replanReason,
         observations,
       });
+      const previous = plan;
       plan = reconcilePlan(plan, draft, progress.replanReason);
       state.plan = plan;
       state.requiredCriterionIds = plan.acceptanceCriteria.map((criterion) => criterion.id);
@@ -1100,6 +1360,13 @@ export async function runAgentLoopFromState(
         type: "plan_revised",
         version: plan.version,
         reason: progress.replanReason,
+        detail: buildPlanRevisedDetail({
+          before: previous,
+          after: plan,
+          reason: progress.replanReason,
+          recentFailures: recentToolFailures,
+          failureCount: toolFailureCount,
+        }),
       });
       state.activeStepId = undefined;
       if (++replansWithoutProgress > MAX_REPLANS_WITHOUT_PROGRESS) {
@@ -1133,6 +1400,7 @@ export function summarizeRun(state: AgentState): {
   validations: number;
   modelSteps: number;
   toolCalls: number;
+  usage: RunUsage;
 } {
   return {
     runId: state.runId,
@@ -1142,5 +1410,6 @@ export function summarizeRun(state: AgentState): {
     validations: state.validations.length,
     modelSteps: state.budget.modelSteps,
     toolCalls: state.budget.toolCalls,
+    usage: structuredClone(state.usage),
   };
 }

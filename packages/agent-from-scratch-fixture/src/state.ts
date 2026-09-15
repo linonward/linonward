@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { emptyUsage } from "./trace.js";
 import type { AgentState } from "./types.js";
 
 /**
@@ -76,6 +77,7 @@ export function createInitialState(
     constraints: [],
     skills: { catalog: [], activeSkills: {} },
     compaction: { snapshots: [], compactedThroughEvent: 0 },
+    usage: emptyUsage(),
   };
 }
 

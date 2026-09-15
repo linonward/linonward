@@ -1,5 +1,12 @@
 import type { ModelRequest } from "./context.js";
-import type { FunctionCallOutput, Model, ModelDriver, ModelTurn, ToolDefinition } from "./model.js";
+import type {
+  FunctionCallOutput,
+  Model,
+  ModelDriver,
+  ModelTurn,
+  ModelUsage,
+  ToolDefinition,
+} from "./model.js";
 import type { UserInputRequest } from "./types.js";
 
 /** 确定性的模型替身：不读 API Key、不访问网络、不产生费用。 */
@@ -85,4 +92,9 @@ export function userInputTurn(
     toolCalls: [],
     userInputRequest: request,
   };
+}
+
+/** 给任意 turn 挂上 provider usage：离线测试用来断言用量透传与成本估算。 */
+export function withUsage(turn: ModelTurn, usage: ModelUsage): ModelTurn {
+  return { ...turn, usage };
 }

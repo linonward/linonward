@@ -10,7 +10,7 @@ import {
   parseCliArgs,
   runCli,
 } from "../src/index.js";
-import { InMemoryTraceSink } from "../src/trace.js";
+import { emptyUsage, InMemoryTraceSink } from "../src/trace.js";
 import type { AgentResult, AgentState, StopReason } from "../src/types.js";
 import {
   CompletingPlanner,
@@ -54,6 +54,7 @@ function fakeResult(input: {
     constraints: [],
     skills: { catalog: [], activeSkills: {} },
     compaction: { snapshots: [], compactedThroughEvent: 0 },
+    usage: emptyUsage(),
   } satisfies AgentState;
 
   return {
@@ -162,6 +163,29 @@ describe("cli exit codes", () => {
     expect(fixture.stderr[0]).toContain('"type":"run_started"');
     expect(fixture.stderr.at(-1)).toContain('"stopReason":"final_answer"');
     expect(fixture.seen[0]?.signal.aborted).toBe(false);
+    // 默认路径不额外输出 usage / summary。
+    expect(fixture.stderr.join("\n")).not.toContain("[usage]");
+    expect(fixture.stderr.join("\n")).not.toContain("[summary]");
+  });
+
+  it("appends a bounded [summary] usage line and the run [usage] line when verbose", async () => {
+    const fixture = harness({});
+
+    const code = await runCli(["run", "解释 package.json"], fixture.dependencies, fixture.io, {
+      verbose: true,
+    });
+
+    expect(code).toBe(EXIT_CODES.completed);
+    const joined = fixture.stderr.join("\n");
+    // 没有接线定价时成本是 unknown，而不是 $0.000000。
+    expect(joined).toContain(
+      "[summary] usage modelCalls=0 toolCalls=0 in=0 out=0 cached=0 wallMs=0 cost=unknown",
+    );
+    expect(joined).toContain(
+      "[usage] run: modelCalls=0 toolCalls=0 in=0 out=0 cached=0 wallMs=0 cost=unknown",
+    );
+    // stdout 仍然只有最终答案，管道可用。
+    expect(fixture.stdout).toEqual(["解释 package.json"]);
   });
 
   it("returns the usage code without creating a runtime", async () => {

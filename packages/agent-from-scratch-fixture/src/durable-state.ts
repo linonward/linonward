@@ -1,4 +1,5 @@
 import type { ContextSource } from "./context.js";
+import { emptyUsage } from "./trace.js";
 import type { AgentState, DurableAgentState, ProviderCursor } from "./types.js";
 
 /**
@@ -44,6 +45,7 @@ export function toDurableState(
     events: state.events,
     nextEventSequence: state.nextEventSequence,
     stopReason: state.stopReason,
+    usage: state.usage,
   };
   if (state.activeStepId !== undefined) durable.activeStepId = state.activeStepId;
   if (state.pendingUserInput !== undefined) durable.pendingUserInput = state.pendingUserInput;
@@ -102,5 +104,8 @@ export function fromDurableState(durable: DurableAgentState): AgentState {
     constraints: durable.constraints,
     skills: durable.skills,
     compaction: durable.compaction,
+    // 旧检查点没有 `usage`：补成已知的 0 起点。深拷贝一份，避免恢复出来的 AgentState
+    // 与 durable 快照共享同一个累加器对象。
+    usage: durable.usage === undefined ? emptyUsage() : structuredClone(durable.usage),
   };
 }

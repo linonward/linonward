@@ -1,21 +1,28 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { type AgentLoopOptions, runAgentLoop, runAgentLoopFromState } from "../src/agent-loop.js";
+import {
+  type AgentLoopEvent,
+  type AgentLoopOptions,
+  runAgentLoop,
+  runAgentLoopFromState,
+} from "../src/agent-loop.js";
 import { isRecord, sha256 } from "../src/checkpoint.js";
-import { FakeModelDriver, textTurn, turnWithTools } from "../src/fake-model.js";
+import { fromDurableState, toDurableState } from "../src/durable-state.js";
+import { FakeModelDriver, textTurn, turnWithTools, withUsage } from "../src/fake-model.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
 import { createInitialState, transitionState } from "../src/state.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { runCommandTool } from "../src/tools/run-command.js";
 import { InMemoryTraceSink } from "../src/trace.js";
-import type { ValidationSpec } from "../src/types.js";
+import type { AgentState, ValidationSpec } from "../src/types.js";
 import {
   CompletingPlanner,
   completeWith,
   createRegistry,
   criterion,
   echoTool,
+  failingTool,
   makeDraft,
   makeTaskPlan,
   makeTempDir,
@@ -65,11 +72,18 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
   if (overrides.clock !== undefined) options.clock = overrides.clock;
   if (overrides.signal !== undefined) options.signal = overrides.signal;
   if (overrides.onEvent !== undefined) options.onEvent = overrides.onEvent;
+  if (overrides.pricing !== undefined) options.pricing = overrides.pricing;
   return options;
 }
 
 const echoObservation = JSON.stringify({ ok: true, data: { echoed: "hi" } });
 const echoCall = { callId: "call-1", name: "echo", argumentsJson: '{"value":"hi"}' };
+/** `boom` 抛错后的 observation 形状（见 `execute-tool.ts` 的失败分支）。 */
+const failureObservation = JSON.stringify({
+  ok: false,
+  error: "tool_error",
+  message: "tool exploded",
+});
 
 /** `plan_blocked` 的 detail 是 JSON 文本：测试只按稳定字段读取，不做类型断言。 */
 function parseDetail(detail: string): Record<string, unknown> {
@@ -334,6 +348,212 @@ describe("agent loop control flow", () => {
     expect(result.state.plan?.version).toBe(2);
     expect(result.state.planHistory[0]).toMatchObject({ version: 2 });
     expect(result.stopReason).toBe("max_steps");
+  });
+
+  it("attaches the bounded plan diff and the failed-tool evidence to plan_revised", async () => {
+    const cwd = await tempDir();
+    const draft = makeDraft({ steps: [{ id: "inspect", title: "读取 package.json" }] });
+    const revised = makeDraft({
+      steps: [
+        { id: "inspect", title: "读取并解释 package.json" },
+        { id: "extra", title: "新增的步骤" },
+      ],
+    });
+    const planner = new ScriptedPlanner(
+      draft,
+      [
+        {
+          completed: false,
+          evidence: [failureObservation],
+          passedCriteria: [],
+          replanReason: "failed_assumption",
+        },
+      ],
+      revised,
+    );
+    const events: AgentLoopEvent[] = [];
+
+    await runAgentLoop(
+      "任务",
+      base(cwd, {
+        maxSteps: 2,
+        model: new FakeModelDriver([
+          turnWithTools({ callId: "call-boom", name: "boom", argumentsJson: "{}" }),
+          textTurn("仍然未完成", "response-2"),
+        ]),
+        planner,
+        tools: createRegistry(failingTool),
+        onEvent: (event) => void events.push(event),
+      }),
+    );
+
+    const revisedEvent = events.find((event) => event.type === "plan_revised");
+    if (revisedEvent?.type !== "plan_revised") throw new Error("plan_revised event is missing");
+
+    // 改了什么：新增 step-extra、改名 inspect、依赖未变；为什么：reason。
+    expect(revisedEvent.detail).toMatchObject({
+      type: "plan_revised",
+      reason: "failed_assumption",
+      addedSteps: ["extra"],
+      removedSteps: [],
+      renamedSteps: ["inspect"],
+      addedStepsOmitted: 0,
+      removedStepsOmitted: 0,
+      renamedStepsOmitted: 0,
+      dependencyChanges: 0,
+      // 触发证据：最近失败的工具 + error code。
+      recentFailures: [{ name: "boom", errorCode: "tool_error" }],
+      recentFailuresOmitted: 0,
+    });
+  });
+
+  it("accumulates model tokens, cache hits and tool calls into state.usage", async () => {
+    const cwd = await tempDir();
+    const driver = new FakeModelDriver([
+      withUsage(turnWithTools(echoCall), {
+        inputTokens: 100,
+        outputTokens: 10,
+        cachedInputTokens: 40,
+      }),
+      withUsage(textTurn("完成"), {
+        inputTokens: 200,
+        outputTokens: 20,
+        cachedInputTokens: 60,
+      }),
+    ]);
+    const planner = new ScriptedPlanner(
+      makeDraft({ steps: [{ id: "inspect", title: "读取 package.json" }] }),
+      [completeWith([echoObservation], ["criterion-1"])],
+    );
+
+    const result = await runAgentLoop(
+      "任务",
+      base(cwd, { model: driver, planner, tools: createRegistry(echoTool) }),
+    );
+
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.state.usage.inputTokens).toBe(300);
+    expect(result.state.usage.outputTokens).toBe(30);
+    expect(result.state.usage.cachedInputTokens).toBe(100);
+    expect(result.state.usage.modelCalls).toBe(2);
+    expect(result.state.usage.toolCalls).toBe(1);
+    expect(result.state.usage.durationMs).toBeGreaterThanOrEqual(0);
+    // 没有接线定价时算不出成本：保持 undefined，输出层显示 `cost=unknown`。
+    expect(result.state.usage.estimatedCostUsd).toBeUndefined();
+  });
+
+  it("records a model call without usage as unknown instead of zero", async () => {
+    const cwd = await tempDir();
+    const driver = new FakeModelDriver([
+      withUsage(turnWithTools(echoCall), { inputTokens: 100, outputTokens: 10 }),
+      textTurn("完成"),
+    ]);
+    const planner = new ScriptedPlanner(
+      makeDraft({ steps: [{ id: "inspect", title: "读取 package.json" }] }),
+      [completeWith([echoObservation], ["criterion-1"])],
+    );
+
+    const result = await runAgentLoop(
+      "任务",
+      base(cwd, { model: driver, planner, tools: createRegistry(echoTool) }),
+    );
+
+    // 未知会传播：第二次调用没报 usage，整轮 token 就是未知，而不是"等于第一次的值"。
+    expect(result.state.usage.inputTokens).toBeUndefined();
+    expect(result.state.usage.outputTokens).toBeUndefined();
+    expect(result.state.usage.modelCalls).toBe(2);
+  });
+
+  it("estimates cost from the injected price table and leaves it unknown otherwise", async () => {
+    const cwd = await tempDir();
+    const turn = withUsage(textTurn("完成"), { inputTokens: 1_000_000, outputTokens: 1_000_000 });
+    const planner = new CompletingPlanner(makeDraft({}), ["criterion-1"]);
+    const table = {
+      asOf: "2024-01-01",
+      models: {
+        "test-model": {
+          inputPerMillionUsd: 100,
+          cachedInputPerMillionUsd: 10,
+          outputPerMillionUsd: 200,
+          asOf: "2024-01-01",
+        },
+      },
+    };
+
+    const priced = await runAgentLoop(
+      "任务",
+      base(cwd, {
+        model: new FakeModelDriver([turn]),
+        planner,
+        tools: createRegistry(echoTool),
+        pricing: { modelId: "test-model", table },
+      }),
+    );
+    expect(priced.state.usage.estimatedCostUsd).toBeCloseTo(300, 10);
+
+    const unpriced = await runAgentLoop(
+      "任务",
+      base(cwd, {
+        model: new FakeModelDriver([turn]),
+        planner,
+        tools: createRegistry(echoTool),
+        pricing: { modelId: "not-in-the-table", table },
+      }),
+    );
+    expect(unpriced.state.usage.estimatedCostUsd).toBeUndefined();
+  });
+
+  it("keeps accumulating usage across a durable round trip", async () => {
+    const cwd = await tempDir();
+    const seed = createInitialState("任务", cwd, { maxSteps: 4, maxToolCalls: 4 });
+    const seededState: AgentState = {
+      ...seed,
+      plan: makeTaskPlan({ steps: [planStep("inspect", { status: "in_progress" })] }),
+      activeStepId: "inspect",
+      usage: {
+        inputTokens: 1_000,
+        outputTokens: 100,
+        cachedInputTokens: 400,
+        modelCalls: 3,
+        toolCalls: 2,
+        durationMs: 500,
+      },
+    };
+
+    const restored = fromDurableState(toDurableState(seededState));
+    // 检查点往返后用量原样回来，且是深拷贝（不与快照共享累加器）。
+    expect(restored.usage).toEqual(seededState.usage);
+    expect(restored.usage).not.toBe(seededState.usage);
+
+    const driver = new FakeModelDriver([
+      withUsage(turnWithTools({ ...echoCall, callId: "call-9" }), {
+        inputTokens: 300,
+        outputTokens: 30,
+        cachedInputTokens: 200,
+      }),
+      withUsage(textTurn("最终答案"), {
+        inputTokens: 200,
+        outputTokens: 20,
+        cachedInputTokens: 100,
+      }),
+    ]);
+    const planner = new ScriptedPlanner(makeDraft({}), [
+      completeWith([echoObservation], ["criterion-1"]),
+    ]);
+
+    const result = await runAgentLoopFromState(
+      restored,
+      base(cwd, { model: driver, planner, tools: createRegistry(echoTool) }),
+    );
+
+    expect(result.stopReason).toBe("final_answer");
+    // 续跑不是从 0 重新开始：1k/100/400 的底座 + 本轮两轮调用。
+    expect(result.state.usage.inputTokens).toBe(1_500);
+    expect(result.state.usage.outputTokens).toBe(150);
+    expect(result.state.usage.cachedInputTokens).toBe(700);
+    expect(result.state.usage.modelCalls).toBe(5);
+    expect(result.state.usage.toolCalls).toBe(3);
+    expect(result.state.usage.durationMs).toBeGreaterThanOrEqual(500);
   });
 
   it("waits for user input instead of completing", async () => {

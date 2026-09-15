@@ -10,6 +10,7 @@ import {
   MAX_ALLOWED_ARGV_PREVIEW,
   MAX_ALLOWED_ARGV_PREVIEW_CHARACTERS,
   type PolicyContext,
+  type PolicyDecision,
   type PolicyDenyDetails,
 } from "./policy.js";
 import { type Sandbox, SandboxError } from "./sandbox.js";
@@ -51,11 +52,21 @@ export interface ToolObservation {
   ok: boolean;
   effect: ToolEffect | "unknown";
   errorCode?: string | undefined;
+  /**
+   * 本次调用的策略决定（若已经走到 `authorize`）。只为完整日志透出，
+   * 不参与 observation 的序列化输出，也不改变已有的 ok / errorCode 语义。
+   */
+  policy?: PolicyDecision | undefined;
 }
 
 export type ToolExecutionResult =
   | ToolObservation
-  | { type: "waiting"; requestId: string; reason: "approval_required" };
+  | {
+      type: "waiting";
+      requestId: string;
+      reason: "approval_required";
+      policy?: PolicyDecision | undefined;
+    };
 
 export interface ExecuteToolCallOptions {
   call: ToolCall;
@@ -247,13 +258,16 @@ export async function executeToolCall(
   const decision = authorize(tool, prepared.input, policy);
 
   if (decision.type === "deny") {
-    return failureWithLimit(
-      options.call.callId,
-      decision.reason,
-      denialMessage(decision),
-      tool.effect,
-      MAX_DENIAL_MESSAGE_CHARACTERS,
-    );
+    return {
+      ...failureWithLimit(
+        options.call.callId,
+        decision.reason,
+        denialMessage(decision),
+        tool.effect,
+        MAX_DENIAL_MESSAGE_CHARACTERS,
+      ),
+      policy: decision,
+    };
   }
 
   if (decision.type === "ask") {
@@ -273,6 +287,7 @@ export async function executeToolCall(
         type: "waiting",
         requestId: decision.request.id,
         reason: "approval_required",
+        policy: decision,
       };
     }
   }
@@ -298,11 +313,14 @@ export async function executeToolCall(
       requireSandbox: options.requireSandbox,
       sandboxPolicy: { network: policy.network, writableRoot: policy.realWorkspaceRoot },
     });
-    return observationFromValue(
-      options.call.callId,
-      { ok: true, data },
-      { ok: true, effect: tool.effect },
-    );
+    return {
+      ...observationFromValue(
+        options.call.callId,
+        { ok: true, data },
+        { ok: true, effect: tool.effect },
+      ),
+      policy: decision,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const code =
@@ -315,7 +333,7 @@ export async function executeToolCall(
             : KNOWN_TOOL_ERRORS.has(message)
               ? message
               : "tool_error";
-    return failure(options.call.callId, code, message, tool.effect);
+    return { ...failure(options.call.callId, code, message, tool.effect), policy: decision };
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener("abort", onOuterAbort);

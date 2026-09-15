@@ -21,12 +21,37 @@ export interface ToolCall {
   argumentsJson: string;
 }
 
+/**
+ * provider 返回的原始 token 用量。
+ *
+ * 字段**全部可选**：字段缺失就是缺失（`undefined`），绝不用 0 冒充未知。
+ *
+ * 字段名以官方文档为准（`https://api-docs.deepseek.com/api/create-response`，
+ * 与 OpenAI Responses API 一致）：
+ * - `usage.input_tokens` / `usage.output_tokens` / `usage.total_tokens`；
+ * - 缓存命中在 `usage.input_tokens_details.cached_tokens`。
+ *
+ * 兼容解析：Chat Completions 风格的 `prompt_tokens_details.cached_tokens` 与
+ * `prompt_cache_hit_tokens` 也认，因为网关代理可能把两套字段混在一起返回。
+ */
+export interface ModelUsage {
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  cachedInputTokens?: number | undefined;
+  totalTokens?: number | undefined;
+}
+
 export interface ModelTurn {
   responseId: string;
   finalText: string;
   toolCalls: ToolCall[];
   /** 交互章扩展：模型请求澄清时，Harness 必须先落盘再停止。 */
   userInputRequest?: UserInputRequest | undefined;
+  /**
+   * provider 报告的 token 用量。缺失（老网关、截断的响应等）时保持 `undefined`：
+   * Harness 会把它记成 `unknown`，而不是按 0 计入成本。
+   */
+  usage?: ModelUsage | undefined;
 }
 
 export interface FunctionCallOutput {
@@ -64,6 +89,14 @@ export interface ResponsesResultLike {
   }>;
 }
 
+/**
+ * 已经**归一化**过的响应：`usage` 是 `parseModelUsage` 的结果，而不是 provider 的原始 JSON。
+ * `src/responses-http.ts` 的 `normalizeResult` 产出这个形状；`toModelTurn` 只认它。
+ */
+export interface NormalizedModelResponse extends ResponsesResultLike {
+  usage?: ModelUsage | undefined;
+}
+
 export interface ResponsesClientLike {
   responses: {
     create(body: {
@@ -74,8 +107,48 @@ export interface ResponsesClientLike {
       tools?: ToolDefinition[];
       tool_choice?: "auto";
       parallel_tool_calls?: boolean;
-    }): Promise<ResponsesResultLike>;
+    }): Promise<NormalizedModelResponse>;
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** 从 `{ cached_tokens: n }` 这类对象里读一个可选计数；对象不存在就是未知。 */
+function nestedCount(value: unknown, key: string): number | undefined {
+  return isRecord(value) ? optionalCount(value[key]) : undefined;
+}
+
+/**
+ * 宽松解析 provider 的 `usage`：**缺字段就返回 `undefined` 字段，不伪造 0**。
+ *
+ * 完全没有可用计数时返回 `undefined`，让上层把这次调用记成 `unknown`。
+ */
+export function parseModelUsage(raw: unknown): ModelUsage | undefined {
+  if (!isRecord(raw)) return undefined;
+
+  const usage: ModelUsage = {};
+  const inputTokens = optionalCount(raw["input_tokens"]) ?? optionalCount(raw["prompt_tokens"]);
+  const outputTokens =
+    optionalCount(raw["output_tokens"]) ?? optionalCount(raw["completion_tokens"]);
+  const totalTokens = optionalCount(raw["total_tokens"]);
+  // 官方 Responses 字段优先；Chat Completions 的两种别名只在官方字段缺失时兜底。
+  const cachedInputTokens =
+    nestedCount(raw["input_tokens_details"], "cached_tokens") ??
+    nestedCount(raw["prompt_tokens_details"], "cached_tokens") ??
+    optionalCount(raw["prompt_cache_hit_tokens"]);
+
+  if (inputTokens !== undefined) usage.inputTokens = inputTokens;
+  if (outputTokens !== undefined) usage.outputTokens = outputTokens;
+  if (cachedInputTokens !== undefined) usage.cachedInputTokens = cachedInputTokens;
+  if (totalTokens !== undefined) usage.totalTokens = totalTokens;
+
+  return Object.keys(usage).length === 0 ? undefined : usage;
 }
 
 export const userInputRequestSchema = z
@@ -90,7 +163,7 @@ export const userInputRequestSchema = z
 /** 保留的澄清调用名。它不会走普通工具权限，也不会在等待前产生副作用。 */
 export const REQUEST_USER_INPUT_TOOL_NAME = "request_user_input";
 
-export function toModelTurn(response: ResponsesResultLike, now = new Date()): ModelTurn {
+export function toModelTurn(response: NormalizedModelResponse, now = new Date()): ModelTurn {
   const toolCalls: ToolCall[] = [];
   let userInputRequest: UserInputRequest | undefined;
 
@@ -128,6 +201,8 @@ export function toModelTurn(response: ResponsesResultLike, now = new Date()): Mo
     toolCalls,
   };
   if (userInputRequest !== undefined) turn.userInputRequest = userInputRequest;
+  // 缺失就是缺失：`usage` 不存在时不写这个字段，上层据此记 `unknown`。
+  if (response.usage !== undefined) turn.usage = response.usage;
   return turn;
 }
 

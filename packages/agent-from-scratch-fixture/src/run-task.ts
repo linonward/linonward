@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { type AgentLoopEvent, runAgentLoop, summarizeRun } from "./agent-loop.js";
+import { type AgentLoopEvent, type LoopPricing, runAgentLoop, summarizeRun } from "./agent-loop.js";
 import type { Compactor } from "./compaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
@@ -76,6 +76,11 @@ export interface RunRealTaskOptions {
    * 让 `run_command` 返回 `sandbox_unavailable`，而不是静默降级。
    */
   requireSandbox?: boolean | undefined;
+  /**
+   * 成本估算接线（模型 id + 价目表）。缺省时 `usage.estimatedCostUsd` 保持 `undefined`，
+   * 输出层显示 `cost=unknown`——真实通路的模型 id 来自 `DeepSeekConfig.model`。
+   */
+  pricing?: LoopPricing | undefined;
 }
 
 export interface RealTaskOutcome {
@@ -251,6 +256,7 @@ export async function runRealTask(options: RunRealTaskOptions): Promise<RealTask
       signal: options.signal,
       onEvent: options.onEvent,
       runId,
+      pricing: options.pricing,
       // 压缩已接线但窗口极大，默认不会触发；需要时由调用方替换 compaction。
       compaction: {
         compactor: neverCalledCompactor(),

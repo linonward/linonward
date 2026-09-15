@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { buildModelRequest } from "../src/context.js";
 import { FakeModel } from "../src/fake-model.js";
-import { type ResponsesResultLike, toModelTurn } from "../src/model.js";
+import {
+  type NormalizedModelResponse,
+  parseModelUsage,
+  type ResponsesResultLike,
+  toModelTurn,
+} from "../src/model.js";
 import { createModel } from "../src/model-factory.js";
 
 describe("offline model path", () => {
@@ -101,5 +106,47 @@ describe("offline model path", () => {
 
     expect(turn.userInputRequest).toBeUndefined();
     expect(turn.toolCalls.map((call) => call.callId)).toEqual(["call-bad"]);
+  });
+
+  it("carries normalized usage onto the turn and leaves it absent when unknown", () => {
+    const withUsage: NormalizedModelResponse = {
+      id: "response-usage",
+      output_text: "done",
+      output: [],
+      usage: { inputTokens: 1234, outputTokens: 256, cachedInputTokens: 1024, totalTokens: 1490 },
+    };
+
+    expect(toModelTurn(withUsage).usage).toEqual({
+      inputTokens: 1234,
+      outputTokens: 256,
+      cachedInputTokens: 1024,
+      totalTokens: 1490,
+    });
+    // 缺失就是缺失：turn 上不该出现 `usage` 键，上层据此记 `unknown`。
+    expect(toModelTurn({ id: "r", output_text: "x", output: [] })).not.toHaveProperty("usage");
+  });
+
+  it("parses provider usage tolerantly without fabricating zeros", () => {
+    // 官方 Responses 字段。
+    expect(
+      parseModelUsage({
+        input_tokens: 10,
+        input_tokens_details: { cached_tokens: 4 },
+        output_tokens: 2,
+        total_tokens: 12,
+      }),
+    ).toEqual({ inputTokens: 10, outputTokens: 2, cachedInputTokens: 4, totalTokens: 12 });
+
+    // Chat Completions 别名（网关可能混用）。
+    expect(
+      parseModelUsage({ prompt_tokens: 10, completion_tokens: 2, prompt_cache_hit_tokens: 4 }),
+    ).toEqual({ inputTokens: 10, outputTokens: 2, cachedInputTokens: 4 });
+
+    // 字段缺失保持缺失；无法识别的形状整体视为未知。
+    expect(parseModelUsage({ input_tokens: 7 })).toEqual({ inputTokens: 7 });
+    expect(parseModelUsage(undefined)).toBeUndefined();
+    expect(parseModelUsage("n/a")).toBeUndefined();
+    expect(parseModelUsage({})).toBeUndefined();
+    expect(parseModelUsage({ input_tokens: -1 })).toBeUndefined();
   });
 });
