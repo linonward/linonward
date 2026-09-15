@@ -297,15 +297,20 @@ function createLoopContext(options: AgentLoopOptions): LoopContext {
   };
 
   let writer: DurableWriter | undefined;
+  let writerState: AgentState | undefined;
   let durableFailed = false;
 
   const writerFor = (state: AgentState): DurableWriter => {
-    if (writer) return writer;
+    // 状态是不可变更新：`waitForUserInput` / `writeStatusEvent` 会返回新对象。
+    // writer 若继续绑定旧对象，检查点就会写出一份过期快照（例如丢掉 pendingUserInput），
+    // 恢复链随即失效。状态对象一变就重绑；store 序号会从事件日志重新推导，不受影响。
+    if (writer && writerState === state) return writer;
     writer = createDurableWriter({
       persistence: options.persistence,
       state,
       clock: options.clock,
     });
+    writerState = state;
     return writer;
   };
 
