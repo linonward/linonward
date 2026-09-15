@@ -340,17 +340,42 @@ export function loopOptionsFromRuntime(
   };
 }
 
+export interface ResumeAgentRunOptions {
+  /**
+   * 一次性调用（CLI 的 `resume` / `answer`）在返回前释放 lease。
+   * 默认 `false`：长驻 worker 继续持有 lease，保持既有 fencing 语义。
+   */
+  releaseLeaseOnReturn?: boolean | undefined;
+}
+
 /**
  * 恢复入口：先获取新 lease、重放事件、对账 in-flight 工具，
  * 再从原预算与原计划继续。计数器不会被清零。
  */
-export async function resumeAgentRun(runId: string, runtime: AgentRuntime): Promise<AgentResult> {
+export async function resumeAgentRun(
+  runId: string,
+  runtime: AgentRuntime,
+  options: ResumeAgentRunOptions = {},
+): Promise<AgentResult> {
   const restored = await restoreRun({
     runId,
     ownerId: randomUUID(),
     store: runtime.store,
   });
 
+  try {
+    return await resumeRestoredRun(restored, runtime);
+  } finally {
+    if (options.releaseLeaseOnReturn === true) {
+      await runtime.store.releaseLease(restored.lease);
+    }
+  }
+}
+
+async function resumeRestoredRun(
+  restored: RestoredRun,
+  runtime: AgentRuntime,
+): Promise<AgentResult> {
   let state = fromDurableState(restored.state);
   const outputs: FunctionCallOutput[] = [];
 

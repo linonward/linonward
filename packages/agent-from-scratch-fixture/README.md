@@ -32,13 +32,60 @@ pnpm lint
 
 CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntime` 实现了
 `run` / `resume` / `answer` 三个子命令、退出码、`onEvent` 打印与 `AbortSignal` 传播。
-`main` 入口刻意不连接真实模型——真实 `ModelDriver`、`Planner`、`ToolRegistry` 由嵌入方通过
-`createAgentCliRuntime` 注入；测试里用替身驱动同一条链路（见 `tests/cli.test.ts`）。
-需要真实模型时用下面这条 opt-in 通路，它默认仍然完全离线。
+可执行入口是 `scripts/agent.ts`（`pnpm agent`）：它装配真实 DeepSeek Responses 驱动
+（见"接入真实模型"）；同时 `createAgentCliRuntime` 仍然保留，嵌入方可以自行注入其它
+`ModelDriver` / `Planner` / `ToolRegistry`（`tests/agent-cli.test.ts` 用替身驱动同一条链路）。
+
+## 命令行入口
+
+`package.json` 的 `agent` 脚本是唯一的可执行入口，`src/agent-cli.ts` 负责 flag 解析与装配：
+
+```sh
+cd packages/agent-from-scratch-fixture
+pnpm agent run "读取 package.json，告诉我这个项目用哪个包管理器，并列出 scripts 里的命令" --cwd /tmp/demo --allow node --version
+pnpm agent resume <run-id>
+pnpm agent answer <run-id> <request-id> "用 pnpm"
+```
+
+脚本本体是 `node --env-file-if-exists=.env --import tsx scripts/agent.ts`：
+
+- `--env-file-if-exists=.env`：`.env` 存在时由 Node 24 原生加载，不存在也不报错，
+  因此不需要 `dotenv` 依赖；`.env` 已被仓库根 `.gitignore` 忽略。
+- `--import tsx`：直接执行 `.ts` 入口。`tsx` 是唯一为此新增的 devDependency。
+- 缺 `DEEPSEEK_API_KEY` 时不会发起任何请求，而是打印包含 `.env.example` 指引的错误并以
+  退出码 `2` 结束（错误信息**不会回显 key 值**）。
+
+### flags
+
+| flag | 作用 |
+| --- | --- |
+| `--cwd <dir>` | 任务工作区根，默认当前目录。策略的 `cwd` / `realWorkspaceRoot` 都用它 |
+| `--allow <command> [args...]` | 把**一条完整 argv** 加入 `run_command` 白名单，可重复。`--allow node --version` 只放行 `node --version` 这条精确 argv；收集会持续到下一个已识别的 CLI flag |
+| `--require-sandbox` | 显式要求隔离：没有可用沙箱时 `run_command` 拒绝执行而不是无隔离运行 |
+| `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
+| `--max-steps <n>` | 模型步数上限，默认 `16` |
+| `--max-tool-calls <n>` | 工具调用上限，默认 `32` |
+
+`run` 的持久化落在 `AGENT_STORE_ROOT`（默认 `<系统临时目录>/linonward-agent-runs`）下的
+`LocalFileRunStore`：`resume` / `answer` 是独立进程，必须靠这个稳定路径找到同一个 run。
+`--cwd` 只决定任务工作区，不影响存根位置。
+
+### 退出码
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | `completed`：最终答案已写到 stdout |
+| `1` | `failed`：运行失败，或 `resume` / `answer` 不可执行（未知 run、未知 requestId、无有效检查点等） |
+| `2` | `usage`：参数错误（未知 flag、缺值、非法数字、缺子命令）或缺少 `DEEPSEEK_API_KEY` |
+| `3` | `waiting`：停在 `user_input_required` / `approval_required`，用 `answer` 继续 |
+| `130` | `cancelled`：进程收到 `SIGINT` / `SIGTERM` |
+
+每次 `run` / `resume` / `answer` 都会在结束时释放 run 的 lease，因此三条命令可以连续执行，
+不需要等待 TTL 过期。
 
 ## 接入真实模型（DeepSeek Responses API）
 
-真实通路由四个模块组成，都只依赖 Node 24 内置 `fetch`，不引入任何新依赖：
+真实通路与它的 CLI 装配由五个模块组成，都只依赖 Node 24 内置 `fetch`，不引入任何新运行时依赖（`tsx` 只是开发期执行器）：
 
 | 模块 | 职责 |
 | --- | --- |
@@ -46,6 +93,7 @@ CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntim
 | `src/responses-stateless-driver.ts` | 无状态 `ModelDriver`：在客户端累积 `output` items，续轮重发完整历史 |
 | `src/planner-model.ts` | 完整 `Planner`（`create` / `revise` / `evaluate`）：JSON 解析健壮化、证据用下标、`completed` 判据收紧、失败带错误有界重试、降级可见 |
 | `src/run-task.ts` | `runRealTask`：把工具注册表、策略、trace、`LocalFileRunStore` + lease、时钟、Skills、压缩装配到 `runAgentLoop` 上 |
+| `src/agent-cli.ts` | `pnpm agent` 的装配层：`parseAgentArgs` 解析 flags，`createDeepSeekAgentCli` 装配真实驱动 / 工具 / 沙箱 / 策略并返回 argv 处理器；全部依赖可注入替身 |
 
 ### 环境变量
 
@@ -56,8 +104,9 @@ CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntim
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | **循环模型**：多轮工具调用用它。也可用 `deepseek-v4-pro`，或从 `GET /v1/models` 发现 |
 | `DEEPSEEK_PLANNER_MODEL` | 否 | 回落到 `DEEPSEEK_MODEL` | **规划模型**：只给模型版规划器用。规划只输出短 JSON，可以单独选更强的型号 |
 
-密钥只从进程环境变量读取：fixture 没有 `dotenv` 依赖，也没有 `tsx`，
-`.env` 文件不会被自动加载，请在命令行显式传入。
+密钥只从进程环境变量读取：fixture 没有 `dotenv` 依赖；`pnpm agent` 通过
+`node --env-file-if-exists=.env` 在 `.env` 存在时自动加载它，其它入口（例如 `vitest`）
+不会自动加载，请在命令行显式传入。
 
 ### 运行真实 e2e
 
@@ -199,6 +248,7 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
 | `src/responses-stateless-driver.ts` | `tests/responses-stateless-driver.test.ts` | 首轮无 `previous_response_id`、续轮按序重发 `function_call` + `function_call_output` + 新上下文、`tools` 无 `strict` |
 | `src/planner-model.ts` | `tests/planner-model.test.ts` | `extractJsonObject` 三级解析、create/revise/evaluate 的解析与校验、带错误的有界重试、编造证据被丢弃、`completed=true` 但证据为空时降级为 `false` 并给出 notes、计划外 criterion id 被忽略 |
 | `src/run-task.ts` | `tests/run-task.test.ts` | 离线装配：工具 + 持久化 + trace + lease 释放；伪造证据被 Loop 拒绝 |
+| `src/agent-cli.ts` | `tests/agent-cli.test.ts` | 离线：三种命令与全部 flag 的解析、`--allow` 重复收集、非法输入报错含 `AGENT_USAGE`、`FakeModelDriver` 驱动 `run` / `answer` / 恢复、缺 key 指引进 `.env.example` |
 | 端到端 | `tests/deepseek-e2e.test.ts` | 真实调用，`describe.skipIf(!process.env.DEEPSEEK_API_KEY)` 门控；两条确定性规划器 + 一条真实模型规划器 |
 
 ## 关键不变量
@@ -243,10 +293,15 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   仍需容器或 OS sandbox，并应把 `requireSandbox` 打开。
 - **`providerCursor` 兼容性检查是可选钩子**。`ModelDriver.canResume` 存在时会用它；
   真实部署还需要核对 Provider、模型与保留策略。
-- **`src/index.ts` 的 `main` 不连接真实模型**。离线 fixture 没有 `openai` 依赖，
-  也没有 `tsx`，因此真实驱动必须由嵌入方注入。真实通路是 `src/run-task.ts` 的
-  `runRealTask`：它是装配函数，不是新的 CLI 子命令；CLI 的 `run` / `resume` / `answer`
-  仍然由调用方注入 `ModelDriver` / `Planner` / `ToolRegistry`。
+- **CLI 入口与运行时装配是两层**。`pnpm agent`（`scripts/agent.ts`）现在会装配真实的
+  DeepSeek Responses 驱动：`src/agent-cli.ts` 用 `resolveDeepSeekConfig` +
+  `createResponsesHttpClient` 装配循环驱动（`DEEPSEEK_MODEL`）与模型版规划器
+  （`DEEPSEEK_PLANNER_MODEL`），工具走 `createRealTaskRegistry`，沙箱走 `detectSandbox`，
+  因此真实通路不再需要嵌入方注入。与此同时 `createAgentCliRuntime` 与
+  `src/index.ts` 的 `parseCliArgs` / `runCli` 仍然保留：调用方可以注入其它
+  `ModelDriver` / `Planner` / `ToolRegistry`（`tests/agent-cli.test.ts` 用
+  `FakeModelDriver` 驱动 `run` / `resume` / `answer` 三条命令，全程离线）。
+  真实通路另外提供 `src/run-task.ts` 的 `runRealTask`——它是装配函数，不是 CLI 子命令。
 - **真实运行默认不自动批准命令**。`runRealTask` 只有在显式打开
   `autoApproveAllowedCommands` 时才会自动批准策略放行的 `run_command`（e2e 测试这么用）；
   默认仍会停在 `approval_required`。无论哪种情况，`allowedArgv` 都是硬边界。

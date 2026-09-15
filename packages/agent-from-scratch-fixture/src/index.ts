@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { type AgentLoopEvent, type AgentLoopOptions, runAgentLoop } from "./agent-loop.js";
+import { type AgentLoopEvent, runAgentLoop } from "./agent-loop.js";
 import { canonicalJson } from "./checkpoint.js";
 import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
@@ -222,12 +222,8 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
   };
 }
 
-function optionsFor(
-  state: ReturnType<typeof createInitialState>,
-  runtime: AgentRuntime,
-): AgentLoopOptions {
-  return loopOptionsFromRuntime(state, runtime);
-}
+/** CLI 进程是短命的：每次 `run` / `resume` / `answer` 都取一次 lease，结束后立即释放。 */
+export const CLI_LEASE_TTL_MS = 10 * 60 * 1_000;
 
 /** 生产装配：模型驱动、计划器与工具注册表都由调用方注入，CLI 只负责编排。 */
 export function createAgentCliRuntime(
@@ -242,10 +238,21 @@ export function createAgentCliRuntime(
           maxSteps: options.maxSteps ?? 12,
           maxToolCalls: options.maxToolCalls ?? 24,
         });
-        return runAgentLoop(task, optionsFor(state, runtime));
+        const lease = await options.store.acquireLease(state.runId, randomUUID(), CLI_LEASE_TTL_MS);
+
+        try {
+          // `runId` 必须显式传给 Loop：否则 `runAgentLoop` 会另生成一个 runId，
+          // 拿到的 lease 与真正持久化的 run 就对不上，`resume` 永远找不到它。
+          return await runAgentLoop(task, {
+            ...loopOptionsFromRuntime(state, runtime, lease),
+            runId: state.runId,
+          });
+        } finally {
+          await options.store.releaseLease(lease);
+        }
       },
       async resume(runId) {
-        return resumeAgentRun(runId, runtime);
+        return resumeAgentRun(runId, runtime, { releaseLeaseOnReturn: true });
       },
       async answer(runId, answer) {
         const restored = await restoreRun({
@@ -253,47 +260,55 @@ export function createAgentCliRuntime(
           ownerId: randomUUID(),
           store: options.store,
         });
-        const now = runtime.clock.now();
-        const resumed = applyUserAnswer(fromDurableState(restored.state), answer, now);
 
-        await options.store.append({
-          runId,
-          expectedSequence: restored.state.nextEventSequence,
-          ownerId: restored.lease.ownerId,
-          epoch: restored.lease.epoch,
-          event: {
-            type: "user_input_received",
-            requestId: answer.requestId,
-            content: answer.content,
-          },
-          now,
-        });
-
-        const durable = toDurableState(resumed, restored.state.providerCursor);
-        await options.store.saveCheckpoint(
-          createRunCheckpoint({
-            state: { ...durable, nextEventSequence: restored.state.nextEventSequence + 1 },
-            throughSequence: restored.state.nextEventSequence,
+        try {
+          const now = runtime.clock.now();
+          const resumed = applyUserAnswer(fromDurableState(restored.state), answer, now);
+          // store 的序号由 store 自己决定：内存日志含 `step_started` 等运行时事件，
+          // 两个计数器并不共用，用 `state.nextEventSequence` 会被拒绝为 unexpected_sequence。
+          const persisted = await options.store.readEvents(runId, 0);
+          const record = await options.store.append({
+            runId,
+            expectedSequence: (persisted.at(-1)?.sequence ?? 0) + 1,
+            ownerId: restored.lease.ownerId,
+            epoch: restored.lease.epoch,
+            event: {
+              type: "user_input_received",
+              requestId: answer.requestId,
+              content: answer.content,
+            },
             now,
-          }),
-          restored.lease,
-        );
+          });
 
-        return resumeAgentRun(runId, runtime);
+          const durable = toDurableState(resumed, restored.state.providerCursor);
+          await options.store.saveCheckpoint(
+            createRunCheckpoint({
+              state: { ...durable, nextEventSequence: resumed.nextEventSequence },
+              throughSequence: record.sequence,
+              now,
+            }),
+            restored.lease,
+          );
+        } finally {
+          // 回答已经落盘；随后交给 `resumeAgentRun` 重新取 lease 续跑。
+          await options.store.releaseLease(restored.lease);
+        }
+
+        return resumeAgentRun(runId, runtime, { releaseLeaseOnReturn: true });
       },
     };
   };
 }
 
 /**
- * 该 fixture 永远不访问网络：`main` 只负责装配 store 与信号，
- * 真实模型驱动必须由嵌入方通过 `createAgentCliRuntime` 注入。
+ * 直接执行 `src/index.ts` 时的兜底提示。可执行入口是 `scripts/agent.ts`（`pnpm agent`），
+ * 它装配真实 DeepSeek Responses 驱动；这里的 `main` 只说明如何自行注入另一种驱动。
  */
 async function main(): Promise<void> {
   process.stderr.write(
     [
-      "agent-from-scratch fixture 离线运行入口。",
-      "请通过 createAgentCliRuntime 注入 ModelDriver / Planner / ToolRegistry，",
+      "agent-from-scratch fixture：可执行入口是 `pnpm agent`（见 scripts/agent.ts）。",
+      "如需注入其它 ModelDriver / Planner / ToolRegistry，请使用 createAgentCliRuntime。",
       CLI_USAGE,
     ].join("\n") + "\n",
   );
