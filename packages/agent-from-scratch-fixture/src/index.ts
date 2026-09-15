@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import { type AgentLoopEvent, runAgentLoop } from "./agent-loop.js";
 import { canonicalJson } from "./checkpoint.js";
+import { createVerboseObserver } from "./cli-verbose.js";
 import { applyUserAnswer } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
@@ -118,6 +119,15 @@ export interface CliIo {
   stderr(text: string): void;
 }
 
+/** `--verbose` 是纯输出开关：只影响 stderr 上的额外详情，不改变控制流与退出码。 */
+export interface CliRunOptions {
+  /**
+   * 打开详细输出：stderr 上额外打印每个 Loop 事件一行、工具观测的有界摘要
+   * 与运行结束汇总。stdout 始终只放最终答案，管道因此保持可用。
+   */
+  verbose?: boolean | undefined;
+}
+
 /**
  * `run` 启动新运行，`resume` 从 checkpoint 续跑，`answer` 先落盘回答再续跑。
  * 退出码区分完成、失败、用法错误、等待输入与取消。
@@ -126,6 +136,7 @@ export async function runCli(
   argv: string[],
   dependencies: CliDependencies,
   io: CliIo,
+  options: CliRunOptions = {},
 ): Promise<number> {
   let parsed: CliCommand;
   try {
@@ -141,13 +152,19 @@ export async function runCli(
   process.once("SIGTERM", onSignal);
 
   const cwd = process.cwd();
+  // 关闭时连观察者都不创建：默认路径没有额外订阅，也没有额外计算。
+  const observer =
+    options.verbose === true ? createVerboseObserver((line) => io.stderr(line)) : undefined;
 
   try {
     const runtime = dependencies.createRuntime({
       cwd,
       skillsDirectory: resolve(cwd, "skills"),
       signal: controller.signal,
-      onEvent: (event) => io.stderr(canonicalJson(event)),
+      onEvent: (event) => {
+        io.stderr(canonicalJson(event));
+        observer?.onEvent(event);
+      },
     });
 
     let result: AgentResult;
@@ -173,6 +190,7 @@ export async function runCli(
         mutationRevision: result.state.mutationRevision,
       }),
     );
+    observer?.finish(result);
     return exitCodeFor(result);
   } finally {
     process.removeListener("SIGINT", onSignal);

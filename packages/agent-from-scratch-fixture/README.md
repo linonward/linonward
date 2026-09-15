@@ -43,6 +43,7 @@ CLI 装配在 `src/index.ts`：`parseCliArgs` / `runCli` / `createAgentCliRuntim
 ```sh
 cd packages/agent-from-scratch-fixture
 pnpm agent run "读取 package.json，告诉我这个项目用哪个包管理器，并列出 scripts 里的命令" --cwd /tmp/demo --allow node --version
+pnpm agent --verbose run "读取 package.json，简述这个项目的用途" --cwd /tmp/demo
 pnpm agent resume <run-id>
 pnpm agent answer <run-id> <request-id> "用 pnpm"
 ```
@@ -65,6 +66,11 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
 | `--max-steps <n>` | 模型步数上限，默认 `16` |
 | `--max-tool-calls <n>` | 工具调用上限，默认 `32` |
+| `--verbose` | 在 stderr 上追加详细输出：每个 Loop 事件一行（`[event] run_started runId=...`）、每次工具观测的有界摘要（工具名 + `callId` + `ok` + 截断预览）与运行结束汇总（`runId` / `status` / `stopReason` / `budget` / `changedFiles` / `validations` / trace 事件类型序列）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
+
+`--verbose` 的输出是**有界**的：单条详情最多 `200` 字符，工具观测最多列 `20` 条（更早的折叠成
+`[verbose] omitted N earlier observation(s)`），汇总里的 `changedFiles` / trace 列表同样有上限。
+stdout 永远只有最终答案，因此 `pnpm agent --verbose run "..." > answer.txt` 依然可用。
 
 `run` 的持久化落在 `AGENT_STORE_ROOT`（默认 `<系统临时目录>/linonward-agent-runs`）下的
 `LocalFileRunStore`：`resume` / `answer` 是独立进程，必须靠这个稳定路径找到同一个 run。
