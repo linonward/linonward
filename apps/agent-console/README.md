@@ -38,6 +38,10 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `DEEPSEEK_PRICE_TABLE(_JSON)` | 可选成本价目表；缺失时界面显示 `cost=unknown`。 |
 | `AGENT_STORE_ROOT` | 运行存根目录（`LocalFileRunStore`），默认系统临时目录下的 `linonward-agent-console-runs`。 |
 | `AGENT_CONSOLE_API_PORT` | API 端口，默认 `8787`（Vite 代理也读这个变量）。 |
+| `AGENT_CONSOLE_HOST` | 监听地址，默认 `127.0.0.1`。绑非回环地址时**必须**同时设置令牌，否则拒绝启动。 |
+| `AGENT_CONSOLE_TOKEN` | 访问令牌。设置后除 `/api/health` 外所有接口都要带 `Authorization: Bearer <token>`（或 `x-agent-console-token`）；令牌本身也在脱敏清单里。 |
+| `AGENT_CONSOLE_ALLOWED_ROOTS` | 允许的工作区根（逗号分隔的绝对路径）。设置后 `cwd` 必须落在其中之一，否则 400。 |
+| `AGENT_CONSOLE_MAX_OPEN_RUNS` | 同时打开的运行上限（运行中 + 等待回答）；超出返回 429。非法值直接报错，不静默退回不限。 |
 
 `dev:api` / `dev` 会用 `node --env-file-if-exists=.env` 加载 `apps/agent-console/.env`
 （不存在也能启动）。
@@ -54,7 +58,15 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `POST` | `/api/runs/:runId/answer` | body `{ requestId, text }`：审批 / 澄清后继续运行。 |
 | `POST` | `/api/runs/:runId/cancel` | 中止正在执行的运行（`abort` 一路传到模型调用与工具，含整个进程组）。运行停在等待回答时返回 409：没有正在跑的任务。 |
 
-服务只监听 `127.0.0.1`，没有鉴权（本地工具）。
+### 边界（可以放到内网的形态）
+
+- **令牌**：`AGENT_CONSOLE_TOKEN` 一设，除健康检查外全部接口都要求带上；比较用常量时间，
+  错误响应不回显令牌，令牌也在脱敏清单里（会连同模型密钥一起替换成 `***`）。
+- **工作区根**：`AGENT_CONSOLE_ALLOWED_ROOTS` 一设，`cwd` 必须落在允许根内（按目录边界比较，
+  `/srv/ws` 不会放行 `/srv/ws-evil`）。这是"本地工具"与"多租户服务"之间最小的一道门。
+- **并发上限**：`AGENT_CONSOLE_MAX_OPEN_RUNS` 按**打开的运行**计——等待回答的运行同样占着
+  频道、journal 轮询与一份上下文，只数"正在跑"的保护不够。超限返回 429。
+- 默认仍然只监听 `127.0.0.1`；健康检查保持开放（探针要能打），但未授权时不透露是否配了密钥。
 
 ## 花费与时间的硬上限
 

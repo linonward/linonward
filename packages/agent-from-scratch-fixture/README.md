@@ -450,6 +450,9 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `changedFiles`、绑定 `mutationRevision` 的 `ValidationRecord`、`stopReason`），
   但模型是否愿意按提示调用工具仍存在不确定性；失败时先用 `console.log` 打印的
   事件序列与 answers 判断是"模型没照做"还是"harness 出错"。
+- **取消会打断正在飞行中的模型调用**。`createResponsesHttpClient` 接受外部 `AbortSignal`：
+  没有它，"中止"只能等下一次循环检查，用户要干等一次 60 秒超时。CLI 侧目前仍以
+  `SIGINT` + 工具/HTTP 超时为准（客户端在装配期创建，尚未绑定每次调用的信号）。
 - **`providerCursor` 真实通路未实现**。`createStatelessResponsesDriver` 不提供
   `canResume`，因为 DeepSeek 无状态：跨进程恢复只能靠客户端重发历史，
   当前 fixture 的恢复链路（`resumeAgentRun`）仍然面向 OpenAI 风格的 cursor。

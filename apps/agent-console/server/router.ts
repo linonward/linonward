@@ -1,4 +1,6 @@
+import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isAbsolute, resolve, sep } from "node:path";
 import { messageOf } from "../src/lib/format.js";
 import {
   isPlainObject,
@@ -18,6 +20,47 @@ import {
 } from "./runner.js";
 
 export const DEFAULT_API_PORT = 8787;
+/** 访问令牌的环境变量名：设置后所有 `/api/*`（健康检查除外）都必须带对。 */
+export const CONSOLE_TOKEN_ENV = "AGENT_CONSOLE_TOKEN";
+/** 允许的工作区根（逗号分隔的绝对路径）。未设置即不限制。 */
+export const CONSOLE_ALLOWED_ROOTS_ENV = "AGENT_CONSOLE_ALLOWED_ROOTS";
+/** 同时可以打开的运行上限（运行中 + 等待回答）。未设置即不限制。 */
+export const CONSOLE_MAX_OPEN_RUNS_ENV = "AGENT_CONSOLE_MAX_OPEN_RUNS";
+
+function readToken(env: NodeJS.ProcessEnv): string | undefined {
+  const token = env[CONSOLE_TOKEN_ENV]?.trim();
+  return token === undefined || token.length === 0 ? undefined : token;
+}
+
+/** 允许根列表：空项与相对路径直接忽略，不做任何猜测。 */
+export function parseAllowedRoots(env: NodeJS.ProcessEnv): string[] {
+  const raw = env[CONSOLE_ALLOWED_ROOTS_ENV];
+  if (raw === undefined) return [];
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && isAbsolute(entry))
+    .map((entry) => resolve(entry));
+}
+
+/** 常量时间比较：长度不同直接拒绝，长度相同则比内容。 */
+function tokenMatches(provided: string, expected: string): boolean {
+  const left = Buffer.from(provided);
+  const right = Buffer.from(expected);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function readProvidedToken(request: IncomingMessage): string | undefined {
+  const header = request.headers.authorization;
+  if (typeof header === "string" && header.startsWith("Bearer ")) {
+    const value = header.slice("Bearer ".length).trim();
+    if (value.length > 0) return value;
+  }
+  const custom = request.headers["x-agent-console-token"];
+  if (typeof custom === "string" && custom.length > 0) return custom;
+  return undefined;
+}
 /** 请求体上限：本地工具，1MB 足够放下一段任务描述与白名单。 */
 export const MAX_BODY_BYTES = 1_000_000;
 
@@ -97,17 +140,51 @@ function readAllowedArgv(record: JournalRecord): string[][] {
   return result;
 }
 
+export interface ParseRunInputOptions {
+  /**
+   * 允许的工作区根（绝对路径）。配置后 `cwd` 必须落在其中之一里：这是把"本地工具"
+   * 变成"多租户服务"时最小的一道边界——否则任何调用方都能让 agent 在任意目录里跑。
+   */
+  allowedRoots?: readonly string[] | undefined;
+}
+
+/** 解析成绝对路径；不存在也允许（错误留给工具层报），但必须能规范化。 */
+function resolveCwd(raw: string): string {
+  return resolve(raw);
+}
+
+function insideRoots(cwd: string, roots: readonly string[]): boolean {
+  // 用规范化后的字符串比较前缀，并强制目录边界，避免 `/srv/ws` 放行 `/srv/ws-evil`。
+  return roots.some((root) => {
+    const resolvedRoot = resolve(root);
+    return cwd === resolvedRoot || cwd.startsWith(`${resolvedRoot}${sep}`);
+  });
+}
+
 /** 请求体 → 运行输入。所有非法输入都在这里变成 4xx，而不是让运行时崩掉。 */
-export function parseRunInput(value: unknown, defaultCwd: string): StartRunInput {
+export function parseRunInput(
+  value: unknown,
+  defaultCwd: string,
+  options: ParseRunInputOptions = {},
+): StartRunInput {
   if (!isPlainObject(value)) throw new RunnerError(400, "请求体必须是 JSON 对象");
 
   const task = readString(value, "task")?.trim();
   if (task === undefined || task.length === 0) throw new RunnerError(400, "task 不能为空");
 
   const cwdValue = readString(value, "cwd")?.trim();
+  const cwd = resolveCwd(cwdValue === undefined || cwdValue.length === 0 ? defaultCwd : cwdValue);
+  const allowedRoots = options.allowedRoots ?? [];
+  if (allowedRoots.length > 0 && !insideRoots(cwd, allowedRoots)) {
+    throw new RunnerError(
+      400,
+      `cwd 不在允许的工作区根内：${cwd}（允许：${allowedRoots.map((root) => resolve(root)).join(", ")}）`,
+    );
+  }
+
   const input: StartRunInput = {
     task,
-    cwd: cwdValue === undefined || cwdValue.length === 0 ? defaultCwd : cwdValue,
+    cwd,
     allowedArgv: readAllowedArgv(value),
     maxSteps: readPositiveInt(value, "maxSteps", CONSOLE_DEFAULT_MAX_STEPS),
     maxToolCalls: readPositiveInt(value, "maxToolCalls", CONSOLE_DEFAULT_MAX_TOOL_CALLS),
@@ -230,6 +307,8 @@ export interface RouterOptions {
   env: NodeJS.ProcessEnv;
   /** 表单没给 cwd 时的默认值（默认进程工作目录）。 */
   defaultCwd?: string | undefined;
+  /** 允许的工作区根；缺省时从 `AGENT_CONSOLE_ALLOWED_ROOTS` 读。 */
+  allowedRoots?: string[] | undefined;
 }
 
 function parseAfter(url: URL): number {
@@ -246,6 +325,8 @@ export function createRequestHandler(
   const secrets = secretValues(options.env);
   const defaultCwd = options.defaultCwd ?? process.cwd();
   const apiKey = options.env["DEEPSEEK_API_KEY"];
+  const token = readToken(options.env);
+  const allowedRoots = options.allowedRoots ?? parseAllowedRoots(options.env);
 
   return async (request, response) => {
     const method = request.method ?? "GET";
@@ -258,12 +339,24 @@ export function createRequestHandler(
         return;
       }
 
+      // 健康检查保持开放（探针要能打），但未授权时不透露任何配置细节。
+      const provided = token === undefined ? undefined : readProvidedToken(request);
+      const authorized =
+        token === undefined || (provided !== undefined && tokenMatches(provided, token));
+      if (!authorized && route.name !== "health") {
+        sendJson(response, 401, { error: "缺少或错误的访问令牌" });
+        return;
+      }
+
       switch (route.name) {
         case "health": {
-          sendJson(response, 200, {
+          const body: Record<string, unknown> = {
             ok: true,
-            apiKeyConfigured: typeof apiKey === "string" && apiKey.length > 0,
-          });
+            authenticated: token === undefined || authorized,
+          };
+          if (authorized)
+            body["apiKeyConfigured"] = typeof apiKey === "string" && apiKey.length > 0;
+          sendJson(response, 200, body);
           return;
         }
         case "runs": {
@@ -274,7 +367,7 @@ export function createRequestHandler(
         }
         case "start": {
           const body = await readJsonBody(request);
-          const input = parseRunInput(body, defaultCwd);
+          const input = parseRunInput(body, defaultCwd, { allowedRoots });
           const started = await options.runner.start(input);
           sendJson(response, 200, { runId: started.runId });
           return;

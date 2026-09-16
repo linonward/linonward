@@ -412,3 +412,103 @@ describe("API 路由（注入假 runner）", () => {
     );
   });
 });
+
+/**
+ * 生产化的入口边界：令牌、允许的工作区根、并发上限。
+ *
+ * 这三条都不是"功能"，而是**拒绝**——所以每个用例都断言状态码与可读原因，
+ * 而不是只看"能跑"。
+ */
+describe("访问令牌", () => {
+  const ENV_WITH_TOKEN: NodeJS.ProcessEnv = {
+    DEEPSEEK_API_KEY: "sk-test-not-a-real-key",
+    AGENT_CONSOLE_TOKEN: "s3cret-token",
+  };
+
+  it("配了令牌就必须带对：缺失/错误 401，正确 200", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_TOKEN },
+      async (base) => {
+        const missing = await fetch(`${base}/api/runs`);
+        expect(missing.status).toBe(401);
+        await expect(missing.json()).resolves.toEqual({ error: "缺少或错误的访问令牌" });
+
+        const wrong = await fetch(`${base}/api/runs`, {
+          headers: { authorization: "Bearer nope" },
+        });
+        expect(wrong.status).toBe(401);
+
+        const ok = await fetch(`${base}/api/runs`, {
+          headers: { authorization: "Bearer s3cret-token" },
+        });
+        expect(ok.status).toBe(200);
+
+        // 中止与回答同样是受保护的动作。
+        const cancel = await fetch(`${base}/api/runs/run-1/cancel`, { method: "POST" });
+        expect(cancel.status).toBe(401);
+      },
+    );
+  });
+
+  it("健康检查保持开放，但未授权时不透露是否配了密钥", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_TOKEN },
+      async (base) => {
+        const anonymous = (await (await fetch(`${base}/api/health`)).json()) as Record<
+          string,
+          unknown
+        >;
+        expect(anonymous["ok"]).toBe(true);
+        expect(Object.hasOwn(anonymous, "apiKeyConfigured")).toBe(false);
+
+        const authorized = (await (
+          await fetch(`${base}/api/health`, {
+            headers: { authorization: "Bearer s3cret-token" },
+          })
+        ).json()) as Record<string, unknown>;
+        expect(authorized["apiKeyConfigured"]).toBe(true);
+      },
+    );
+  });
+
+  it("错误响应里不会回显令牌本身", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_TOKEN },
+      async (base) => {
+        const body = await (await fetch(`${base}/api/runs`)).text();
+        expect(body).not.toContain("s3cret-token");
+      },
+    );
+  });
+});
+
+describe("允许的工作区根", () => {
+  it("cwd 超出允许根时 400，根内（含根本身）放行", () => {
+    const roots = ["/srv/workspaces"];
+
+    expect(() =>
+      parseRunInput({ task: "x", cwd: "/srv/workspaces/a" }, "/tmp", { allowedRoots: roots }),
+    ).not.toThrow();
+    expect(() =>
+      parseRunInput({ task: "x", cwd: "/srv/workspaces" }, "/tmp", { allowedRoots: roots }),
+    ).not.toThrow();
+    // 前缀相同但不在根内（经典目录穿越写法）。
+    expect(() =>
+      parseRunInput({ task: "x", cwd: "/srv/workspaces-evil" }, "/tmp", { allowedRoots: roots }),
+    ).toThrow(RunnerError);
+    expect(() =>
+      parseRunInput({ task: "x", cwd: "/srv/workspaces/../etc" }, "/tmp", { allowedRoots: roots }),
+    ).toThrow("cwd 不在允许的工作区根内");
+    // 默认 cwd 也要过同一道门。
+    expect(() => parseRunInput({ task: "x" }, "/etc", { allowedRoots: roots })).toThrow(
+      "cwd 不在允许的工作区根内",
+    );
+  });
+
+  it("没有配置允许根时不限制（本地默认行为不变）", () => {
+    expect(() => parseRunInput({ task: "x", cwd: "/anything" }, "/tmp")).not.toThrow();
+  });
+});

@@ -74,6 +74,9 @@ export const CONSOLE_DEFAULT_MAX_STEPS = REAL_TASK_DEFAULT_MAX_STEPS;
 export const CONSOLE_DEFAULT_MAX_TOOL_CALLS = REAL_TASK_DEFAULT_MAX_TOOL_CALLS;
 export const CONSOLE_DEFAULT_STORE_ROOT = join(tmpdir(), "linonward-agent-console-runs");
 
+/** 同时可以打开的运行上限的环境变量名（运行中 + 等待回答）。 */
+export const CONSOLE_MAX_OPEN_RUNS_ENV = "AGENT_CONSOLE_MAX_OPEN_RUNS";
+
 /** `GET /api/runs` 默认返回多少条：本地工具，够翻最近几次就够。 */
 export const LIST_DEFAULT_LIMIT = 20;
 
@@ -159,6 +162,37 @@ export interface ConsoleRunnerOptions {
   hub: RunHub;
   storeRoot?: string | undefined;
   skillsDirectory?: string | undefined;
+  /** 同时可以打开的运行上限；缺省时从 `AGENT_CONSOLE_MAX_OPEN_RUNS` 读。 */
+  maxOpenRuns?: number | undefined;
+}
+
+/**
+ * 超出并发上限时的拒绝。
+ *
+ * 上限按**打开的运行**计（运行中 + 等待回答）：等待中的运行同样各占一条频道、
+ * 一个 journal 轮询与一份上下文，所以只数"正在跑"的并不足以保护进程。
+ * 单独成函数是为了让边界能被离线测到，而不是藏在 `start` 的分支里。
+ */
+export function openRunRefusal(
+  openCount: number,
+  limit: number | undefined,
+): RunnerError | undefined {
+  if (limit === undefined || openCount < limit) return undefined;
+  return new RunnerError(
+    429,
+    `同时打开的运行已达上限（${limit}）：请等其中一次结束，或调整 ${CONSOLE_MAX_OPEN_RUNS_ENV}`,
+  );
+}
+
+/** 读出并发上限：非法值（0 / 负数 / 非数字）直接报错，而不是静默退回不限。 */
+export function readMaxOpenRuns(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env[CONSOLE_MAX_OPEN_RUNS_ENV];
+  if (raw === undefined || raw.trim().length === 0) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${CONSOLE_MAX_OPEN_RUNS_ENV} 需要正整数，收到：${raw}`);
+  }
+  return parsed;
 }
 
 interface RunContext {
@@ -319,6 +353,7 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
   const skillsDirectory = options.skillsDirectory ?? defaultSkillsDirectory();
   const store = new LocalFileRunStore(storeRoot);
   const contexts = new Map<string, RunContext>();
+  const maxOpenRuns = options.maxOpenRuns ?? readMaxOpenRuns(env);
 
   /**
    * 组装一次运行的进程内上下文。
@@ -331,7 +366,14 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     const secrets = secretValues(env);
     const { config, pricing } = resolveDeepSeek(env, run.plannerModel, secrets);
 
-    const client = createResponsesHttpClient({ apiKey: config.apiKey, baseUrl: config.baseUrl });
+    // 取消信号必须一路传到 HTTP 客户端：否则"中止"只是不再进入下一步，
+    // 却还要干等正在飞行中的那次模型调用（最长 60 秒）才真的停下。
+    const controller = new AbortController();
+    const client = createResponsesHttpClient({
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      signal: controller.signal,
+    });
     const model: ModelDriver = createStatelessResponsesDriver({ client, modelId: config.model });
     const planner: Planner = createModelPlanner(
       createResponsesModel({ client, modelId: config.plannerModel }),
@@ -403,7 +445,6 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       onToolCall: createJournalToolHook(journal),
     };
 
-    const controller = new AbortController();
     const cliInput: CliRuntimeInput = {
       cwd: run.cwd,
       skillsDirectory,
@@ -557,6 +598,9 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
 
   return {
     async start(input) {
+      const refusal = openRunRefusal(contexts.size, maxOpenRuns);
+      if (refusal !== undefined) throw refusal;
+
       const runId = randomUUID();
       const context = createContext(runId, input);
       contexts.set(runId, context);

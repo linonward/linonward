@@ -1,23 +1,17 @@
 import { createServer } from "node:http";
 
 import { RunHub } from "./bus.js";
-import { createRequestHandler, DEFAULT_API_PORT } from "./router.js";
+import { readHost, readPort, startupRefusal } from "./entry-options.js";
+import { createRequestHandler } from "./router.js";
 import { createConsoleRunner } from "./runner.js";
 
-/**
- * 本地 API 服务入口（用 `tsx` 跑）：`node --env-file-if-exists=.env --import tsx server/index.ts`。
- *
- * 只监听 `127.0.0.1`；密钥只在 `process.env` / `.env` 里读，既不写入日志也不出现在响应里。
- */
-function readPort(env: NodeJS.ProcessEnv): number {
-  const raw = env["AGENT_CONSOLE_API_PORT"];
-  if (raw === undefined || raw.length === 0) return DEFAULT_API_PORT;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_API_PORT;
-}
-
-const host = "127.0.0.1";
+const host = readHost(process.env);
 const port = readPort(process.env);
+const refusal = startupRefusal({ host, token: process.env["AGENT_CONSOLE_TOKEN"] });
+if (refusal !== undefined) {
+  process.stderr.write(`${refusal}\n`);
+  process.exit(1);
+}
 const hub = new RunHub();
 const runner = createConsoleRunner({ env: process.env, hub });
 const handle = createRequestHandler({ runner, hub, env: process.env });
@@ -47,6 +41,8 @@ server.listen(port, host, () => {
       `GET  /api/runs`,
       `GET  /api/runs/:runId/stream`,
       `GET  /api/runs/:runId`,
+      `POST /api/runs/:runId/cancel`,
+      `访问令牌：${(process.env["AGENT_CONSOLE_TOKEN"] ?? "").trim().length === 0 ? "未设置（仅本机可信环境）" : "已设置"}`,
       `POST /api/runs/:runId/answer`,
       "",
     ].join("\n"),
