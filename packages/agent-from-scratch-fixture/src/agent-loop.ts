@@ -1566,6 +1566,21 @@ async function runLoopFromState(
       }
 
       if (result.type === "waiting") {
+        // 策略是在**派发之前**要求人工批准的，所以这次调用确定没有产生副作用。
+        // 把这个事实落盘：否则它只是一条"有 intent、没有 result"的在途调用，恢复时会被
+        // 判成"可能已经执行过"，要求人工对账（`no verifier registered for in-flight tool`），
+        // 于是"批准之后继续"根本走不通。
+        await context.persist(state, {
+          type: "tool_result",
+          callId: call.callId,
+          idempotencyKey,
+          output: JSON.stringify({
+            ok: false,
+            error: "not_executed",
+            message: `awaiting_approval: 这次调用没有被执行，等待人工批准（requestId=${result.requestId}）`,
+          }),
+        });
+
         const waiting = transitionState(state, "waiting", result.reason, context.now());
         context.emit(waiting, { type: "run_stopped", reason: "approval_required" });
         return finishStop(waiting, "approval_required", context);

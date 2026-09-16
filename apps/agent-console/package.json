@@ -1,0 +1,33 @@
+{
+  "name": "@linonward/agent-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local React + Vite console that streams a real agent-from-scratch run, including the model's visible reasoning.",
+  "scripts": {
+    "build": "vite build",
+    "dev": "tsx scripts/dev.ts",
+    "dev:api": "node --env-file-if-exists=.env --import tsx server/index.ts",
+    "dev:web": "vite",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@linonward/agent-from-scratch-fixture": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "eslint": "9.39.5",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3",
+    "vite": "8.3.0",
+    "vitest": "5.0.0"
+  }
+}

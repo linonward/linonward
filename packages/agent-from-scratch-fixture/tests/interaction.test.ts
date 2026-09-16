@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { applyUserAnswer, applyUserSteering, waitForUserInput } from "../src/interaction.js";
+import {
+  applyApprovalGrant,
+  applyUserAnswer,
+  applyUserSteering,
+  waitForUserInput,
+} from "../src/interaction.js";
 import { authorize, InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
-import { createInitialState } from "../src/state.js";
+import { createInitialState, transitionState } from "../src/state.js";
 import { runCommandTool } from "../src/tools/run-command.js";
 import type { UserInputRequest } from "../src/types.js";
 import { makeTaskPlan } from "./support.js";
@@ -159,6 +164,53 @@ describe("user interaction", () => {
     ).toBeUndefined();
   });
 
+  it("审批摘要只绑定会被执行的东西：重述 purpose 不该让批准失效", async () => {
+    const context: PolicyContext = {
+      cwd: "/workspace",
+      realWorkspaceRoot: "/workspace",
+      allowedArgv: [["pnpm", "test"]],
+      network: "disabled",
+    };
+    // 模型在批准后重放同一调用时，几乎一定会把 purpose 换个说法（`purpose` 是给人看的标签，
+    // 不参与执行）。如果它进了摘要，用户就得为同一条命令反复批准。
+    const first = authorize(
+      runCommandTool,
+      { command: "pnpm", args: ["test"], purpose: "运行测试" },
+      context,
+    );
+    const retry = authorize(
+      runCommandTool,
+      { command: "pnpm", args: ["test"], purpose: "重新运行测试以确认结果" },
+      context,
+    );
+    if (first.type !== "ask" || retry.type !== "ask") throw new Error("expected approval requests");
+
+    expect(retry.request.actionDigest).toBe(first.request.actionDigest);
+
+    // 批准一次，重放的那次就能直接消费到凭证。
+    const ledger = new InMemoryApprovalLedger();
+    await ledger.saveApprovalRequest("run-1", first.request);
+    await ledger.approve("run-1", first.request.id, now);
+    await expect(
+      ledger.consumeApprovalGrant("run-1", retry.request.actionDigest, now),
+    ).resolves.toBeDefined();
+
+    // 真正会执行的东西变了，摘要必须跟着变。
+    const changed = authorize(
+      runCommandTool,
+      { command: "pnpm", args: ["test", "--watch"], purpose: "运行测试" },
+      {
+        ...context,
+        allowedArgv: [
+          ["pnpm", "test"],
+          ["pnpm", "test", "--watch"],
+        ],
+      },
+    );
+    if (changed.type !== "ask") throw new Error("expected an approval request");
+    expect(changed.request.actionDigest).not.toBe(first.request.actionDigest);
+  });
+
   it("propagates cancellation without losing the audit trail", () => {
     const state = createInitialState("任务", "/workspace");
     const outcome = applyUserSteering(state, { kind: "cancel", reason: "user_cancelled" }, now);
@@ -166,5 +218,44 @@ describe("user interaction", () => {
     expect(outcome.state.status).toBe("cancelled");
     expect(outcome.state.stopReason).toBe("user_cancelled");
     expect(outcome.state.events.map((event) => event.sequence)).toEqual([1, 2]);
+  });
+});
+
+/**
+ * 审批与澄清共用 `waiting` 状态，但恢复方式不同：批准只需要把账本里的凭证发出去，
+ * 运行状态要从 `waiting` 回到 `running` 才能续跑（状态机不允许 waiting -> waiting，
+ * 否则重放同一次调用会直接以 `invalid state transition` 失败）。
+ */
+describe("审批恢复", () => {
+  it("批准后把 waiting 拉回 running，并记下是哪条请求被批准", () => {
+    // 审批等待**不写** pendingUserInput（那个字段只管澄清），所以这里手工造状态。
+    const waiting = transitionState(
+      createInitialState("任务", "/workspace", undefined, { now }),
+      "waiting",
+      "approval_required",
+      now,
+    );
+
+    const running = applyApprovalGrant(waiting, "request-1", now);
+
+    expect(running.status).toBe("running");
+    expect(running.pendingUserInput).toBeUndefined();
+    // `transitionState` 会再补一条 status_changed，因此审批事件在它前面。
+    expect(running.events.map((event) => event.type).slice(-2)).toEqual([
+      "approval_granted",
+      "status_changed",
+    ]);
+    expect(running.events.at(-2)?.detail).toBe('{"requestId":"request-1"}');
+  });
+
+  it("只在 waiting 时可用：重复批准会被拒绝", () => {
+    const waiting = transitionState(
+      createInitialState("任务", "/workspace"),
+      "waiting",
+      "approval_required",
+    );
+    const running = applyApprovalGrant(waiting, "request-1");
+
+    expect(() => applyApprovalGrant(running, "request-1")).toThrow("not_waiting_for_approval");
   });
 });

@@ -1,5 +1,6 @@
 import type { ContextSource } from "./context.js";
 import type { ReplanReason } from "./plan.js";
+import type { ApprovalLedger } from "./policy.js";
 import { appendEvent, transitionState } from "./state.js";
 import type { AgentState, UserInputAnswer, UserInputRequest } from "./types.js";
 
@@ -57,6 +58,44 @@ export function applyUserAnswer(
     now,
   );
   return transitionState(recorded, "running", "user_input_received", now);
+}
+
+/**
+ * 批准了一条策略审批之后，把运行从 `waiting` 拉回 `running`。
+ *
+ * 审批与澄清共用 `waiting`，但恢复方式不同：澄清要把回答写进上下文（`applyUserAnswer`），
+ * 审批只是**放行一次已经绑定 digest 的调用**——凭证由账本发放，重放的工具调用会在
+ * `consumeApprovalGrant` 时消费它。
+ *
+ * 必须显式走这一步，因为状态机只允许 `waiting -> running`：批准后若直接续跑、
+ * 模型又提出一次审批，`waiting -> waiting` 会直接抛 `invalid state transition`。
+ */
+export function applyApprovalGrant(
+  state: AgentState,
+  requestId: string,
+  now = new Date(),
+): AgentState {
+  if (state.status !== "waiting") throw new Error("not_waiting_for_approval");
+
+  const recorded = appendEvent(state, "approval_granted", JSON.stringify({ requestId }), now);
+  return transitionState(recorded, "running", "approval_granted", now);
+}
+
+/**
+ * 批准一条待批准的请求：先发凭证，再把运行拉回 `running`。
+ *
+ * 顺序不能反：状态一旦回到 `running`，就意味着这次批准已经生效——凭证必须先到位，
+ * 否则续跑的第一次工具调用会再次落在 `waiting` 上。
+ */
+export async function grantApproval(input: {
+  approvals: ApprovalLedger;
+  state: AgentState;
+  requestId: string;
+  now?: Date | undefined;
+}): Promise<AgentState> {
+  const now = input.now ?? new Date();
+  await input.approvals.approve(input.state.runId, input.requestId, now);
+  return applyApprovalGrant(input.state, input.requestId, now);
 }
 
 export type SteeringInput =

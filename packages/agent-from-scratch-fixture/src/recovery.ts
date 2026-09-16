@@ -146,6 +146,9 @@ export function reduceDurableEvent(
       return { ...state, status: "waiting", stopReason: event.reason };
     case "user_input_received":
       return state;
+    case "approval_granted":
+      // 批准把运行拉回 running；后续的 run_stopped 会按新的停止原因覆盖状态。
+      return { ...state, status: "running" };
     case "run_stopped":
       return { ...state, status: statusForStopReason(event.reason), stopReason: event.reason };
     default:
