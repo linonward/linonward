@@ -400,6 +400,8 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       logPath: journalPath,
       truncate: true,
       write: writeLine,
+      // 形状兜底（journal 自带）之外，再叠一层"环境里真正配过的密钥"。
+      redact: (line) => redactAll(line, secrets),
     });
 
     // 结构化记录（带 kind）由 journal 的 JSONL 增量读取器变成实时流。

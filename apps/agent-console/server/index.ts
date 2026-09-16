@@ -1,5 +1,10 @@
 import { createServer } from "node:http";
 
+import {
+  DAY_MS,
+  parseRetentionDays,
+  pruneRuns,
+} from "../../../packages/agent-from-scratch-fixture/src/retention.js";
 import { detectSandbox } from "../../../packages/agent-from-scratch-fixture/src/sandbox.js";
 import { RunHub } from "./bus.js";
 import { readHost, readPort, startupRefusal } from "./entry-options.js";
@@ -30,6 +35,17 @@ const server = createServer((request, response) => {
     response.end();
   });
 });
+
+// 保留策略：缺省不清理（本地工具），设了 AGENT_RETENTION_DAYS 就按天数在启动时清一次。
+const retentionDays = parseRetentionDays(process.env);
+const storeRoot = process.env["AGENT_STORE_ROOT"];
+if (retentionDays !== undefined && storeRoot !== undefined && storeRoot.length > 0) {
+  void pruneRuns(storeRoot, { maxAgeMs: retentionDays * DAY_MS }).then((result) => {
+    process.stdout.write(
+      `保留策略：${retentionDays} 天，清理 ${result.removed.length} 个运行，保留 ${result.kept} 个\n`,
+    );
+  });
+}
 
 server.listen(port, host, () => {
   const keyState = process.env["DEEPSEEK_API_KEY"] ? "已配置" : "未配置（/api/run 会返回 4xx）";

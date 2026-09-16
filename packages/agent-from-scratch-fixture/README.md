@@ -456,6 +456,11 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `changedFiles`、绑定 `mutationRevision` 的 `ValidationRecord`、`stopReason`），
   但模型是否愿意按提示调用工具仍存在不确定性；失败时先用 `console.log` 打印的
   事件序列与 answers 判断是"模型没照做"还是"harness 出错"。
+- **日志写入前会脱敏**：`redactCredentialPatterns` 盖掉常见凭证形状（`sk-…`、`ghp_…`、
+  JWT、`Bearer …`、`password=…` 等，长值保留首尾各 4 字符便于定位），调用方再用 `redact`
+  叠加"环境里真正配过的密钥"。顺序是**先脱敏再截断**，否则凭证可能落在截断边界之外。
+- **运行目录有保留策略**：`pruneRuns(root, { maxAgeMs })` 按"目录内容里最新的 mtime"
+  判断年龄并清理，支持 `dryRun`；`AGENT_RETENTION_DAYS` 是控制台侧的开关（缺省不清理）。
 - **崩溃恢复会先自动对账**：`createRealTaskVerifiers()` 给 `read_file` / `search_text`
   （确定没有副作用）与 `apply_patch`（用内容哈希对照"执行前 / 执行后"两个确定状态）注册了
   判定器；判定不了时**不猜**，仍旧转成人工对账请求。`run_command` 没有判定器——命令是否

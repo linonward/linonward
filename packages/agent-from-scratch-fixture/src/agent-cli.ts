@@ -497,11 +497,16 @@ export async function createDeepSeekAgentCli(
     // 缺 key 的异常必须直接冒泡（由 scripts/agent.ts 打印），因此 wiring 先于 journal 解析。
     const realWiring = runtimeOverride === undefined ? resolveWiring() : undefined;
 
+    // 形状兜底由 journal 自带；这里再叠一层"环境里真正配过的密钥"。
+    const secrets = [env["DEEPSEEK_API_KEY"]].flatMap((secret) =>
+      secret === undefined || secret.length === 0 ? [] : [secret],
+    );
     const journal = createJournal({
       verbose: parsed.config.verbose,
       logPath: parsed.config.logPath,
       truncate: !parsed.config.noTruncate,
       write: (line) => io.stderr(line),
+      redact: (line) => secrets.reduce((text, secret) => text.split(secret).join("***"), line),
     });
 
     try {

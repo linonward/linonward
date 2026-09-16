@@ -38,6 +38,7 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `DEEPSEEK_PRICE_TABLE(_JSON)` | 可选成本价目表；缺失时界面显示 `cost=unknown`。 |
 | `AGENT_STORE_ROOT` | 运行存根目录（`LocalFileRunStore`），默认系统临时目录下的 `linonward-agent-console-runs`。 |
 | `AGENT_SANDBOX` / `AGENT_SANDBOX_IMAGE` | 选择沙箱（`docker` / `seatbelt` / `bubblewrap` / `none`）或指定容器镜像。默认按平台探测，启动时会打印结果。 |
+| `AGENT_RETENTION_DAYS` | 启动时按天数清理 `AGENT_STORE_ROOT` 下的旧运行（需要同时设置 store root）；缺省不清理，非法值直接报错。 |
 | `AGENT_CONSOLE_API_PORT` | API 端口，默认 `8787`（Vite 代理也读这个变量）。 |
 | `AGENT_CONSOLE_HOST` | 监听地址，默认 `127.0.0.1`。绑非回环地址时**必须**同时设置令牌，否则拒绝启动。 |
 | `AGENT_CONSOLE_TOKEN` | 访问令牌。设置后除 `/api/health` 与 `/api/session` 外所有接口都要带 `Authorization: Bearer <token>`、`x-agent-console-token` 或会话 cookie；令牌本身也在脱敏清单里。 |

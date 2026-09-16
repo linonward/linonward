@@ -224,6 +224,66 @@ export interface JournalOptions {
   write: (line: string) => void;
   /** 可注入时钟，便于测试固定时间戳；默认系统时间。 */
   now?: (() => Date) | undefined;
+  /**
+   * 额外的字段级脱敏，在写盘与写 stderr **之前**执行。
+   *
+   * 调用方通常传"环境里配过的密钥"（控制台就是这样）；默认还会叠一层
+   * `redactCredentialPatterns`，把模型输出里常见的凭证形状盖掉——日志会长期留在磁盘上，
+   * 不能指望"模型不会把 key 打出来"。
+   */
+  redact?: ((text: string) => string) | undefined;
+}
+
+/**
+ * 常见凭证形状的兜底脱敏。
+ *
+ * 只认"几乎不可能是普通文本"的形状，并且保留前缀与后缀各 4 个字符以便定位
+ * （`sk-1234…cdef`）——既要能排查，又不能留下可用的密钥。这里刻意不做通用"高熵字符串"
+ * 猜测：误伤日志的代价比多留一层显式脱敏更高。
+ */
+/** 独立的 token 形状：这些整串都是凭证，直接盖掉。 */
+export const CREDENTIAL_TOKEN_PATTERNS: readonly RegExp[] = [
+  /\bsk-[A-Za-z0-9_-]{16,}\b/g, // OpenAI / DeepSeek 风格
+  /\bghp_[A-Za-z0-9]{20,}\b/g, // GitHub personal access token
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, // Slack
+  /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, // JWT
+];
+
+/** `token=...` 这类键值：保留键名与分隔符，只盖住值。 */
+const CREDENTIAL_KEY_VALUE_PATTERN =
+  /\b(password|passwd|secret|token|api[_-]?key)(\s*[=:]\s*["']?)([^\s"',]{8,})/gi;
+
+/** `Bearer <token>`：保留方案名。 */
+const CREDENTIAL_BEARER_PATTERN = /\bBearer(\s+)([A-Za-z0-9._~+/-]{16,}=*)/gi;
+
+function maskSecret(value: string): string {
+  if (value.length <= 12) return "***";
+  return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+/**
+ * 把常见凭证形状替换成 `***`（长值保留首尾各 4 个字符以便定位）。
+ *
+ * 刻意只认"几乎不可能是普通文本"的形状，不做通用高熵猜测：误伤日志的代价比多留一层
+ * 显式脱敏更高。8 字符以下的值不动——`token=abc` 这种占位文本不该被改写。
+ */
+export function redactCredentialPatterns(text: string): string {
+  let result = text;
+  for (const pattern of CREDENTIAL_TOKEN_PATTERNS) {
+    result = result.replace(pattern, (match) => maskSecret(match));
+  }
+  result = result.replace(
+    CREDENTIAL_KEY_VALUE_PATTERN,
+    (_match, key: string, separator: string, value: string) =>
+      `${key}${separator}${maskSecret(value)}`,
+  );
+  result = result.replace(
+    CREDENTIAL_BEARER_PATTERN,
+    (_match, space: string, value: string) => `Bearer${space}${maskSecret(value)}`,
+  );
+  return result;
 }
 
 /**
@@ -273,9 +333,16 @@ export function createJournal(options: JournalOptions): Journal {
   const fd = options.logPath === undefined ? undefined : openSync(options.logPath, "a");
   let closed = false;
 
+  // 脱敏在 clip 之前：先盖掉凭证，再按长度截断，顺序反了会把凭证留在尾部。
+  const redact = (text: string): string => {
+    const masked = redactCredentialPatterns(text);
+    return options.redact === undefined ? masked : options.redact(masked);
+  };
+
   const clip = (text: string): string => {
-    if (!options.truncate || text.length <= DEFAULT_JOURNAL_MAX_CHARACTERS) return text;
-    return `${text.slice(0, DEFAULT_JOURNAL_MAX_CHARACTERS)}…truncated(原长度 ${text.length})`;
+    const masked = redact(text);
+    if (!options.truncate || masked.length <= DEFAULT_JOURNAL_MAX_CHARACTERS) return masked;
+    return `${masked.slice(0, DEFAULT_JOURNAL_MAX_CHARACTERS)}…truncated(原长度 ${masked.length})`;
   };
 
   const writeRecord = (record: Record<string, unknown>): void => {
@@ -284,7 +351,7 @@ export function createJournal(options: JournalOptions): Journal {
   };
 
   const writeLine = (line: string): void => {
-    options.write(line);
+    options.write(redact(line));
   };
 
   if (!options.truncate) {
