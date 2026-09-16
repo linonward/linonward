@@ -456,6 +456,10 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `changedFiles`、绑定 `mutationRevision` 的 `ValidationRecord`、`stopReason`），
   但模型是否愿意按提示调用工具仍存在不确定性；失败时先用 `console.log` 打印的
   事件序列与 answers 判断是"模型没照做"还是"harness 出错"。
+- **崩溃恢复会先自动对账**：`createRealTaskVerifiers()` 给 `read_file` / `search_text`
+  （确定没有副作用）与 `apply_patch`（用内容哈希对照"执行前 / 执行后"两个确定状态）注册了
+  判定器；判定不了时**不猜**，仍旧转成人工对账请求。`run_command` 没有判定器——命令是否
+  已经产生副作用无法从工作区推断，只能由人确认。
 - **取消会打断正在飞行中的模型调用**。`createResponsesHttpClient` 接受外部 `AbortSignal`：
   没有它，"中止"只能等下一次循环检查，用户要干等一次 60 秒超时。CLI 侧目前仍以
   `SIGINT` + 工具/HTTP 超时为准（客户端在装配期创建，尚未绑定每次调用的信号）。

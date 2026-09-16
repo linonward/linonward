@@ -59,6 +59,7 @@ import type {
   AgentResult,
   AgentState,
 } from "../../../packages/agent-from-scratch-fixture/src/types.js";
+import { createRealTaskVerifiers } from "../../../packages/agent-from-scratch-fixture/src/verifiers.js";
 import { messageOf } from "../src/lib/format.js";
 import { isPlainObject, type JournalRecord } from "../src/lib/journal.js";
 import type { RunChannel, RunHub } from "./bus.js";
@@ -438,6 +439,8 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
       approvals,
       sandbox: detectSandbox(),
       requireSandbox: run.requireSandbox,
+      // 崩溃恢复的自动对账（`rehydrate` + `answer` 走的正是恢复路径）。
+      verifiers: createRealTaskVerifiers(),
       maxSteps: run.maxSteps,
       maxToolCalls: run.maxToolCalls,
       pricing,

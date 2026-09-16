@@ -27,6 +27,7 @@ import {
   loopOptionsFromRuntime,
   restoreRun,
   resumeAgentRun,
+  type ToolStateVerifier,
   toDurableState,
 } from "./recovery.js";
 import { createRunCheckpoint, type RunStore } from "./run-store.js";
@@ -296,6 +297,11 @@ export interface AgentCliOptions {
   sandbox?: Sandbox | undefined;
   /** 显式要求隔离：`true` 时没有可用沙箱就拒绝执行。 */
   requireSandbox?: boolean | undefined;
+  /**
+   * 崩溃恢复的对账器：工具名 → 判定"在途调用是否已生效"。
+   * 只影响 `resume` / `answer` 的恢复路径（首次运行不需要它）。
+   */
+  verifiers?: Record<string, ToolStateVerifier> | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
@@ -326,6 +332,7 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     writeLease: base.writeLease ?? new InMemoryWriteLease(),
     sandbox: base.sandbox,
     requireSandbox: base.requireSandbox,
+    verifiers: base.verifiers,
     validationSpecs: base.validationSpecs,
     signal: input.signal,
     onEvent: input.onEvent,

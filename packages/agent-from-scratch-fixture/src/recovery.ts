@@ -42,12 +42,21 @@ import type {
   ValidationSpec,
 } from "./types.js";
 
-/** 工具声明自己的恢复策略；未知调用绝不能因为"多数时候没事"就标记完成。 */
+/**
+ * 工具声明自己的恢复策略；未知调用绝不能因为"多数时候没事"就标记完成。
+ *
+ * `ambiguous`（"确定不了"）必须是显式的：把它挤进 `not_applied` 会让循环以为副作用
+ * 没发生，从而**重复执行**；挤进 `applied` 则会凭空造出一个没发生过的结果。
+ */
 export interface ToolStateVerifier {
   verify(input: {
     call: PersistedToolCall;
     state: DurableAgentState;
-  }): Promise<{ status: "applied"; output: string } | { status: "not_applied" }>;
+  }): Promise<
+    | { status: "applied"; output: string }
+    | { status: "not_applied" }
+    | { status: "ambiguous"; reason: string }
+  >;
 }
 
 export type RecoveryPolicy =
@@ -275,6 +284,9 @@ export async function reconcileInFlightTool(
   }
 
   const verified = await verifier.verify({ call, state });
+  if (verified.status === "ambiguous") {
+    return { type: "manual_reconciliation", reason: verified.reason };
+  }
   const output =
     verified.status === "applied"
       ? verified.output

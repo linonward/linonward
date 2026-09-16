@@ -37,6 +37,7 @@ import {
 import { detectSandbox } from "./sandbox.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { Clock } from "./types.js";
+import { createRealTaskVerifiers } from "./verifiers.js";
 
 export const AGENT_USAGE =
   "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose] [--log <path>] [--no-truncate] [--no-repeat-guard]";
@@ -406,6 +407,8 @@ function createRuntimeFactory(
       approvals,
       sandbox: detectSandbox(),
       requireSandbox: wiring.config.requireSandbox,
+      // 崩溃恢复的自动对账：没有它，一次进程重启后每个在途调用都要人工回答。
+      verifiers: createRealTaskVerifiers(),
       maxSteps: wiring.config.maxSteps,
       maxToolCalls: wiring.config.maxToolCalls,
       pricing: wiring.pricing,
