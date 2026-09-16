@@ -77,7 +77,14 @@ export interface JournalRunMetaView {
   command?: string | undefined;
   task?: string | undefined;
   cwd?: string | undefined;
-  budgets?: { maxSteps?: number | undefined; maxToolCalls?: number | undefined } | undefined;
+  budgets?:
+    | {
+        maxSteps?: number | undefined;
+        maxToolCalls?: number | undefined;
+        maxCostUsd?: number | undefined;
+        maxWallMs?: number | undefined;
+      }
+    | undefined;
   allowedArgv?: string[][] | undefined;
   requireSandbox?: boolean | undefined;
   approveAllowed?: boolean | undefined;
@@ -94,9 +101,13 @@ function readBudgets(value: unknown): JournalRunMetaView["budgets"] {
   const record = value as Record<string, unknown>;
   const maxSteps = record["maxSteps"];
   const maxToolCalls = record["maxToolCalls"];
+  const maxCostUsd = record["maxCostUsd"];
+  const maxWallMs = record["maxWallMs"];
   return {
     ...(typeof maxSteps === "number" ? { maxSteps } : {}),
     ...(typeof maxToolCalls === "number" ? { maxToolCalls } : {}),
+    ...(typeof maxCostUsd === "number" ? { maxCostUsd } : {}),
+    ...(typeof maxWallMs === "number" ? { maxWallMs } : {}),
   };
 }
 

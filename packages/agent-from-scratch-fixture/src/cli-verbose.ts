@@ -1,9 +1,11 @@
 import type {
   AgentLoopEvent,
   BudgetExhaustedDetail,
+  BudgetExhaustedReason,
   BudgetExhaustedToolCall,
   PlanRevisedDetail,
 } from "./agent-loop.js";
+import { BUDGET_EXHAUSTED_REASONS } from "./agent-loop.js";
 import { formatCostUsd } from "./pricing.js";
 import { formatUsageNumber } from "./trace.js";
 import type { AgentResult, AgentState, PlanStep } from "./types.js";
@@ -300,7 +302,12 @@ export function readBudgetExhaustedDetail(state: AgentState): BudgetExhaustedDet
   if (!isRecord(parsed)) return undefined;
 
   const reason = parsed["reason"];
-  if (reason !== "max_steps" && reason !== "max_tool_calls") return undefined;
+  if (
+    typeof reason !== "string" ||
+    !(BUDGET_EXHAUSTED_REASONS as readonly string[]).includes(reason)
+  ) {
+    return undefined;
+  }
 
   const budget = parsed["budget"];
   const usage = parsed["usage"];
@@ -329,7 +336,7 @@ export function readBudgetExhaustedDetail(state: AgentState): BudgetExhaustedDet
 
   const detail: BudgetExhaustedDetail = {
     type: "budget_exhausted",
-    reason,
+    reason: reason as BudgetExhaustedReason,
     budget: { modelSteps, maxSteps, toolCalls, maxToolCalls },
     usage: { modelCalls, toolCalls: usageToolCalls, durationMs, cost },
     pendingSteps: boundedArray(parsed["pendingSteps"], pendingStepFrom),
@@ -346,6 +353,11 @@ export function readBudgetExhaustedDetail(state: AgentState): BudgetExhaustedDet
   if (cachedInputTokens !== undefined) detail.usage.cachedInputTokens = cachedInputTokens;
   const estimatedCostUsd = numberField(usage["estimatedCostUsd"]);
   if (estimatedCostUsd !== undefined) detail.usage.estimatedCostUsd = estimatedCostUsd;
+
+  const maxCostUsd = numberField(budget["maxCostUsd"]);
+  if (maxCostUsd !== undefined) detail.budget.maxCostUsd = maxCostUsd;
+  const maxWallMs = numberField(budget["maxWallMs"]);
+  if (maxWallMs !== undefined) detail.budget.maxWallMs = maxWallMs;
 
   const activeStepId = parsed["activeStepId"];
   if (typeof activeStepId === "string") detail.activeStepId = activeStepId;
@@ -379,9 +391,24 @@ function repeatedCallLabels(calls: readonly BudgetExhaustedToolCall[]): string[]
 const BUDGET_REPEAT_HINT =
   "模型在重复同一个工具调用，考虑检查 observation 是否足以让它继续，或提高 --max-tool-calls / 换更强模型";
 const BUDGET_UNFINISHED_HINT = "预算耗尽但计划未完成，可提高 --max-steps 或拆分任务";
+const BUDGET_COST_HINT =
+  "花费越过上限：可提高 --max-cost-usd、换更便宜的模型，或把任务拆小；成本按内置价目表估算，仅供参考";
+const BUDGET_COST_UNKNOWN_HINT =
+  "设了 --max-cost-usd 但这次调用算不出成本（模型不在价目表里），因此保守停下：配置 DEEPSEEK_PRICE_TABLE_JSON 或去掉该上限";
+const BUDGET_WALL_HINT = "墙钟越过上限：可提高 --max-wall-ms，或把任务拆成可独立完成的小步";
 
-/** 依事实生成的可操作提示：重复调用优先于"计划没做完"。 */
+/**
+ * 依事实生成的可操作提示。
+ *
+ * 钱和时间优先：`max_steps` 的提示再怎么准，也解释不了"为什么这一步就停了"。
+ */
 function budgetHint(detail: BudgetExhaustedDetail): string | undefined {
+  if (detail.reason === "max_cost") {
+    return detail.usage.estimatedCostUsd === undefined
+      ? BUDGET_COST_UNKNOWN_HINT
+      : BUDGET_COST_HINT;
+  }
+  if (detail.reason === "max_wall_ms") return BUDGET_WALL_HINT;
   if (detail.recentToolCalls.some((call) => call.repeated)) return BUDGET_REPEAT_HINT;
   if (detail.pendingSteps.length > 0 || detail.pendingStepsOmitted > 0) {
     return BUDGET_UNFINISHED_HINT;
@@ -396,7 +423,7 @@ function budgetHint(detail: BudgetExhaustedDetail): string | undefined {
  * 全部沿用 200 字符 / 20 项上限；`hint` 依据事实生成，没有可说的就不加。
  */
 export function budgetExhaustedSummaryLines(result: AgentResult): string[] {
-  if (result.stopReason !== "max_steps" && result.stopReason !== "max_tool_calls") return [];
+  if (!(BUDGET_EXHAUSTED_REASONS as readonly string[]).includes(result.stopReason)) return [];
 
   const { state } = result;
   const budget = `modelSteps=${state.budget.modelSteps}/${state.budget.maxSteps}, toolCalls=${state.budget.toolCalls}/${state.budget.maxToolCalls}`;
@@ -419,8 +446,21 @@ export function budgetExhaustedSummaryLines(result: AgentResult): string[] {
         : `${detail.activeStepId}(status=${detail.activeStep.status})`;
   const pendingIds = detail.pendingSteps.map((step) => step.id);
 
+  // 钱与时间的上限存在时，把"上限 vs 实际花掉"一起写进同一行：只写上限回答不了
+  // "为什么这一步就停了"。没有设上限的运行输出保持原样。
+  const budgetLine = [
+    `modelSteps=${detail.budget.modelSteps}/${detail.budget.maxSteps}`,
+    `toolCalls=${detail.budget.toolCalls}/${detail.budget.maxToolCalls}`,
+    ...(detail.budget.maxCostUsd === undefined
+      ? []
+      : [`maxCostUsd=${detail.budget.maxCostUsd}`, `spent=${detail.usage.cost}`]),
+    ...(detail.budget.maxWallMs === undefined
+      ? []
+      : [`maxWallMs=${detail.budget.maxWallMs}`, `wallMs=${detail.usage.durationMs}`]),
+  ].join(", ");
+
   const lines = [
-    `[summary] stopped: ${detail.reason} (modelSteps=${detail.budget.modelSteps}/${detail.budget.maxSteps}, toolCalls=${detail.budget.toolCalls}/${detail.budget.maxToolCalls})`,
+    `[summary] stopped: ${detail.reason} (${budgetLine})`,
     [
       `[summary] stopped detail: active=${active}`,
       `last tools=${boundedJoined(lastTools, lastTools.length + detail.recentToolCallsOmitted)}`,

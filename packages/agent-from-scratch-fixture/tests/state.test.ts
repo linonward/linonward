@@ -102,3 +102,20 @@ describe("agent state machine", () => {
     );
   });
 });
+
+describe("预算里的硬上限", () => {
+  it("只在显式设置时才写进 budget（缺省不限制，而不是 0）", () => {
+    const plain = createInitialState("任务", "/workspace", { maxSteps: 4, maxToolCalls: 8 });
+    expect(Object.hasOwn(plain.budget, "maxCostUsd")).toBe(false);
+    expect(Object.hasOwn(plain.budget, "maxWallMs")).toBe(false);
+
+    const capped = createInitialState("任务", "/workspace", {
+      maxSteps: 4,
+      maxToolCalls: 8,
+      maxCostUsd: 0.25,
+      maxWallMs: 60_000,
+    });
+    expect(capped.budget.maxCostUsd).toBe(0.25);
+    expect(capped.budget.maxWallMs).toBe(60_000);
+  });
+});

@@ -230,6 +230,10 @@ export interface AgentLoopOptions {
   skillsDirectory: string;
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）。缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）。缺省不限制。 */
+  maxWallMs?: number | undefined;
   toolTimeoutMs: number;
   model: ModelDriver;
   planner: Planner;
@@ -666,7 +670,13 @@ function recordPlanBlocked(
  * `max_steps` / `max_tool_calls` 的触发点：停止原因必须能回答"卡在哪、模型最后在做什么、
  * 还差什么"。`plan_blocked` 已经有诊断，这两种预算停止在本事件里补齐同样的信息。
  */
-export type BudgetExhaustedReason = "max_steps" | "max_tool_calls";
+export const BUDGET_EXHAUSTED_REASONS = [
+  "max_steps",
+  "max_tool_calls",
+  "max_cost",
+  "max_wall_ms",
+] as const;
+export type BudgetExhaustedReason = (typeof BUDGET_EXHAUSTED_REASONS)[number];
 
 /** `budget_exhausted` 里最多登记多少条未完成步骤：与 `plan_blocked` 共用同一上限。 */
 export const MAX_BUDGET_EXHAUSTED_PENDING_STEPS = MAX_PLAN_BLOCKED_PENDING_STEPS;
@@ -692,6 +702,8 @@ export interface BudgetExhaustedBudget {
   maxSteps: number;
   toolCalls: number;
   maxToolCalls: number;
+  maxCostUsd?: number | undefined;
+  maxWallMs?: number | undefined;
 }
 
 export interface BudgetExhaustedActiveStep {
@@ -746,6 +758,8 @@ function describeBudgetExhausted(
       maxSteps: budget.maxSteps,
       toolCalls: budget.toolCalls,
       maxToolCalls: budget.maxToolCalls,
+      ...(budget.maxCostUsd !== undefined ? { maxCostUsd: budget.maxCostUsd } : {}),
+      ...(budget.maxWallMs !== undefined ? { maxWallMs: budget.maxWallMs } : {}),
     },
     usage: {
       inputTokens: usage.inputTokens,
@@ -779,6 +793,36 @@ function describeBudgetExhausted(
   if (lastReplan !== undefined) detail.lastReplanReason = lastReplan.reason;
 
   return detail;
+}
+
+/**
+ * 钱与时间的硬上限检查。
+ *
+ * 与 `maxSteps` / `maxToolCalls` 不同，这两个上限看的不是"做了多少次"，而是"已经花掉多少"，
+ * 因此必须在**每次模型调用之后**立刻检查：否则一次昂贵的调用就能把上限远远甩在后面，
+ * 而这一轮的工具还会继续被派发。
+ *
+ * 设了 `maxCostUsd` 却算不出价格（模型不在价目表里）时同样停下：不能因为"算不出钱"
+ * 就当作没花钱继续跑。真正"一分没花"时（还没有任何模型调用）不触发。
+ */
+function readHardLimitHit(
+  state: AgentState,
+  context: LoopContext,
+): "max_cost" | "max_wall_ms" | undefined {
+  const { maxCostUsd, maxWallMs } = state.budget;
+  if (maxCostUsd === undefined && maxWallMs === undefined) return undefined;
+
+  // 墙钟只在停止边界才累加，检查前先补上这一段，否则上限永远看不到真实耗时。
+  context.usage.markElapsed();
+
+  if (maxWallMs !== undefined && state.usage.durationMs >= maxWallMs) return "max_wall_ms";
+
+  if (maxCostUsd !== undefined && state.usage.modelCalls > 0) {
+    const costUsd = state.usage.estimatedCostUsd;
+    if (costUsd === undefined || costUsd >= maxCostUsd) return "max_cost";
+  }
+
+  return undefined;
 }
 
 /**
@@ -1092,7 +1136,12 @@ export async function runAgentLoop(task: string, options: AgentLoopOptions): Pro
   const state = createInitialState(
     task,
     options.cwd,
-    { maxSteps: options.maxSteps, maxToolCalls: options.maxToolCalls },
+    {
+      maxSteps: options.maxSteps,
+      maxToolCalls: options.maxToolCalls,
+      ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+      ...(options.maxWallMs !== undefined ? { maxWallMs: options.maxWallMs } : {}),
+    },
     { now: options.clock?.now() ?? new Date(), runId: options.runId },
   );
 
@@ -1237,6 +1286,8 @@ async function runLoopFromState(
     if (state.budget.modelSteps >= state.budget.maxSteps) {
       return stopForBudget(state, "max_steps", context, toolCallLog);
     }
+    const hardLimit = readHardLimitHit(state, context);
+    if (hardLimit !== undefined) return stopForBudget(state, hardLimit, context, toolCallLog);
 
     let plan: TaskPlan | undefined = state.plan;
     if (!plan) {
@@ -1431,6 +1482,12 @@ async function runLoopFromState(
       }))
     ) {
       return interruptedResult(state);
+    }
+
+    // 钱和时间在模型边界就已经花了：先判硬上限，再决定是否派发这一轮的工具或采纳答案。
+    const hardLimitAfterTurn = readHardLimitHit(state, context);
+    if (hardLimitAfterTurn !== undefined) {
+      return stopForBudget(state, hardLimitAfterTurn, context, toolCallLog);
     }
 
     if (turn.userInputRequest && turn.toolCalls.length > 0) {

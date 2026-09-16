@@ -33,6 +33,14 @@ export interface AgentBudget {
   maxToolCalls: number;
   modelSteps: number;
   toolCalls: number;
+  /**
+   * 花费上限（美元，按内置价目表估算）。`maxSteps` 管"做了多少次"，管不住
+   * "一次花掉多少"——一次昂贵的模型调用就能把账单甩到上限之外，所以钱要单独设闸。
+   * 未设置即不限制。
+   */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）。未设置即不限制。 */
+  maxWallMs?: number | undefined;
 }
 
 /**
@@ -43,6 +51,10 @@ export interface StopReasonMap {
   final_answer: true;
   max_steps: true;
   max_tool_calls: true;
+  /** 估算花费越过 `budget.maxCostUsd`（或设了上限却算不出价格）。 */
+  max_cost: true;
+  /** 墙钟越过 `budget.maxWallMs`。 */
+  max_wall_ms: true;
   cancelled: true;
   model_error: true;
   invalid_model_output: true;

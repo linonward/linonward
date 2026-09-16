@@ -23,6 +23,10 @@ export function canTransition(from: AgentState["status"], to: AgentState["status
 export interface InitialStateLimits {
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）。缺省不限制：只有调用方显式设了才写进 budget。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）。缺省不限制。 */
+  maxWallMs?: number | undefined;
 }
 
 export interface InitialStateOptions {
@@ -57,6 +61,8 @@ export function createInitialState(
       maxToolCalls: limits.maxToolCalls,
       modelSteps: 0,
       toolCalls: 0,
+      ...(limits.maxCostUsd !== undefined ? { maxCostUsd: limits.maxCostUsd } : {}),
+      ...(limits.maxWallMs !== undefined ? { maxWallMs: limits.maxWallMs } : {}),
     },
     events: [
       {

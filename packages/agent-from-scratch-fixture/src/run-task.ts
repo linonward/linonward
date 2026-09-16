@@ -251,7 +251,8 @@ export async function runRealTask(options: RunRealTaskOptions): Promise<RealTask
       approvals,
       writeLease: new InMemoryWriteLease(),
       sandbox: options.sandbox ?? detectSandbox(),
-      requireSandbox: options.requireSandbox ?? false,
+      // 与 CLI 一致：默认要求隔离，调用方要无隔离执行必须显式传 false。
+      requireSandbox: options.requireSandbox ?? true,
       clock,
       signal: options.signal,
       onEvent: options.onEvent,

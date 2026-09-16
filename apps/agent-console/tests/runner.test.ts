@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,9 +18,13 @@ import type {
 } from "../../../packages/agent-from-scratch-fixture/src/types.js";
 import { type RunChannel, RunHub } from "../server/bus.js";
 import {
+  CONSOLE_MAX_OPEN_RUNS_ENV,
+  cancelRefusal,
   clarificationMismatch,
   createConsoleRunner,
+  openRunRefusal,
   RunnerError,
+  readMaxOpenRuns,
   resolveAnswerKind,
   type StartRunInput,
 } from "../server/runner.js";
@@ -34,6 +39,7 @@ function startInput(overrides: Partial<StartRunInput> = {}): StartRunInput {
     maxSteps: 2,
     maxToolCalls: 2,
     approveAllowed: false,
+    // 离线测试不执行真命令；默认值仍与线上一致（要求隔离）。
     requireSandbox: false,
     repeatGuard: true,
     ...overrides,
@@ -571,4 +577,130 @@ describe("进程重启后继续一次等待中的运行（离线）", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+});
+
+/** 中止运行：没有可中止的东西时要给出不同的拒绝，而不是一律报"未知运行"。 */
+describe("中止运行（离线，假密钥 + 不可达 baseUrl）", () => {
+  it("没有活上下文 → 404；有上下文但没在执行 → 409；正在执行 → 放行", () => {
+    expect(cancelRefusal(undefined, "run-1")).toMatchObject({ status: 404 });
+    expect(cancelRefusal({ active: false }, "run-1")).toMatchObject({
+      status: 409,
+      message: expect.stringContaining("等待回答"),
+    });
+    expect(cancelRefusal({ active: true }, "run-1")).toBeUndefined();
+  });
+
+  it("中止正在执行的运行会真的把它停下来（abort 一路传到模型调用）", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-cancel-"));
+    try {
+      const hub = new RunHub();
+      const runner = createConsoleRunner({
+        env: {
+          DEEPSEEK_API_KEY: FAKE_KEY,
+          // 不可达：模型调用会卡在重试里，正好留出"运行中"的窗口。
+          DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1",
+        },
+        hub,
+        storeRoot: directory,
+      });
+
+      const { runId } = await runner.start(startInput());
+      const channel = hub.get(runId);
+      expect(channel).toBeDefined();
+      if (channel === undefined) return;
+
+      // 可能已经失败（极快）——那就没有可中止的运行，语义上等价于"已结束"。
+      const cancel = await runner.cancel(runId).then(
+        () => "ok" as const,
+        (error: unknown) => error,
+      );
+      if (cancel !== "ok") {
+        expect(cancel).toMatchObject({ status: expect.any(Number) });
+      }
+
+      await waitForDone(channel, 30_000);
+      expect(channel.done).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("硬上限写进 run_started 记录，重建运行时才拿得回来", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-caps-"));
+    try {
+      const runner = createConsoleRunner({
+        env: { DEEPSEEK_API_KEY: FAKE_KEY, DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1" },
+        hub: new RunHub(),
+        storeRoot: directory,
+      });
+
+      const { runId } = await runner.start(startInput({ maxCostUsd: 0.5, maxWallMs: 60_000 }));
+      const journal = await readFile(join(directory, runId, "journal.jsonl"), "utf8");
+      const meta = JSON.parse(journal.split("\n")[0] ?? "{}") as Record<string, unknown>;
+
+      expect(meta["budgets"]).toEqual({
+        maxSteps: 2,
+        maxToolCalls: 2,
+        maxCostUsd: 0.5,
+        maxWallMs: 60_000,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * 并发上限：一个进程同时打开多少运行。
+ *
+ * 上限按"打开的运行"计（运行中 + 等待回答），因为等待中的运行同样占着频道、journal
+ * 轮询与一份上下文；只数"正在跑"的保护是不够的。
+ */
+describe("同时打开的运行上限", () => {
+  it("边界判断：达到上限即拒绝，未配置上限则永不拒绝", () => {
+    expect(openRunRefusal(0, 2)).toBeUndefined();
+    expect(openRunRefusal(1, 2)).toBeUndefined();
+    expect(openRunRefusal(2, 2)).toMatchObject({ status: 429 });
+    expect(openRunRefusal(99, undefined)).toBeUndefined();
+  });
+
+  it("配置非法时直接报错，而不是静默退回不限", () => {
+    expect(readMaxOpenRuns({})).toBeUndefined();
+    expect(readMaxOpenRuns({ [CONSOLE_MAX_OPEN_RUNS_ENV]: "3" })).toBe(3);
+    expect(() => readMaxOpenRuns({ [CONSOLE_MAX_OPEN_RUNS_ENV]: "0" })).toThrow("正整数");
+    expect(() => readMaxOpenRuns({ [CONSOLE_MAX_OPEN_RUNS_ENV]: "abc" })).toThrow("正整数");
+  });
+
+  it("达到上限时 start 返回 429，而不会真的启动第二次运行", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-console-limit-"));
+    // 一个"永不回应"的本地模型端点：让第一次运行确定性地停留在运行中。
+    const server = createServer(() => undefined);
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("测试服务器没有端口");
+
+    try {
+      const hub = new RunHub();
+      const runner = createConsoleRunner({
+        env: {
+          DEEPSEEK_API_KEY: FAKE_KEY,
+          DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/v1`,
+        },
+        hub,
+        storeRoot: directory,
+        maxOpenRuns: 1,
+      });
+
+      const first = await runner.start(startInput());
+      await expect(runner.start(startInput())).rejects.toMatchObject({ status: 429 });
+
+      // 收尾：中止第一次运行，释放它的上下文。
+      await runner.cancel(first.runId).catch(() => undefined);
+      const channel = hub.get(first.runId);
+      if (channel !== undefined) await waitForDone(channel, 30_000).catch(() => undefined);
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 40_000);
 });

@@ -146,6 +146,105 @@ export const linuxBubblewrapSandbox: Sandbox = {
   },
 };
 
+/** 容器沙箱的环境变量：`AGENT_SANDBOX=docker` 或直接给镜像名。 */
+export const SANDBOX_KIND_ENV = "AGENT_SANDBOX";
+export const SANDBOX_IMAGE_ENV = "AGENT_SANDBOX_IMAGE";
+export const DOCKER_SANDBOX_DEFAULT_IMAGE = "node:24-bookworm-slim";
+export const DOCKER_SANDBOX_DEFAULT_MEMORY = "2g";
+export const DOCKER_SANDBOX_DEFAULT_CPUS = "2";
+export const DOCKER_SANDBOX_DEFAULT_PIDS = 512;
+
+export interface DockerSandboxOptions {
+  image?: string | undefined;
+  memory?: string | undefined;
+  cpus?: string | undefined;
+  pidsLimit?: number | undefined;
+  /** 只读根下的可写临时目录大小。 */
+  tmpfsSize?: string | undefined;
+  /** 探测 docker 是否可用；离线测试注入替身，默认真的去跑 `docker version`。 */
+  isDockerAvailable?: (() => Promise<boolean>) | undefined;
+}
+
+/**
+ * 纯函数：生成 `docker run` argv。
+ *
+ * 这是把"策略声明"变成"内核级事实"的一层：`--network none` 才是真的没网，
+ * `--read-only` + `-v workspace:rw` 才是真的只能写工作区，`--cap-drop ALL` +
+ * `no-new-privileges` 才让容器里的进程没法提权。配额（内存 / CPU / pids）是另一件事：
+ * 没有它，一条命令就能把宿主机拖垮。
+ *
+ * 命令与参数原样接在镜像之后，不经过任何 shell 拼接。
+ */
+export function buildDockerArgs(
+  input: SandboxCommand,
+  policy: SandboxPolicy,
+  options: DockerSandboxOptions = {},
+): string[] {
+  const image = options.image ?? DOCKER_SANDBOX_DEFAULT_IMAGE;
+  const cwd = input.cwd ?? policy.writableRoot;
+  const args: string[] = [
+    "run",
+    "--rm",
+    "--init",
+    "--network",
+    policy.network === "disabled" ? "none" : "bridge",
+    "--memory",
+    options.memory ?? DOCKER_SANDBOX_DEFAULT_MEMORY,
+    "--cpus",
+    options.cpus ?? DOCKER_SANDBOX_DEFAULT_CPUS,
+    "--pids-limit",
+    String(options.pidsLimit ?? DOCKER_SANDBOX_DEFAULT_PIDS),
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "--read-only",
+    "--tmpfs",
+    `/tmp:rw,noexec,nosuid,size=${options.tmpfsSize ?? "256m"}`,
+  ];
+
+  // 以宿主 uid/gid 运行：否则容器里写出来的文件属于 root，工作区会被搞得没法用。
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (uid !== undefined && gid !== undefined) args.push("--user", `${uid}:${gid}`);
+
+  args.push("-v", `${policy.writableRoot}:${policy.writableRoot}:rw`, "-w", cwd);
+  args.push(image, input.command, ...input.args);
+  return args;
+}
+
+async function dockerAvailable(): Promise<boolean> {
+  const { execFile } = await import("node:child_process");
+  return await new Promise<boolean>((resolve) => {
+    execFile(
+      "docker",
+      ["version", "--format", "{{.Server.Version}}"],
+      { timeout: 5_000 },
+      (error) => resolve(error === null),
+    );
+  });
+}
+
+/**
+ * 容器沙箱：把命令交给 `docker run`，用挂载与内核配额把副作用限制在工作区里。
+ *
+ * 它比 seatbelt / bubblewrap 更适合生产：镜像固定了工具链，配额由内核保证，
+ * 而且在 Linux 服务器与 CI 里都一致——不像 seatbelt 只在 macOS、bwrap 只在装了
+ * bubblewrap 的 Linux 上可用。
+ */
+export function createDockerSandbox(options: DockerSandboxOptions = {}): Sandbox {
+  return {
+    id: "docker",
+    guarantees: ["network-isolation", "filesystem-write-confinement"],
+    isAvailable: options.isDockerAvailable ?? dockerAvailable,
+    async wrap(input, policy) {
+      return { command: "docker", args: buildDockerArgs(input, policy, options) };
+    },
+  };
+}
+
+export const dockerSandbox: Sandbox = createDockerSandbox();
+
 /**
  * `noSandbox` **不提供任何隔离**：命令以当前用户的全部权限运行，
  * 只适用于已经可信的任务（例如仓库自己的测试）。需要执行不可信代码时，
@@ -162,8 +261,25 @@ export const noSandbox: Sandbox = {
   },
 };
 
-/** 按平台选择实现；**这里不探测可用性**，`isAvailable()` 由调用方 await。 */
-export function detectSandbox(platform: string = process.platform): Sandbox {
+/**
+ * 选择实现；**这里不探测可用性**，`isAvailable()` 由调用方 await。
+ *
+ * 优先级：`AGENT_SANDBOX` 显式指定 > `AGENT_SANDBOX_IMAGE`（给了镜像就是要容器）>
+ * 平台默认。无法识别的取值不猜，回落到平台默认。
+ */
+export function detectSandbox(
+  platform: string = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): Sandbox {
+  const requested = env[SANDBOX_KIND_ENV]?.trim();
+  if (requested === "docker") return dockerSandbox;
+  if (requested === "none") return noSandbox;
+  if (requested === "seatbelt") return macOsSeatbeltSandbox;
+  if (requested === "bubblewrap") return linuxBubblewrapSandbox;
+
+  const image = env[SANDBOX_IMAGE_ENV]?.trim();
+  if (image !== undefined && image.length > 0) return createDockerSandbox({ image });
+
   if (platform === "darwin") return macOsSeatbeltSandbox;
   if (platform === "linux") return linuxBubblewrapSandbox;
   return noSandbox;

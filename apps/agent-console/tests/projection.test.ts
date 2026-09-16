@@ -285,3 +285,49 @@ describe("deriveStopHint", () => {
     expect(deriveStopHint({ type: "something_else" })).toBeUndefined();
   });
 });
+
+/** 硬上限要能在界面上看见：预算条之外，成本与墙钟各有一条"已用 / 上限"。 */
+describe("预算视图里的硬上限", () => {
+  it("从 run_started 的 budgets 读回 maxCostUsd / maxWallMs", () => {
+    const records: JournalRecord[] = [
+      {
+        kind: "run_started",
+        at: "2024-01-01T00:00:00.000Z",
+        task: "任务",
+        cwd: "/workspace",
+        budgets: { maxSteps: 4, maxToolCalls: 8, maxCostUsd: 0.5, maxWallMs: 60_000 },
+        allowedArgv: [],
+        requireSandbox: false,
+      },
+      {
+        kind: "usage",
+        scope: "run",
+        modelCalls: 1,
+        toolCalls: 0,
+        inputTokens: 10,
+        outputTokens: 2,
+        wallMs: 1_000,
+        costUsd: 0.25,
+      },
+    ];
+
+    const view = projectRun("run-1", records);
+
+    expect(view.budget).toMatchObject({ maxCostUsd: 0.5, maxWallMs: 60_000 });
+  });
+
+  it("旧记录没有上限时视图里也不写这两个字段", () => {
+    const view = projectRun("run-1", [
+      {
+        kind: "run_started",
+        at: "2024-01-01T00:00:00.000Z",
+        budgets: { maxSteps: 4, maxToolCalls: 8 },
+        allowedArgv: [],
+        requireSandbox: false,
+      },
+    ]);
+
+    expect(Object.hasOwn(view.budget, "maxCostUsd")).toBe(false);
+    expect(Object.hasOwn(view.budget, "maxWallMs")).toBe(false);
+  });
+});

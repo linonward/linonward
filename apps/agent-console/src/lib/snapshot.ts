@@ -16,6 +16,10 @@ export interface SnapshotBudgetView {
   maxToolCalls?: number | undefined;
   modelSteps?: number | undefined;
   toolCalls?: number | undefined;
+  /** 花费上限（美元）：未设置即不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：未设置即不限制。 */
+  maxWallMs?: number | undefined;
 }
 
 export interface SnapshotUsageView {
@@ -48,6 +52,8 @@ export interface RunSnapshotView {
   changedFiles: string[];
   plan?: unknown;
   pending?: SnapshotPendingView | undefined;
+  /** 这个运行此刻是否正在执行（决定"中止运行"是否可用）。 */
+  cancellable?: boolean | undefined;
 }
 
 function readOptionalString(record: Record<string, unknown>, key: string): string | undefined {
@@ -71,6 +77,10 @@ function parseBudget(value: unknown): SnapshotBudgetView {
   if (modelSteps !== undefined) budget.modelSteps = modelSteps;
   const toolCalls = readOptionalNumber(value, "toolCalls");
   if (toolCalls !== undefined) budget.toolCalls = toolCalls;
+  const maxCostUsd = readOptionalNumber(value, "maxCostUsd");
+  if (maxCostUsd !== undefined) budget.maxCostUsd = maxCostUsd;
+  const maxWallMs = readOptionalNumber(value, "maxWallMs");
+  if (maxWallMs !== undefined) budget.maxWallMs = maxWallMs;
   return budget;
 }
 
@@ -149,6 +159,7 @@ export function parseRunSnapshot(value: unknown): RunSnapshotView | undefined {
   if (stopReason !== undefined) view.stopReason = stopReason;
   const usage = parseUsage(value["usage"]);
   if (usage !== undefined) view.usage = usage;
+  if (value["cancellable"] === true) view.cancellable = true;
   if (Object.hasOwn(value, "plan")) view.plan = value["plan"];
   const pending = parsePending(value["pending"]);
   if (pending !== undefined) view.pending = pending;

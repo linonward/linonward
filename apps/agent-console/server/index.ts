@@ -1,23 +1,23 @@
 import { createServer } from "node:http";
 
+import {
+  DAY_MS,
+  parseRetentionDays,
+  pruneRuns,
+} from "../../../packages/agent-from-scratch-fixture/src/retention.js";
+import { detectSandbox } from "../../../packages/agent-from-scratch-fixture/src/sandbox.js";
 import { RunHub } from "./bus.js";
-import { createRequestHandler, DEFAULT_API_PORT } from "./router.js";
+import { readHost, readPort, startupRefusal } from "./entry-options.js";
+import { createRequestHandler } from "./router.js";
 import { createConsoleRunner } from "./runner.js";
 
-/**
- * 本地 API 服务入口（用 `tsx` 跑）：`node --env-file-if-exists=.env --import tsx server/index.ts`。
- *
- * 只监听 `127.0.0.1`；密钥只在 `process.env` / `.env` 里读，既不写入日志也不出现在响应里。
- */
-function readPort(env: NodeJS.ProcessEnv): number {
-  const raw = env["AGENT_CONSOLE_API_PORT"];
-  if (raw === undefined || raw.length === 0) return DEFAULT_API_PORT;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_API_PORT;
-}
-
-const host = "127.0.0.1";
+const host = readHost(process.env);
 const port = readPort(process.env);
+const refusal = startupRefusal({ host, token: process.env["AGENT_CONSOLE_TOKEN"] });
+if (refusal !== undefined) {
+  process.stderr.write(`${refusal}\n`);
+  process.exit(1);
+}
 const hub = new RunHub();
 const runner = createConsoleRunner({ env: process.env, hub });
 const handle = createRequestHandler({ runner, hub, env: process.env });
@@ -36,8 +36,26 @@ const server = createServer((request, response) => {
   });
 });
 
+// 保留策略：缺省不清理（本地工具），设了 AGENT_RETENTION_DAYS 就按天数在启动时清一次。
+const retentionDays = parseRetentionDays(process.env);
+const storeRoot = process.env["AGENT_STORE_ROOT"];
+if (retentionDays !== undefined && storeRoot !== undefined && storeRoot.length > 0) {
+  void pruneRuns(storeRoot, { maxAgeMs: retentionDays * DAY_MS }).then((result) => {
+    process.stdout.write(
+      `保留策略：${retentionDays} 天，清理 ${result.removed.length} 个运行，保留 ${result.kept} 个\n`,
+    );
+  });
+}
+
 server.listen(port, host, () => {
   const keyState = process.env["DEEPSEEK_API_KEY"] ? "已配置" : "未配置（/api/run 会返回 4xx）";
+  // 默认要求隔离：先把"这台机器上能用什么沙箱"说清楚，避免第一条 run_command 才让人发现。
+  const sandbox = detectSandbox(process.platform, process.env);
+  void sandbox.isAvailable().then((available) => {
+    process.stdout.write(
+      `沙箱：${sandbox.id}（${available ? "可用" : "不可用 —— requireSandbox 默认开启，命令会被拒绝执行"}）\n`,
+    );
+  });
   process.stdout.write(
     [
       `agent-console API 监听 http://${host}:${port}`,
@@ -47,6 +65,8 @@ server.listen(port, host, () => {
       `GET  /api/runs`,
       `GET  /api/runs/:runId/stream`,
       `GET  /api/runs/:runId`,
+      `POST /api/runs/:runId/cancel`,
+      `访问令牌：${(process.env["AGENT_CONSOLE_TOKEN"] ?? "").trim().length === 0 ? "未设置（仅本机可信环境）" : "已设置"}`,
       `POST /api/runs/:runId/answer`,
       "",
     ].join("\n"),

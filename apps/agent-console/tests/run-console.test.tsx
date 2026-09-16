@@ -116,6 +116,7 @@ describe("RunConsole 渲染", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -163,6 +164,7 @@ describe("RunConsole 渲染", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -210,6 +212,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -236,6 +239,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -257,6 +261,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -285,6 +290,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -305,6 +311,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -322,6 +329,7 @@ describe("RunConsole 的 checkpoint 快照面板", () => {
         onStop={noop}
         onAnswer={noop}
         onNew={noop}
+        onCancel={noop}
       />,
     );
 
@@ -362,5 +370,43 @@ describe("RunList 渲染", () => {
     const html = renderToStaticMarkup(<RunList runs={[]} onOpen={noop} />);
 
     expect(html).toBe("");
+  });
+});
+
+describe("中止运行按钮", () => {
+  const cancelled = { ...snapshot({ status: "running", pending: undefined }), cancellable: true };
+
+  it("服务端说运行正在执行时可点，等待回答时禁用并说明原因", () => {
+    const running = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", records())}
+        streaming
+        paused={false}
+        snapshot={cancelled}
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+        onCancel={noop}
+      />,
+    );
+    expect(running).toContain("中止运行");
+    expect(running).not.toContain('disabled="" data-testid="cancel"');
+
+    // 停在等待回答：没有正在跑的任务，按钮必须禁用。
+    const waiting = renderToStaticMarkup(
+      <RunConsole
+        view={projectRun("run-1", records())}
+        streaming={false}
+        paused={false}
+        snapshot={snapshot({ status: "waiting", cancellable: false })}
+        onTogglePause={noop}
+        onStop={noop}
+        onAnswer={noop}
+        onNew={noop}
+        onCancel={noop}
+      />,
+    );
+    expect(waiting).toContain("中止运行");
   });
 });

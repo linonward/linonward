@@ -5,6 +5,8 @@ import { type SandboxPolicy, wrapWithSandbox } from "../sandbox.js";
 import { defineTool, type ToolContext } from "../tool.js";
 
 export const RUN_COMMAND_TIMEOUT_MS = 60_000;
+/** 取消后给进程组多久的体面退出时间，超时即 SIGKILL。 */
+export const RUN_COMMAND_KILL_GRACE_MS = 2_000;
 export const RUN_COMMAND_MAX_OUTPUT_CHARACTERS = 20_000;
 
 export const runCommandInputSchema = z
@@ -68,10 +70,42 @@ export const runCommandTool = defineTool({
     const startedAt = Date.now();
     const timeout = AbortSignal.timeout(RUN_COMMAND_TIMEOUT_MS);
     const signal = AbortSignal.any([context.signal, timeout]);
+    // `detached: true` 让子进程自成进程组：`node -e` / `pnpm` 还会再 spawn 子进程，
+    // 只杀直接子进程会把孙进程留成孤儿。这里显式对**整组**发信号。
     const child = spawn(wrapped.command, wrapped.args, {
       cwd: context.cwd,
       shell: false,
-      signal,
+      detached: true,
+    });
+
+    const killGroup = (killSignal: NodeJS.Signals): void => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      try {
+        // 负 pid 即"整个进程组"；组已经退出时抛 ESRCH，属正常情况。
+        process.kill(-pid, killSignal);
+      } catch {
+        try {
+          child.kill(killSignal);
+        } catch {
+          // 已经退出。
+        }
+      }
+    };
+
+    let killTimer: NodeJS.Timeout | undefined;
+    const onAbort = (): void => {
+      killGroup("SIGTERM");
+      // 宽限期后强杀：SIGTERM 被忽略（或子进程正卡在写盘）时也能收干净。
+      killTimer = setTimeout(() => killGroup("SIGKILL"), RUN_COMMAND_KILL_GRACE_MS);
+      killTimer.unref();
+    };
+
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    child.once("close", () => {
+      signal.removeEventListener("abort", onAbort);
+      if (killTimer !== undefined) clearTimeout(killTimer);
     });
 
     let stdout = "";

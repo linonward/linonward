@@ -27,6 +27,7 @@ import {
   loopOptionsFromRuntime,
   restoreRun,
   resumeAgentRun,
+  type ToolStateVerifier,
   toDurableState,
 } from "./recovery.js";
 import { createRunCheckpoint, type RunStore } from "./run-store.js";
@@ -296,9 +297,18 @@ export interface AgentCliOptions {
   sandbox?: Sandbox | undefined;
   /** 显式要求隔离：`true` 时没有可用沙箱就拒绝执行。 */
   requireSandbox?: boolean | undefined;
+  /**
+   * 崩溃恢复的对账器：工具名 → 判定"在途调用是否已生效"。
+   * 只影响 `resume` / `answer` 的恢复路径（首次运行不需要它）。
+   */
+  verifiers?: Record<string, ToolStateVerifier> | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
+  /** 花费上限（美元）：缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：缺省不限制。 */
+  maxWallMs?: number | undefined;
   /** 完整日志的工具钩子；由装配层接到 journal。 */
   onToolCall?: AgentLoopOptions["onToolCall"];
   /** 成本估算接线；由装配层从模型 id + 价目表解析。 */
@@ -322,6 +332,7 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     writeLease: base.writeLease ?? new InMemoryWriteLease(),
     sandbox: base.sandbox,
     requireSandbox: base.requireSandbox,
+    verifiers: base.verifiers,
     validationSpecs: base.validationSpecs,
     signal: input.signal,
     onEvent: input.onEvent,
@@ -346,6 +357,8 @@ export function createAgentCliRuntime(
         const state = createInitialState(task, options.cwd, {
           maxSteps: options.maxSteps ?? 12,
           maxToolCalls: options.maxToolCalls ?? 24,
+          ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+          ...(options.maxWallMs !== undefined ? { maxWallMs: options.maxWallMs } : {}),
         });
         const lease = await options.store.acquireLease(state.runId, randomUUID(), CLI_LEASE_TTL_MS);
 

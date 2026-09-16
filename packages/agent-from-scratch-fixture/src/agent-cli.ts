@@ -37,6 +37,7 @@ import {
 import { detectSandbox } from "./sandbox.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { Clock } from "./types.js";
+import { createRealTaskVerifiers } from "./verifiers.js";
 
 export const AGENT_USAGE =
   "usage: agent run <task> | agent resume <run-id> | agent answer <run-id> <request-id> <text> [--cwd <dir>] [--allow <command> [args...]] [--require-sandbox] [--approve-allowed] [--max-steps <n>] [--max-tool-calls <n>] [--verbose] [--log <path>] [--no-truncate] [--no-repeat-guard]";
@@ -47,9 +48,16 @@ export const AGENT_DEFAULT_MAX_TOOL_CALLS = REAL_TASK_DEFAULT_MAX_TOOL_CALLS;
 
 const ALLOW_FLAG = "--allow";
 const CWD_FLAG = "--cwd";
+/**
+ * 默认就要隔离：`--require-sandbox` 只是显式重申默认值，`--allow-unsandboxed`
+ * 才是那个"我知道我在做什么"的例外（本机可信环境、或者 CI 里本来就没有沙箱）。
+ */
 const REQUIRE_SANDBOX_FLAG = "--require-sandbox";
+const ALLOW_UNSANDBOXED_FLAG = "--allow-unsandboxed";
 const APPROVE_ALLOWED_FLAG = "--approve-allowed";
 const MAX_STEPS_FLAG = "--max-steps";
+const MAX_COST_USD_FLAG = "--max-cost-usd";
+const MAX_WALL_MS_FLAG = "--max-wall-ms";
 const MAX_TOOL_CALLS_FLAG = "--max-tool-calls";
 const VERBOSE_FLAG = "--verbose";
 const LOG_FLAG = "--log";
@@ -61,9 +69,12 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   ALLOW_FLAG,
   CWD_FLAG,
   REQUIRE_SANDBOX_FLAG,
+  ALLOW_UNSANDBOXED_FLAG,
   APPROVE_ALLOWED_FLAG,
   MAX_STEPS_FLAG,
   MAX_TOOL_CALLS_FLAG,
+  MAX_COST_USD_FLAG,
+  MAX_WALL_MS_FLAG,
   VERBOSE_FLAG,
   LOG_FLAG,
   NO_TRUNCATE_FLAG,
@@ -82,6 +93,15 @@ function positiveInteger(flag: string, value: string): number {
   return parsed;
 }
 
+/** 正数（允许小数）：金额用，`0` 与负数都没有意义。 */
+function positiveNumber(flag: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw usageError(`${flag} 需要一个正数，收到：${value}`);
+  }
+  return parsed;
+}
+
 export interface AgentCliConfig {
   cwd: string;
   allowedArgv: string[][];
@@ -89,6 +109,10 @@ export interface AgentCliConfig {
   autoApproveAllowedCommands: boolean;
   maxSteps: number;
   maxToolCalls: number;
+  /** 花费上限（美元）。缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）。缺省不限制。 */
+  maxWallMs?: number | undefined;
   /** 默认关闭：打开后只在 stderr 上追加有界详情，stdout 仍只有最终答案。 */
   verbose: boolean;
   /** `--log <path>`：把同一条完整日志以 JSONL 追加写入文件。只在 `--verbose` 打开时生效。 */
@@ -115,9 +139,11 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   const positionals: string[] = [];
   const allowedArgv: string[][] = [];
   let cwd: string | undefined;
-  let requireSandbox = false;
+  let requireSandbox = true;
   let autoApproveAllowedCommands = false;
   let maxSteps = AGENT_DEFAULT_MAX_STEPS;
+  let maxCostUsd: number | undefined;
+  let maxWallMs: number | undefined;
   let maxToolCalls = AGENT_DEFAULT_MAX_TOOL_CALLS;
   let verbose = false;
   let logPath: string | undefined;
@@ -165,8 +191,33 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       continue;
     }
 
+    if (token === MAX_COST_USD_FLAG) {
+      const value = argv[index];
+      if (value === undefined || KNOWN_FLAGS.has(value)) {
+        throw usageError(`${MAX_COST_USD_FLAG} 需要一个正数（美元）`);
+      }
+      index += 1;
+      maxCostUsd = positiveNumber(MAX_COST_USD_FLAG, value);
+      continue;
+    }
+
+    if (token === MAX_WALL_MS_FLAG) {
+      const value = argv[index];
+      if (value === undefined || KNOWN_FLAGS.has(value)) {
+        throw usageError(`${MAX_WALL_MS_FLAG} 需要一个正整数（毫秒）`);
+      }
+      index += 1;
+      maxWallMs = positiveInteger(MAX_WALL_MS_FLAG, value);
+      continue;
+    }
+
     if (token === REQUIRE_SANDBOX_FLAG) {
       requireSandbox = true;
+      continue;
+    }
+
+    if (token === ALLOW_UNSANDBOXED_FLAG) {
+      requireSandbox = false;
       continue;
     }
 
@@ -219,6 +270,8 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
       autoApproveAllowedCommands,
       maxSteps,
       maxToolCalls,
+      ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+      ...(maxWallMs !== undefined ? { maxWallMs } : {}),
       verbose,
       logPath,
       noTruncate,
@@ -354,9 +407,13 @@ function createRuntimeFactory(
       approvals,
       sandbox: detectSandbox(),
       requireSandbox: wiring.config.requireSandbox,
+      // 崩溃恢复的自动对账：没有它，一次进程重启后每个在途调用都要人工回答。
+      verifiers: createRealTaskVerifiers(),
       maxSteps: wiring.config.maxSteps,
       maxToolCalls: wiring.config.maxToolCalls,
       pricing: wiring.pricing,
+      ...(wiring.config.maxCostUsd !== undefined ? { maxCostUsd: wiring.config.maxCostUsd } : {}),
+      ...(wiring.config.maxWallMs !== undefined ? { maxWallMs: wiring.config.maxWallMs } : {}),
       repeatGuard: wiring.config.repeatGuard,
     };
     if (wiring.clock !== undefined) options.clock = wiring.clock;
@@ -440,11 +497,16 @@ export async function createDeepSeekAgentCli(
     // 缺 key 的异常必须直接冒泡（由 scripts/agent.ts 打印），因此 wiring 先于 journal 解析。
     const realWiring = runtimeOverride === undefined ? resolveWiring() : undefined;
 
+    // 形状兜底由 journal 自带；这里再叠一层"环境里真正配过的密钥"。
+    const secrets = [env["DEEPSEEK_API_KEY"]].flatMap((secret) =>
+      secret === undefined || secret.length === 0 ? [] : [secret],
+    );
     const journal = createJournal({
       verbose: parsed.config.verbose,
       logPath: parsed.config.logPath,
       truncate: !parsed.config.noTruncate,
       write: (line) => io.stderr(line),
+      redact: (line) => secrets.reduce((text, secret) => text.split(secret).join("***"), line),
     });
 
     try {
@@ -452,7 +514,14 @@ export async function createDeepSeekAgentCli(
         command: parsed.command.command,
         task: parsed.command.command === "run" ? parsed.command.task : undefined,
         cwd: parsed.config.cwd,
-        budgets: { maxSteps: parsed.config.maxSteps, maxToolCalls: parsed.config.maxToolCalls },
+        budgets: {
+          maxSteps: parsed.config.maxSteps,
+          maxToolCalls: parsed.config.maxToolCalls,
+          ...(parsed.config.maxCostUsd !== undefined
+            ? { maxCostUsd: parsed.config.maxCostUsd }
+            : {}),
+          ...(parsed.config.maxWallMs !== undefined ? { maxWallMs: parsed.config.maxWallMs } : {}),
+        },
         allowedArgv: parsed.config.allowedArgv,
         requireSandbox: parsed.config.requireSandbox,
         modelId: realWiring?.modelId,
