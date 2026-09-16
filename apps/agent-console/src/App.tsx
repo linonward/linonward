@@ -7,8 +7,11 @@ import {
   listRuns,
   openRunStream,
   type RunFormValues,
+  readStoredToken,
   sendAnswer,
   startRun,
+  startSession,
+  storeToken,
 } from "./lib/api.js";
 import { messageOf } from "./lib/format.js";
 import { type JournalRecord, projectRun } from "./lib/journal.js";
@@ -37,6 +40,9 @@ export function App(): ReactElement {
   /** 实时流已经拿不到（API 进程重启 / 频道被挤出缓冲）——界面改说快照。 */
   const [streamUnavailable, setStreamUnavailable] = useState(false);
   const [runs, setRuns] = useState<RunSummaryView[]>([]);
+  const [token, setToken] = useState<string | undefined>(undefined);
+  /** 服务端是否要求令牌（由 `/api/session` 告知）。 */
+  const [tokenRequired, setTokenRequired] = useState(false);
   const closeRef = useRef<(() => void) | undefined>(undefined);
   /** 已收到的最后一条记录序号：重连时用它做 `after`，历史记录不会重复渲染。 */
   const lastSeqRef = useRef(0);
@@ -132,13 +138,31 @@ export function App(): ReactElement {
     [connect, writeUrl],
   );
 
-  // 首屏：地址栏里有 `?run=` 就恢复它（刷新、从链接进入都走这条路）。
+  /** 建会话：带令牌就换成 cookie；服务端没配令牌时什么都不用做。 */
+  const establishSession = useCallback(
+    (candidate: string | undefined): void => {
+      startSession(candidate)
+        .then(({ required }) => {
+          setTokenRequired(required);
+          setError(undefined);
+          refreshRuns();
+        })
+        .catch((cause: unknown) => {
+          setError(messageOf(cause));
+        });
+    },
+    [refreshRuns],
+  );
+
+  // 首屏：先用已保存的令牌建会话，再按 `?run=` 恢复运行。
   useEffect(() => {
     if (typeof window === "undefined") return;
+    const stored = readStoredToken();
+    setToken(stored);
+    establishSession(stored);
     const restored = readRunId(window.location.search);
     if (restored !== undefined) open(restored);
-    refreshRuns();
-  }, [open, refreshRuns]);
+  }, [establishSession, open]);
 
   const handleSubmit = (values: RunFormValues): void => {
     setPhase("starting");
@@ -210,6 +234,27 @@ export function App(): ReactElement {
           计划变化、用量与成本。密钥只存在于本地 API 服务进程里，页面与日志都不会出现它。
         </p>
       </header>
+
+      <form
+        className="token-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          storeToken(token);
+          establishSession(token);
+        }}
+      >
+        <label className="field">
+          <span>访问令牌（服务端设置 AGENT_CONSOLE_TOKEN 时必填）</span>
+          <input
+            name="token"
+            type="password"
+            value={token ?? ""}
+            placeholder={tokenRequired ? "必填" : "未启用"}
+            onChange={(event) => setToken(event.target.value)}
+          />
+        </label>
+        <button type="submit">保存并建立会话</button>
+      </form>
 
       <RunForm busy={phase === "starting" || phase === "streaming"} onSubmit={handleSubmit} />
 

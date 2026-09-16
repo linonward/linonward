@@ -51,6 +51,22 @@ function tokenMatches(provided: string, expected: string): boolean {
   return timingSafeEqual(left, right);
 }
 
+/** 会话 cookie：浏览器侧 `EventSource` 不能自定义请求头，因此必须有一条"自动带上"的路。 */
+export const SESSION_COOKIE = "agent_console_session";
+
+function readCookie(request: IncomingMessage, name: string): string | undefined {
+  const raw = request.headers.cookie;
+  if (typeof raw !== "string" || raw.length === 0) return undefined;
+  for (const part of raw.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) {
+      const value = rest.join("=").trim();
+      if (value.length > 0) return value;
+    }
+  }
+  return undefined;
+}
+
 function readProvidedToken(request: IncomingMessage): string | undefined {
   const header = request.headers.authorization;
   if (typeof header === "string" && header.startsWith("Bearer ")) {
@@ -59,7 +75,7 @@ function readProvidedToken(request: IncomingMessage): string | undefined {
   }
   const custom = request.headers["x-agent-console-token"];
   if (typeof custom === "string" && custom.length > 0) return custom;
-  return undefined;
+  return readCookie(request, SESSION_COOKIE);
 }
 /** 请求体上限：本地工具，1MB 足够放下一段任务描述与白名单。 */
 export const MAX_BODY_BYTES = 1_000_000;
@@ -71,13 +87,15 @@ export type RouteMatch =
   | { name: "stream"; runId: string }
   | { name: "snapshot"; runId: string }
   | { name: "answer"; runId: string }
-  | { name: "cancel"; runId: string };
+  | { name: "cancel"; runId: string }
+  | { name: "session" };
 
 /** 纯路由匹配：只做方法与路径的判断，方便离线单测。 */
 export function matchRoute(method: string, pathname: string): RouteMatch | undefined {
   if (method === "GET" && pathname === "/api/health") return { name: "health" };
   if (method === "GET" && pathname === "/api/runs") return { name: "runs" };
   if (method === "POST" && pathname === "/api/run") return { name: "start" };
+  if (method === "POST" && pathname === "/api/session") return { name: "session" };
 
   const match = /^\/api\/runs\/([^/]+)(\/stream|\/answer|\/cancel)?$/.exec(pathname);
   if (match === null) return undefined;
@@ -343,7 +361,8 @@ export function createRequestHandler(
       const provided = token === undefined ? undefined : readProvidedToken(request);
       const authorized =
         token === undefined || (provided !== undefined && tokenMatches(provided, token));
-      if (!authorized && route.name !== "health") {
+      // 会话建立本身就是"用令牌换 cookie"，因此它自己不能要求已经授权。
+      if (!authorized && route.name !== "health" && route.name !== "session") {
         sendJson(response, 401, { error: "缺少或错误的访问令牌" });
         return;
       }
@@ -383,6 +402,25 @@ export function createRequestHandler(
             return;
           }
           sendJson(response, 200, snapshot);
+          return;
+        }
+        case "session": {
+          if (token === undefined) {
+            sendJson(response, 200, { ok: true, required: false });
+            return;
+          }
+          const body = await readJsonBody(request);
+          const providedToken = isPlainObject(body) ? readString(body, "token")?.trim() : undefined;
+          if (providedToken === undefined || !tokenMatches(providedToken, token)) {
+            sendJson(response, 401, { error: "缺少或错误的访问令牌" });
+            return;
+          }
+          // HttpOnly：页面脚本读不到它；SameSite=Strict：不会被跨站请求带上。
+          response.setHeader(
+            "set-cookie",
+            `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/api`,
+          );
+          sendJson(response, 200, { ok: true, required: true });
           return;
         }
         case "cancel": {

@@ -14,6 +14,49 @@ import {
   type RunSummaryView,
 } from "./snapshot.js";
 
+/** 浏览器侧保存访问令牌的键：只放在 sessionStorage，关掉标签页就没了。 */
+export const TOKEN_STORAGE_KEY = "agentConsoleToken";
+
+/** 读出已保存的令牌（没有 sessionStorage 时返回 undefined，便于 SSR / 测试）。 */
+export function readStoredToken(): string | undefined {
+  try {
+    const value = globalThis.sessionStorage?.getItem(TOKEN_STORAGE_KEY)?.trim();
+    return value === undefined || value.length === 0 ? undefined : value;
+  } catch {
+    return undefined;
+  }
+}
+
+export function storeToken(token: string | undefined): void {
+  try {
+    if (token === undefined || token.trim().length === 0) {
+      globalThis.sessionStorage?.removeItem(TOKEN_STORAGE_KEY);
+      return;
+    }
+    globalThis.sessionStorage?.setItem(TOKEN_STORAGE_KEY, token.trim());
+  } catch {
+    // 隐私模式等场景下 sessionStorage 不可用：不因此让界面崩掉。
+  }
+}
+
+/**
+ * 建立会话：把令牌换成 HttpOnly cookie。
+ *
+ * 浏览器侧 `EventSource` 不能自定义请求头，所以"每个请求都带 Authorization"这条路走不通——
+ * 拿 cookie 之后，SSE 也会自动带上。返回 `required: false` 表示服务端根本没配令牌。
+ */
+export async function startSession(token: string | undefined): Promise<{ required: boolean }> {
+  const response = await fetch("/api/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(token === undefined ? {} : { token }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const body: unknown = await response.json();
+  const required = isPlainObject(body) && body["required"] === true;
+  return { required };
+}
+
 export interface RunFormValues {
   task: string;
   cwd: string;

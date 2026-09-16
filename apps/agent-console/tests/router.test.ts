@@ -473,6 +473,50 @@ describe("访问令牌", () => {
     );
   });
 
+  it("用令牌换会话 cookie：浏览器不能给 EventSource 加请求头，所以需要这条路", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_TOKEN },
+      async (base) => {
+        const wrong = await fetch(`${base}/api/session`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: "nope" }),
+        });
+        expect(wrong.status).toBe(401);
+
+        const ok = await fetch(`${base}/api/session`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: "s3cret-token" }),
+        });
+        expect(ok.status).toBe(200);
+        const cookie = ok.headers.get("set-cookie") ?? "";
+        expect(cookie).toContain("agent_console_session=");
+        expect(cookie).toContain("HttpOnly");
+        expect(cookie).toContain("SameSite=Strict");
+
+        // 之后带着 cookie 的请求（含 SSE）就算通过鉴权。
+        const authed = await fetch(`${base}/api/runs`, {
+          headers: { cookie: "agent_console_session=s3cret-token" },
+        });
+        expect(authed.status).toBe(200);
+      },
+    );
+  });
+
+  it("没配令牌时会话接口直接放行，不要求填令牌", async () => {
+    const fake = createFakeRunner();
+    await withServer(
+      { runner: fake.runner, hub: new RunHub(), env: ENV_WITH_KEY },
+      async (base) => {
+        const response = await fetch(`${base}/api/session`, { method: "POST" });
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ ok: true, required: false });
+      },
+    );
+  });
+
   it("错误响应里不会回显令牌本身", async () => {
     const fake = createFakeRunner();
     await withServer(

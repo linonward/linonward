@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { readHost, readPort, startupRefusal } from "../server/entry-options.js";
 import { secretValues } from "../server/redact.js";
+import { readStoredToken, startSession, storeToken } from "../src/lib/api.js";
 
 /**
  * 启动守卫与脱敏都属于"不该出错"的一类：前者决定这个能执行命令的接口是否暴露给网络，
@@ -41,5 +42,42 @@ describe("令牌脱敏", () => {
     ]);
     expect(secretValues({})).toEqual([]);
     expect(secretValues({ AGENT_CONSOLE_TOKEN: "" })).toEqual([]);
+  });
+});
+
+describe("浏览器侧的令牌会话", () => {
+  it("会话接口的判定：required 只在服务端真的配了令牌时为 true", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ ok: true, required: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const original = globalThis.fetch;
+    globalThis.fetch = fakeFetch;
+    try {
+      await expect(startSession("tok")).resolves.toEqual({ required: true });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("令牌缺失/错误时抛出可读错误，而不是静默失败", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ error: "缺少或错误的访问令牌" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const original = globalThis.fetch;
+    globalThis.fetch = fakeFetch;
+    try {
+      await expect(startSession("wrong")).rejects.toThrow("缺少或错误的访问令牌");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("没有 sessionStorage 时读写令牌都不抛错（SSR / 测试环境）", () => {
+    expect(readStoredToken()).toBeUndefined();
+    expect(() => storeToken("tok")).not.toThrow();
   });
 });
