@@ -139,7 +139,7 @@ describe("createConsoleRunner（离线，假密钥 + 不可达 baseUrl）", () =
     }
   });
 
-  it("运行失败也会走完 journal → 总线，并把 run_stopped 推给订阅者（密钥不外泄）", async () => {
+  it("计划创建失败也走完 journal → 总线，并把失败的 checkpoint 暴露给快照（密钥不外泄）", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-console-runner-"));
     try {
       const hub = new RunHub();
@@ -177,8 +177,11 @@ describe("createConsoleRunner（离线，假密钥 + 不可达 baseUrl）", () =
       expect(journal).toContain('"kind":"run_started"');
       expect(journal).not.toContain(FAKE_KEY);
 
-      // 运行失败太早时没有 checkpoint：快照返回 undefined 而不是崩掉。
-      await expect(runner.snapshot(runId)).resolves.toBeUndefined();
+      // 计划创建失败也必须有 checkpoint：否则这次运行在列表与快照里都不存在，
+      // 而它恰恰是最需要复盘的一类失败（不可达的 base URL 让 planner 调用失败）。
+      const snapshot = await runner.snapshot(runId);
+      expect(snapshot?.status).toBe("failed");
+      expect(snapshot?.stopReason).toBe("plan_error");
       await expect(runner.snapshot("does-not-exist")).resolves.toBeUndefined();
     } finally {
       await rm(directory, { recursive: true, force: true });

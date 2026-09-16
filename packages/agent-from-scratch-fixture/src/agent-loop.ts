@@ -395,8 +395,6 @@ function createDurableWriter(input: {
     async checkpoint(now) {
       if (!persistence) return true;
       if (!initialized) await initialize();
-      // 还没生成计划就没有可持久化的权威状态，恢复链路由后续边界接管。
-      if (!state.plan) return true;
       try {
         await persistence.store.saveCheckpoint(
           createRunCheckpoint({
@@ -1145,16 +1143,84 @@ export async function runAgentLoop(task: string, options: AgentLoopOptions): Pro
     { now: options.clock?.now() ?? new Date(), runId: options.runId },
   );
 
-  state.skills.catalog = await discoverSkills(options.skillsDirectory);
-  state.plan = await createInitialPlan(
-    task,
-    summarizeSources(state.contextSources),
-    options.tools.names(),
-    options.planner,
-  );
-  state.requiredCriterionIds = state.plan.acceptanceCriteria.map((criterion) => criterion.id);
+  // 用量累加器与 LoopContext 在这里就建好：初始计划也是一次真实的模型调用，
+  // 失败时必须能用同一个 context 写出检查点（见 `stopForPlanError`）。
+  const usage = createUsageTracker(options, state);
+  try {
+    return await runNewLoop(state, options, createLoopContext(options, usage));
+  } finally {
+    usage.finish();
+  }
+}
 
-  return runAgentLoopFromState(state, options);
+/**
+ * 新建运行的规划阶段 + 主循环。
+ *
+ * 规划失败是本函数唯一在"第一次落盘之前"就可能抛错的环节，因此这里把它收敛成一次
+ * 可持久化的失败停止，而不是让异常穿透到调用方——穿透会让这次运行在磁盘上不存在。
+ */
+async function runNewLoop(
+  state: AgentState,
+  options: AgentLoopOptions,
+  context: LoopContext,
+): Promise<AgentResult> {
+  // `run_started` 先于规划：它是一次真实的模型调用，失败时那次失败也该留下完整的日志
+  // （`run_started → plan_error → run_stopped`），而不是只剩一条没有起点的停止事件。
+  context.emit(state, { type: "run_started", runId: state.runId });
+  if (context.options.persistence) {
+    // store 为空时先落盘 `run_started`，否则事件日志缺少开头——计划失败时尤其明显。
+    if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
+      return interruptedResult(state);
+    }
+  }
+
+  let plan: TaskPlan;
+  try {
+    state.skills.catalog = await discoverSkills(options.skillsDirectory);
+    plan = await createInitialPlan(
+      state.task,
+      summarizeSources(state.contextSources),
+      options.tools.names(),
+      options.planner,
+    );
+  } catch (error) {
+    return stopForPlanError(state, context, error);
+  }
+
+  state.plan = plan;
+  state.requiredCriterionIds = plan.acceptanceCriteria.map((criterion) => criterion.id);
+
+  // `run_started` 已由本函数发出，主循环不再重复。
+  return runLoopFromState(state, options, {}, context, false);
+}
+
+/**
+ * 初始计划创建失败的统一出口：转成 `failed` 状态，落 `run_stopped` 事件与检查点。
+ *
+ * 与 `finishStop` 的差别只有一个：此时 `state.plan` 可能还不存在（规划本身失败），
+ * 因此状态转移不能依赖计划。持久化失败时不抛出——调用方已经拿到一个明确的失败结果。
+ */
+async function stopForPlanError(
+  state: AgentState,
+  context: LoopContext,
+  error: unknown,
+): Promise<AgentResult> {
+  const reason = error instanceof Error ? error.message : String(error);
+  context.persistRuntime(state, "plan_error", reason);
+
+  const stopped = transitionState(state, "failed", "plan_error", context.now());
+  stopped.failedAttempts.push(reason);
+  context.emit(stopped, { type: "run_stopped", reason: "plan_error" });
+
+  try {
+    if (await context.persist(stopped, { type: "run_stopped", reason: "plan_error" })) {
+      await context.checkpoint(stopped, context.now());
+    }
+  } catch {
+    // 持久化围栏不可用时保持内存结果：运行仍然是 `failed`，只是没有磁盘痕迹。
+  }
+
+  return { status: "failed", answer: "", stopReason: "plan_error", state: stopped };
 }
 
 /**
@@ -1175,7 +1241,7 @@ export async function runAgentLoopFromState(
 ): Promise<AgentResult> {
   const usage = createUsageTracker(options, state);
   try {
-    return await runLoopFromState(state, options, resume, usage);
+    return await runLoopFromState(state, options, resume, createLoopContext(options, usage));
   } finally {
     usage.finish();
   }
@@ -1185,9 +1251,9 @@ async function runLoopFromState(
   state: AgentState,
   options: AgentLoopOptions,
   resume: AgentLoopResume,
-  usageTracker: UsageTracker,
+  context: LoopContext,
+  emitRunStarted = true,
 ): Promise<AgentResult> {
-  const context = createLoopContext(options, usageTracker);
   const toolDefinitions = options.tools.definitions();
   const specs = options.validationSpecs ?? [];
 
@@ -1216,11 +1282,14 @@ async function runLoopFromState(
     await context.persist(state, { type: "plan_updated", plan });
   };
 
-  context.emit(state, { type: "run_started", runId: state.runId });
-  if (options.persistence) {
-    // store 为空时先落盘 `run_started`，否则新运行的事件日志会缺少开头。
-    if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
-      return interruptedResult(state);
+  // 新建运行的 `run_started` 已由 `runNewLoop` 在规划之前登记并落盘；续跑时由这里补上。
+  if (emitRunStarted) {
+    context.emit(state, { type: "run_started", runId: state.runId });
+    if (options.persistence) {
+      // store 为空时先落盘 `run_started`，否则新运行的事件日志会缺少开头。
+      if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
+        return interruptedResult(state);
+      }
     }
   }
   if (!state.plan) {

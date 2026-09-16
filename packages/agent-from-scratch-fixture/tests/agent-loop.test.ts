@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -13,7 +14,9 @@ import {
 import { isRecord, sha256 } from "../src/checkpoint.js";
 import { fromDurableState, toDurableState } from "../src/durable-state.js";
 import { FakeModelDriver, textTurn, turnWithTools, withUsage } from "../src/fake-model.js";
+import type { Planner } from "../src/planner.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
+import { LocalFileRunStore } from "../src/run-store.js";
 import { createInitialState, transitionState } from "../src/state.js";
 import { defineTool } from "../src/tool.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
@@ -81,6 +84,8 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
   if (overrides.repeatGuard !== undefined) options.repeatGuard = overrides.repeatGuard;
   if (overrides.maxCostUsd !== undefined) options.maxCostUsd = overrides.maxCostUsd;
   if (overrides.maxWallMs !== undefined) options.maxWallMs = overrides.maxWallMs;
+  if (overrides.runId !== undefined) options.runId = overrides.runId;
+  if (overrides.persistence !== undefined) options.persistence = overrides.persistence;
   return options;
 }
 
@@ -126,6 +131,22 @@ function recordAt(items: unknown[], index: number): Record<string, unknown> {
   const value = items[index];
   if (!isRecord(value)) throw new Error(`item ${index} is not an object`);
   return value;
+}
+
+/** 规划器在 `create` 就失败：复用同一条错误，模拟模型违反计划契约且重试后仍不合法。 */
+function failingPlanner(message = "plan requires at least one acceptance criterion"): Planner {
+  const failure = new Error(message);
+  return {
+    async create() {
+      throw failure;
+    },
+    async revise() {
+      throw failure;
+    },
+    async evaluate() {
+      throw failure;
+    },
+  };
 }
 
 describe("agent loop control flow", () => {
@@ -214,6 +235,54 @@ describe("agent loop control flow", () => {
     );
     expect(noTools.stopReason).toBe("max_tool_calls");
     expect(noTools.state.budget.toolCalls).toBe(0);
+  });
+
+  it("stops with plan_error and a run_stopped event when plan creation fails", async () => {
+    const cwd = await tempDir();
+    const events: AgentLoopEvent[] = [];
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        model: new FakeModelDriver([]),
+        planner: failingPlanner(),
+        tools: createRegistry(echoTool),
+        onEvent: (event) => events.push(event),
+      }),
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.stopReason).toBe("plan_error");
+    expect(events).toContainEqual({ type: "run_stopped", reason: "plan_error" });
+  });
+
+  it("persists a checkpoint when plan creation fails so the run stays auditable", async () => {
+    const cwd = await tempDir();
+    const runId = "run-plan-error-1";
+    const store = new LocalFileRunStore(join(cwd, "runs"));
+    const lease = await store.acquireLease(runId, "worker", 30_000);
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        runId,
+        model: new FakeModelDriver([]),
+        planner: failingPlanner(),
+        tools: createRegistry(echoTool),
+        persistence: { store, lease },
+      }),
+    );
+
+    expect(result.stopReason).toBe("plan_error");
+
+    // 运行列表与快照都只读磁盘上的 checkpoint：有它，这次失败才可发现、可审计。
+    const history = await store.loadCheckpointHistory(runId, 1);
+    expect(history).toHaveLength(1);
+    expect(history[0]?.state.status).toBe("failed");
+    expect(history[0]?.state.stopReason).toBe("plan_error");
+
+    const events = await store.readEvents(runId, 0);
+    expect(events.map((record) => record.event.type)).toEqual(["run_started", "run_stopped"]);
   });
 
   it("maps model failures, cancellation and evidence forgery to stable stop reasons", async () => {

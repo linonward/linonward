@@ -129,6 +129,40 @@ describe("createModelPlanner", () => {
     );
   });
 
+  it("retries create once with the contract error when the draft violates the plan contract", async () => {
+    const { model, requests } = scriptedModel([
+      JSON.stringify({ acceptanceCriteria: [], steps: [] }),
+      JSON.stringify(DRAFT),
+    ]);
+    const planner = createModelPlanner(model);
+
+    await expect(
+      planner.create({
+        goal: "把 README 第一行改成 # Hello Agent",
+        context: "c",
+        availableTools: [],
+      }),
+    ).resolves.toEqual(DRAFT);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.input.at(-1)?.content).toContain(
+      "plan requires at least one acceptance criterion",
+    );
+  });
+
+  it("gives up with the contract error after the bounded create retries", async () => {
+    const empty = JSON.stringify({ acceptanceCriteria: [], steps: [] });
+    const { model, requests } = scriptedModel(
+      Array.from({ length: MAX_PLANNER_RETRIES + 1 }, () => empty),
+    );
+    const planner = createModelPlanner(model);
+
+    await expect(planner.create({ goal: "g", context: "c", availableTools: [] })).rejects.toThrow(
+      "plan requires at least one acceptance criterion",
+    );
+    expect(requests).toHaveLength(MAX_PLANNER_RETRIES + 1);
+  });
+
   it("accepts a create draft wrapped in a Markdown fence", async () => {
     const { model } = scriptedModel([`\`\`\`json\n${JSON.stringify(DRAFT)}\n\`\`\``]);
     const planner = createModelPlanner(model);

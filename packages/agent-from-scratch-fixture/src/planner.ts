@@ -1,5 +1,3 @@
-import { extractJsonObject } from "./json-object.js";
-import type { Model } from "./model.js";
 import type { ReplanReason } from "./plan.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 
@@ -138,35 +136,7 @@ export async function createInitialPlan(
   };
 }
 
-/** Planner 的模型适配器：只解析结构化文本，不做状态写入。 */
-export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
-  return {
-    async create(input) {
-      const raw = await model.generate({
-        instructions: [
-          "You create short, executable plans for repository tasks.",
-          "Return one JSON object and no Markdown fences or commentary.",
-          "Use exactly this shape:",
-          '{"acceptanceCriteria":[{"id":"...","description":"..."}],',
-          '"steps":[{"id":"...","title":"...","dependsOn":[],',
-          '"completionEvidence":"..."}]}',
-          "Every step must be possible with the declared tools.",
-          "Every completionEvidence must describe observable evidence (a tool observation).",
-          "Prefer the fewest steps and the fewest acceptance criteria that still prove the goal.",
-          "A read-only question usually needs a single step and a single acceptance criterion.",
-          "Do not add extra verification steps that the declared tools cannot produce evidence for.",
-        ].join("\n"),
-        input: [{ role: "user", content: JSON.stringify(input) }],
-      });
-
-      let candidate: unknown;
-      try {
-        candidate = extractJsonObject(raw);
-      } catch {
-        throw new Error("planner returned invalid JSON");
-      }
-      validatePlan(candidate);
-      return candidate;
-    },
-  };
-}
+/**
+ * `create` 只由模型适配器（`planner-model.ts`）实现：它复用同一套"解析 → 校验 → 带错误
+ * 有界重试"的契约适配器，因此不再在这里保留一份不重试的旧实现。
+ */

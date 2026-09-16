@@ -6,6 +6,9 @@ import type { AgentState, DurableAgentState, ProviderCursor } from "./types.js";
  * 持久化投影与反向投影单独成模块：`AgentState` 是权威状态，
  * `DurableAgentState` 只保留可序列化字段。
  *
+ * 只有 `running` / `waiting` 才需要计划：它们还能被恢复并继续推进。终态（`failed` 等）
+ * 允许没有计划——计划创建失败恰好停在那里，而那种失败必须留下可审计的检查点。
+ *
  * 这里刻意只依赖 `types.ts` 与 `context.ts`，这样 `agent-loop.ts` 可以直接
  * 使用 `toDurableState` 写检查点，而不会产生 `recovery ↔ agent-loop` 的循环依赖。
  * `recovery.ts` 重新导出这些符号，保持既有 import 与测试不破。
@@ -14,14 +17,15 @@ export function toDurableState(
   state: AgentState,
   providerCursor?: ProviderCursor | undefined,
 ): DurableAgentState {
-  if (!state.plan) throw new Error("cannot persist a run without a plan");
+  if (!state.plan && (state.status === "running" || state.status === "waiting")) {
+    throw new Error("cannot persist a recoverable run without a plan");
+  }
 
   const durable: DurableAgentState = {
     runId: state.runId,
     task: state.task,
     cwd: state.cwd,
     status: state.status,
-    plan: state.plan,
     planHistory: state.planHistory,
     messages: state.messages,
     contextSources: state.contextSources.map((source) => ({
@@ -47,6 +51,7 @@ export function toDurableState(
     stopReason: state.stopReason,
     usage: state.usage,
   };
+  if (state.plan !== undefined) durable.plan = state.plan;
   if (state.activeStepId !== undefined) durable.activeStepId = state.activeStepId;
   if (state.pendingUserInput !== undefined) durable.pendingUserInput = state.pendingUserInput;
   if (providerCursor !== undefined) durable.providerCursor = providerCursor;

@@ -3,7 +3,10 @@ import { type PlanDraft, validatePlan } from "./planner.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 
 export type { PlanDraft, PlanEvaluation, Planner } from "./planner.js";
-export { createInitialPlan, createModelPlanCreator, validatePlan } from "./planner.js";
+export { createInitialPlan, validatePlan } from "./planner.js";
+// `createModelPlanCreator` 与 `revise` / `evaluate` 共用 `planner-model.ts` 的契约适配器，
+// 因此它的归属地也移到那里；这里保持同一个公开出口，调用方无需改变导入路径。
+export { createModelPlanCreator } from "./planner-model.js";
 
 export type ReplanReason =
   | "new_constraint"

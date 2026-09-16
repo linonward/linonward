@@ -2,13 +2,7 @@ import type { ModelMessage } from "./context.js";
 import { extractJsonObject } from "./json-object.js";
 import type { Model } from "./model.js";
 import type { ReplanReason } from "./plan.js";
-import {
-  createModelPlanCreator,
-  type PlanDraft,
-  type PlanEvaluation,
-  type Planner,
-  validatePlan,
-} from "./planner.js";
+import { type PlanDraft, type PlanEvaluation, type Planner, validatePlan } from "./planner.js";
 import type { AcceptanceCriterion } from "./types.js";
 
 /** 供调用方直接 `import { extractJsonObject } from "./planner-model.js"`。 */
@@ -44,6 +38,20 @@ const REVISE_INSTRUCTIONS = [
   "保持目标（goal）原文不变；只调整步骤与验收条件。",
   "已完成且语义契约未变的步骤不会被回退，因此可以放心保留原有 id 与标题。",
   "如果原计划仍然有效，就原样保留步骤与验收条件，不要为了「改进」而重写。",
+].join("\n");
+
+/**
+ * `create` 的系统提示词：复用同一份 JSON 契约。
+ *
+ * 契约定得越明确，模型一次通过的概率越高；而契约违规由 `requestModelJson` 负责追问，
+ * 所以这里不需要在提示词里重复错误处理，也不必为此写第二套解析逻辑。
+ */
+const CREATE_INSTRUCTIONS = [
+  PLAN_CONTRACT,
+  "",
+  "现在为给定的任务创建初始计划。",
+  "acceptanceCriteria 至少一条：描述「怎样才算回答/完成了这个任务」的可观察判据。",
+  "只读问题（读文件、回答问题、给出结论）通常只需要一个步骤和一条验收条件。",
 ].join("\n");
 
 const JSON_ONLY_REMINDER =
@@ -253,6 +261,25 @@ async function requestModelJson<T>(request: ModelJsonRequest<T>): Promise<T> {
   }
 
   throw lastError ?? new Error(`${request.label}返回了非法 JSON`);
+}
+
+/** Planner 的模型适配器：只解析结构化文本，不做状态写入。 */
+export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
+  return {
+    async create(input) {
+      return requestModelJson({
+        model,
+        instructions: CREATE_INSTRUCTIONS,
+        payload: input,
+        label: "create",
+        parse: (raw) => {
+          const candidate = parseJson(raw, "create");
+          validatePlan(candidate);
+          return candidate;
+        },
+      });
+    },
+  };
 }
 
 /**
