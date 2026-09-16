@@ -303,6 +303,16 @@ describe("agent loop control flow", () => {
     expect(result.status).toBe("failed");
     expect(result.stopReason).toBe("plan_error");
     expect(events).toContainEqual({ type: "run_stopped", reason: "plan_error" });
+
+    // 阶段与原因要可读：调用失败（model_call）与"模型输出违反契约"（invalid_plan）处置不同。
+    const detail = result.state.events.find((event) => event.type === "plan_error");
+    expect(detail).toBeDefined();
+    expect(JSON.parse(detail?.detail ?? "{}")).toEqual({
+      type: "plan_error",
+      phase: "plan",
+      reason: "invalid_plan",
+      message: "plan requires at least one acceptance criterion",
+    });
   });
 
   it("persists a checkpoint when plan creation fails so the run stays auditable", async () => {

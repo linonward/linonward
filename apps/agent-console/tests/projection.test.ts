@@ -281,6 +281,17 @@ describe("deriveStopHint", () => {
     ).toBe("没有就绪步骤（reason=no_ready_step）");
   });
 
+  it("plan_error 说清阶段、原因与原始消息", () => {
+    expect(
+      deriveStopHint({
+        type: "plan_error",
+        phase: "plan",
+        reason: "invalid_plan",
+        message: "plan requires at least one step",
+      }),
+    ).toBe("计划创建失败（phase=plan；reason=invalid_plan）：plan requires at least one step");
+  });
+
   it("未知 detail 返回 undefined，不猜", () => {
     expect(deriveStopHint({ type: "something_else" })).toBeUndefined();
   });

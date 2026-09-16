@@ -1183,8 +1183,12 @@ async function runNewLoop(
   }
 
   let plan: TaskPlan;
+  // 规划阶段只有两步：先发现 Skill（环境），再让规划器产出计划（模型边界）。
+  // 失败时带上阶段，操作者才能区分"技能目录有问题"和"模型没按契约输出"。
+  let phase: PlanErrorDetail["phase"] = "skills";
   try {
     state.skills.catalog = await discoverSkills(options.skillsDirectory);
+    phase = "plan";
     plan =
       options.skipPlan?.(state.task) === true
         ? createShortcutPlan(state.task)
@@ -1195,7 +1199,7 @@ async function runNewLoop(
             options.planner,
           );
   } catch (error) {
-    return stopForPlanError(state, context, error);
+    return stopForPlanError(state, context, error, phase);
   }
 
   state.plan = plan;
@@ -1203,6 +1207,47 @@ async function runNewLoop(
 
   // `run_started` 已由本函数发出，主循环不再重复。
   return runLoopFromState(state, options, {}, context, false);
+}
+
+/**
+ * 计划创建失败的诊断：回答"失败在哪一步、是环境问题还是模型没按契约输出"。
+ *
+ * `phase` 区分 Skill 发现与规划本身；`reason` 区分"规划服务不可用"（重试无用）
+ * 与"模型输出不合法"（可归因到契约）。两者处置完全不同，混成一个字符串会让
+ * 操作者只能靠猜。
+ */
+export interface PlanErrorDetail {
+  type: "plan_error";
+  phase: "skills" | "plan";
+  reason: "model_call" | "invalid_plan";
+  message: string;
+}
+
+/** 与"规划服务不可用"（网络 / 鉴权 / 限流 / 上游 5xx）相关的错误码。 */
+const PLAN_MODEL_CALL_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+/**
+ * 分类规划失败。返回码 / 网络错误码在前，契约错误在后：`invalid_plan` 只在
+ * 消息明确形如契约违规（`plan ...`）时才给出，其余归为模型调用失败或计划不可用。
+ */
+function classifyPlanError(error: unknown): PlanErrorDetail["reason"] {
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+  if (code === "ERR_PLANNER_RETRIES" || code === "ERR_PLAN_VALIDATION") return "invalid_plan";
+  if (PLAN_MODEL_CALL_CODES.has(code)) return "model_call";
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("plan ")) return "invalid_plan";
+  if (/\b(401|403|429|5\d\d)\b/.test(message)) return "model_call";
+  return "model_call";
 }
 
 /**
@@ -1215,12 +1260,19 @@ async function stopForPlanError(
   state: AgentState,
   context: LoopContext,
   error: unknown,
+  phase: PlanErrorDetail["phase"],
 ): Promise<AgentResult> {
-  const reason = error instanceof Error ? error.message : String(error);
-  context.persistRuntime(state, "plan_error", reason);
+  const message = error instanceof Error ? error.message : String(error);
+  const detail: PlanErrorDetail = {
+    type: "plan_error",
+    phase,
+    reason: classifyPlanError(error),
+    message,
+  };
+  context.persistRuntime(state, "plan_error", JSON.stringify(detail));
 
   const stopped = transitionState(state, "failed", "plan_error", context.now());
-  stopped.failedAttempts.push(reason);
+  stopped.failedAttempts.push(message);
   context.emit(stopped, { type: "run_stopped", reason: "plan_error" });
 
   try {
@@ -1232,6 +1284,20 @@ async function stopForPlanError(
   }
 
   return { status: "failed", answer: "", stopReason: "plan_error", state: stopped };
+}
+
+/** 从权威状态里取最后一条 `plan_error` 诊断：日志通路（CLI / 控制台）据此渲染原因。 */
+export function readPlanErrorDetail(state: AgentState): PlanErrorDetail | undefined {
+  const event = [...state.events].reverse().find((candidate) => candidate.type === "plan_error");
+  if (event === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(event.detail);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const candidate = parsed as PlanErrorDetail;
+    return candidate.type === "plan_error" ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
