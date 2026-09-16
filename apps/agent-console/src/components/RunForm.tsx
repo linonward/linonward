@@ -16,7 +16,8 @@ interface FormState {
   maxCostUsd: string;
   maxWallMs: string;
   approveAllowed: boolean;
-  requireSandbox: boolean;
+  /** 复选框表达的是"例外"：勾上 = 允许在**没有可用沙箱**时照样执行命令。 */
+  allowUnsandboxed: boolean;
   repeatGuard: boolean;
   plannerModel: string;
 }
@@ -30,7 +31,7 @@ const INITIAL: FormState = {
   maxCostUsd: "",
   maxWallMs: "",
   approveAllowed: false,
-  requireSandbox: false,
+  allowUnsandboxed: false,
   repeatGuard: true,
   plannerModel: "",
 };
@@ -78,7 +79,8 @@ export function RunForm({ busy, onSubmit }: RunFormProps): ReactElement {
           maxCostUsd: optionalPositiveNumber(form.maxCostUsd),
           maxWallMs: optionalPositiveNumber(form.maxWallMs),
           approveAllowed: form.approveAllowed,
-          requireSandbox: form.requireSandbox,
+          // 默认要求隔离；勾上"允许无隔离执行"才传 false。
+          requireSandbox: !form.allowUnsandboxed,
           repeatGuard: form.repeatGuard,
           plannerModel: form.plannerModel,
         });
@@ -203,10 +205,10 @@ export function RunForm({ busy, onSubmit }: RunFormProps): ReactElement {
         <label>
           <input
             type="checkbox"
-            checked={form.requireSandbox}
-            onChange={(event) => update({ requireSandbox: event.target.checked })}
+            checked={form.allowUnsandboxed}
+            onChange={(event) => update({ allowUnsandboxed: event.target.checked })}
           />
-          requireSandbox（没有真隔离就拒绝执行）
+          允许无隔离执行（不推荐：命令将以当前用户权限直接跑在本机）
         </label>
         <label>
           <input

@@ -39,6 +39,7 @@ function startInput(overrides: Partial<StartRunInput> = {}): StartRunInput {
     maxSteps: 2,
     maxToolCalls: 2,
     approveAllowed: false,
+    // 离线测试不执行真命令；默认值仍与线上一致（要求隔离）。
     requireSandbox: false,
     repeatGuard: true,
     ...overrides,

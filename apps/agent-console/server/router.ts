@@ -207,7 +207,8 @@ export function parseRunInput(
     maxSteps: readPositiveInt(value, "maxSteps", CONSOLE_DEFAULT_MAX_STEPS),
     maxToolCalls: readPositiveInt(value, "maxToolCalls", CONSOLE_DEFAULT_MAX_TOOL_CALLS),
     approveAllowed: readOptionalBoolean(value, "approveAllowed", false),
-    requireSandbox: readOptionalBoolean(value, "requireSandbox", false),
+    // 默认要求隔离：没配沙箱就拒绝执行命令。要无隔离执行必须显式传 false。
+    requireSandbox: readOptionalBoolean(value, "requireSandbox", true),
     repeatGuard: readOptionalBoolean(value, "repeatGuard", true),
   };
 

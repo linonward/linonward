@@ -108,7 +108,8 @@ describe("parseAgentArgs", () => {
     expect(run.config).toEqual({
       cwd: process.cwd(),
       allowedArgv: [],
-      requireSandbox: false,
+      // 默认就要隔离：没有可用沙箱时宁可拒绝执行，也不静默降级。
+      requireSandbox: true,
       autoApproveAllowedCommands: false,
       maxSteps: AGENT_DEFAULT_MAX_STEPS,
       maxToolCalls: AGENT_DEFAULT_MAX_TOOL_CALLS,
@@ -128,6 +129,19 @@ describe("parseAgentArgs", () => {
       requestId: "request-1",
       content: "用 pnpm",
     });
+  });
+
+  it("默认要求隔离，--allow-unsandboxed 才是显式例外", () => {
+    expect(parseAgentArgs(["run", "任务"]).config.requireSandbox).toBe(true);
+    expect(parseAgentArgs(["run", "任务", "--require-sandbox"]).config.requireSandbox).toBe(true);
+    expect(parseAgentArgs(["run", "任务", "--allow-unsandboxed"]).config.requireSandbox).toBe(
+      false,
+    );
+    // 后写的开关生效，顺序对用户可预期。
+    expect(
+      parseAgentArgs(["run", "任务", "--allow-unsandboxed", "--require-sandbox"]).config
+        .requireSandbox,
+    ).toBe(true);
   });
 
   it("解析钱与时间的硬上限", () => {

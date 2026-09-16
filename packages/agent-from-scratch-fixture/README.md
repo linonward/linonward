@@ -63,6 +63,7 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | --- | --- |
 | `--cwd <dir>` | 任务工作区根，默认当前目录。策略的 `cwd` / `realWorkspaceRoot` 都用它 |
 | `--allow <command> [args...]` | 把**一条完整 argv** 加入 `run_command` 白名单，可重复。`--allow node --version` 只放行 `node --version` 这条精确 argv；收集会持续到下一个已识别的 CLI flag |
+| `--allow-unsandboxed` | **显式例外**：允许在没有可用沙箱时照样执行命令（默认拒绝）。仅在可信环境使用 |
 | `--require-sandbox` | 显式要求隔离：没有可用沙箱时 `run_command` 拒绝执行而不是无隔离运行 |
 | `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
 | `--max-cost-usd <amount>` | 花费上限（美元，按价目表估算）。越过即停（`max_cost`）；设了上限却算不出成本时同样停下 |
@@ -440,6 +441,11 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `ModelDriver` / `Planner` / `ToolRegistry`（`tests/agent-cli.test.ts` 用
   `FakeModelDriver` 驱动 `run` / `resume` / `answer` 三条命令，全程离线）。
   真实通路另外提供 `src/run-task.ts` 的 `runRealTask`——它是装配函数，不是 CLI 子命令。
+- **默认要求进程隔离**。`run_command` 只在真沙箱里执行：macOS 用 seatbelt、Linux 用
+  bubblewrap，或者用 `AGENT_SANDBOX=docker`（配 `AGENT_SANDBOX_IMAGE`）走容器——
+  容器沙箱额外带 `--network none`、内存/CPU/pids 配额、只读根与工作区挂载。
+  没有可用沙箱时命令会被拒绝（`sandbox_unavailable`），要无隔离执行必须显式
+  `--allow-unsandboxed`。`run_started` 记录里因此永远能看到这次运行到底要求了什么。
 - **预算有两类**：`--max-steps` / `--max-tool-calls` 管"做了多少次"，`--max-cost-usd` /
   `--max-wall-ms` 管"花了多少、跑了多久"。后者在每次模型调用后判定，因此**当轮的工具不会
   再被派发**；一次调用本身可能把花费推过上限，体现在诊断里就是 `spent` 略高于 `maxCostUsd`。

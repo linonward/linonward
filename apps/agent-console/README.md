@@ -37,6 +37,7 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 | `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` / `DEEPSEEK_PLANNER_MODEL` | 与 fixture CLI 相同；表单里的「规划模型」覆盖本次运行的 `DEEPSEEK_PLANNER_MODEL`。 |
 | `DEEPSEEK_PRICE_TABLE(_JSON)` | 可选成本价目表；缺失时界面显示 `cost=unknown`。 |
 | `AGENT_STORE_ROOT` | 运行存根目录（`LocalFileRunStore`），默认系统临时目录下的 `linonward-agent-console-runs`。 |
+| `AGENT_SANDBOX` / `AGENT_SANDBOX_IMAGE` | 选择沙箱（`docker` / `seatbelt` / `bubblewrap` / `none`）或指定容器镜像。默认按平台探测，启动时会打印结果。 |
 | `AGENT_CONSOLE_API_PORT` | API 端口，默认 `8787`（Vite 代理也读这个变量）。 |
 | `AGENT_CONSOLE_HOST` | 监听地址，默认 `127.0.0.1`。绑非回环地址时**必须**同时设置令牌，否则拒绝启动。 |
 | `AGENT_CONSOLE_TOKEN` | 访问令牌。设置后除 `/api/health` 与 `/api/session` 外所有接口都要带 `Authorization: Bearer <token>`、`x-agent-console-token` 或会话 cookie；令牌本身也在脱敏清单里。 |
@@ -71,6 +72,16 @@ pnpm --filter @linonward/agent-console build   # → apps/agent-console/dist
 - **并发上限**：`AGENT_CONSOLE_MAX_OPEN_RUNS` 按**打开的运行**计——等待回答的运行同样占着
   频道、journal 轮询与一份上下文，只数"正在跑"的保护不够。超限返回 429。
 - 默认仍然只监听 `127.0.0.1`；健康检查保持开放（探针要能打），但未授权时不透露是否配了密钥。
+
+## 隔离默认开启
+
+控制台默认传 `requireSandbox: true`：没有可用沙箱时 `run_command` 会被拒绝
+（`sandbox_unavailable`），而不是悄悄在本机跑。表单里的「允许无隔离执行」是显式例外，
+仅在可信环境使用；启动横幅会打印探测到的沙箱与是否可用。
+
+容器沙箱（`AGENT_SANDBOX=docker` + `AGENT_SANDBOX_IMAGE`）把命令放进容器：`--network none`、
+内存/CPU/pids 配额、`--read-only` 根文件系统 + 工作区读写挂载、`--cap-drop ALL` 与
+`no-new-privileges`。这是唯一一种在 Linux 服务器与 CI 里都稳定可用的隔离。
 
 ## 花费与时间的硬上限
 

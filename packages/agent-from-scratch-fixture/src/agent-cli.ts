@@ -47,7 +47,12 @@ export const AGENT_DEFAULT_MAX_TOOL_CALLS = REAL_TASK_DEFAULT_MAX_TOOL_CALLS;
 
 const ALLOW_FLAG = "--allow";
 const CWD_FLAG = "--cwd";
+/**
+ * 默认就要隔离：`--require-sandbox` 只是显式重申默认值，`--allow-unsandboxed`
+ * 才是那个"我知道我在做什么"的例外（本机可信环境、或者 CI 里本来就没有沙箱）。
+ */
 const REQUIRE_SANDBOX_FLAG = "--require-sandbox";
+const ALLOW_UNSANDBOXED_FLAG = "--allow-unsandboxed";
 const APPROVE_ALLOWED_FLAG = "--approve-allowed";
 const MAX_STEPS_FLAG = "--max-steps";
 const MAX_COST_USD_FLAG = "--max-cost-usd";
@@ -63,6 +68,7 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   ALLOW_FLAG,
   CWD_FLAG,
   REQUIRE_SANDBOX_FLAG,
+  ALLOW_UNSANDBOXED_FLAG,
   APPROVE_ALLOWED_FLAG,
   MAX_STEPS_FLAG,
   MAX_TOOL_CALLS_FLAG,
@@ -132,7 +138,7 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
   const positionals: string[] = [];
   const allowedArgv: string[][] = [];
   let cwd: string | undefined;
-  let requireSandbox = false;
+  let requireSandbox = true;
   let autoApproveAllowedCommands = false;
   let maxSteps = AGENT_DEFAULT_MAX_STEPS;
   let maxCostUsd: number | undefined;
@@ -206,6 +212,11 @@ export function parseAgentArgs(argv: string[]): { config: AgentCliConfig; comman
 
     if (token === REQUIRE_SANDBOX_FLAG) {
       requireSandbox = true;
+      continue;
+    }
+
+    if (token === ALLOW_UNSANDBOXED_FLAG) {
+      requireSandbox = false;
       continue;
     }
 

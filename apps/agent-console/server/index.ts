@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 
+import { detectSandbox } from "../../../packages/agent-from-scratch-fixture/src/sandbox.js";
 import { RunHub } from "./bus.js";
 import { readHost, readPort, startupRefusal } from "./entry-options.js";
 import { createRequestHandler } from "./router.js";
@@ -32,6 +33,13 @@ const server = createServer((request, response) => {
 
 server.listen(port, host, () => {
   const keyState = process.env["DEEPSEEK_API_KEY"] ? "已配置" : "未配置（/api/run 会返回 4xx）";
+  // 默认要求隔离：先把"这台机器上能用什么沙箱"说清楚，避免第一条 run_command 才让人发现。
+  const sandbox = detectSandbox(process.platform, process.env);
+  void sandbox.isAvailable().then((available) => {
+    process.stdout.write(
+      `沙箱：${sandbox.id}（${available ? "可用" : "不可用 —— requireSandbox 默认开启，命令会被拒绝执行"}）\n`,
+    );
+  });
   process.stdout.write(
     [
       `agent-console API 监听 http://${host}:${port}`,

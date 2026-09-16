@@ -116,9 +116,15 @@ describe("parseRunInput", () => {
       maxSteps: 16,
       maxToolCalls: 32,
       approveAllowed: false,
-      requireSandbox: false,
+      // 默认要求隔离：没有可用沙箱时拒绝执行命令，而不是静默降级。
+      requireSandbox: true,
       repeatGuard: true,
     });
+  });
+
+  it("只有显式传 false 才允许无隔离执行", () => {
+    expect(parseRunInput({ task: "x", requireSandbox: false }, "/tmp").requireSandbox).toBe(false);
+    expect(parseRunInput({ task: "x", requireSandbox: true }, "/tmp").requireSandbox).toBe(true);
   });
 
   it("非法字段一律 400", () => {
