@@ -24,15 +24,18 @@ import {
   userInputTurn,
   withUsage,
 } from "../src/fake-model.js";
-import { EXIT_CODES } from "../src/index.js";
+import type { AgentCliOptions } from "../src/index.js";
+import { createAgentCliRuntime, EXIT_CODES, runCli } from "../src/index.js";
 import type { ModelUsage, NormalizedModelResponse } from "../src/model.js";
 import {
   createStatelessResponsesDriver,
   type StatelessResponsesClient,
 } from "../src/responses-stateless-driver.js";
 import { InMemoryRunStore } from "../src/run-store.js";
+import { PreApprovingLedger } from "../src/run-task.js";
 import { createInitialState } from "../src/state.js";
 import { defineTool } from "../src/tool.js";
+import { runCommandTool } from "../src/tools/run-command.js";
 import {
   CompletingPlanner,
   createRegistry,
@@ -105,7 +108,8 @@ describe("parseAgentArgs", () => {
     expect(run.config).toEqual({
       cwd: process.cwd(),
       allowedArgv: [],
-      requireSandbox: false,
+      // 默认就要隔离：没有可用沙箱时宁可拒绝执行，也不静默降级。
+      requireSandbox: true,
       autoApproveAllowedCommands: false,
       maxSteps: AGENT_DEFAULT_MAX_STEPS,
       maxToolCalls: AGENT_DEFAULT_MAX_TOOL_CALLS,
@@ -125,6 +129,42 @@ describe("parseAgentArgs", () => {
       requestId: "request-1",
       content: "用 pnpm",
     });
+  });
+
+  it("默认要求隔离，--allow-unsandboxed 才是显式例外", () => {
+    expect(parseAgentArgs(["run", "任务"]).config.requireSandbox).toBe(true);
+    expect(parseAgentArgs(["run", "任务", "--require-sandbox"]).config.requireSandbox).toBe(true);
+    expect(parseAgentArgs(["run", "任务", "--allow-unsandboxed"]).config.requireSandbox).toBe(
+      false,
+    );
+    // 后写的开关生效，顺序对用户可预期。
+    expect(
+      parseAgentArgs(["run", "任务", "--allow-unsandboxed", "--require-sandbox"]).config
+        .requireSandbox,
+    ).toBe(true);
+  });
+
+  it("解析钱与时间的硬上限", () => {
+    const parsed = parseAgentArgs([
+      "run",
+      "任务",
+      "--max-cost-usd",
+      "0.5",
+      "--max-wall-ms",
+      "60000",
+    ]);
+
+    expect(parsed.config.maxCostUsd).toBe(0.5);
+    expect(parsed.config.maxWallMs).toBe(60_000);
+    expect(parseAgentArgs(["run", "任务"]).config.maxCostUsd).toBeUndefined();
+    expect(parseAgentArgs(["run", "任务"]).config.maxWallMs).toBeUndefined();
+  });
+
+  it("非法的上限一律拒绝", () => {
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "0"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "-1"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-cost-usd", "abc"])).toThrow("max-cost-usd");
+    expect(() => parseAgentArgs(["run", "任务", "--max-wall-ms", "0"])).toThrow("max-wall-ms");
   });
 
   it("collects flags and repeated --allow argv", () => {
@@ -312,6 +352,62 @@ describe("createDeepSeekAgentCli", () => {
 
     expect(answerCode).toBe(EXIT_CODES.failed);
     expect(stderr.at(-1)).toContain("unexpected_user_input");
+  });
+
+  /**
+   * 审批必须跨"运行"与"回答"两次调用共享同一个批准账本：CLI 的 `agent answer` 是
+   * 另一个进程、另一份内存账本，所以这里直接驱动 `runCli` 并复用一个账本，
+   * 复现控制台（一个长驻进程、一个 per-run 账本）的情形。
+   */
+  it("approves a policy request and resumes the run (审批不是澄清)", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const approvals = new PreApprovingLedger();
+    const runCommand = turnWithTools({
+      callId: "call-1",
+      name: "run_command",
+      argumentsJson: '{"command":"node","args":["--version"]}',
+    });
+    const model = new FakeModelDriver([runCommand, runCommand, textTurn("node 版本已确认。")]);
+    const store = new InMemoryRunStore();
+    const base: AgentCliOptions = {
+      cwd: process.cwd(),
+      skillsDirectory: resolve(import.meta.dirname, "..", "skills"),
+      store,
+      model,
+      planner: new CompletingPlanner(makeDraft({}), ["criterion-1"]),
+      tools: createRegistry(runCommandTool),
+      policy: {
+        cwd: process.cwd(),
+        realWorkspaceRoot: process.cwd(),
+        allowedArgv: [["node", "--version"]],
+        network: "disabled",
+      },
+      approvals,
+      maxSteps: AGENT_DEFAULT_MAX_STEPS,
+      maxToolCalls: AGENT_DEFAULT_MAX_TOOL_CALLS,
+    };
+    const dependencies = { createRuntime: createAgentCliRuntime(base) };
+    const io = {
+      stdout: (text: string) => void stdout.push(text),
+      stderr: (text: string) => void stderr.push(text),
+    };
+
+    const runCode = await runCli(["run", "查看 node 版本"], dependencies, io, { verbose: true });
+    expect(runCode).toBe(EXIT_CODES.waiting);
+    const runId = runIdFromStderr(stderr);
+    // 策略请求确实落在了这个账本里，且还是"待批准"。
+    const pending = await approvals.pendingRequests(runId);
+    expect(pending).toHaveLength(1);
+    const requestId = pending[0]?.id ?? "";
+    expect(requestId.length).toBeGreaterThan(0);
+
+    const answerCode = await runCli(["answer", runId, requestId, "批准"], dependencies, io, {
+      verbose: true,
+    });
+
+    expect(answerCode).toBe(EXIT_CODES.completed);
+    expect(stdout.at(-1)).toBe("node 版本已确认。");
   });
 
   it("resumes a waiting run when the answer matches the pending request", async () => {
@@ -658,6 +754,84 @@ describe("--verbose", () => {
     // 既有的 usage 行必须与诊断在同一次输出里，且 hint 收尾。
     expect(joined).toContain("[summary] usage modelCalls=1 toolCalls=1");
     expect(joined.indexOf("[summary] hint:")).toBeGreaterThan(joined.indexOf("[summary] usage"));
+  });
+
+  /** 价格 $1/token：`inputTokens: 1` 就是 $1，算术一眼可验。 */
+  const ONE_DOLLAR_PER_TOKEN = JSON.stringify({
+    asOf: "2024-01-01",
+    models: {
+      "test-model": {
+        inputPerMillionUsd: 1_000_000,
+        outputPerMillionUsd: 0,
+        asOf: "2024-01-01",
+      },
+    },
+  });
+
+  it("--max-cost-usd 越过上限时停止，并在汇总里给出上限与提示", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const model = new FakeModelDriver([
+      withUsage(
+        turnWithTools({ callId: "call-1", name: "echo", argumentsJson: '{"value":"hi"}' }),
+        {
+          inputTokens: 1,
+          outputTokens: 0,
+        },
+      ),
+    ]);
+    const cli = await createDeepSeekAgentCli({
+      env: { DEEPSEEK_PRICE_TABLE_JSON: ONE_DOLLAR_PER_TOKEN },
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        modelId: "test-model",
+        planner: new ScriptedPlanner(makeDraft({}), [notCompleted()]),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+      },
+    });
+
+    const code = await cli(["run", "花钱", "--verbose", "--max-cost-usd", "0.5"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("stopped: max_cost");
+    expect(joined).toContain("[summary] stopped detail:");
+    expect(joined).toContain("hint:");
+    expect(joined).toContain("--max-cost-usd");
+  });
+
+  it("--max-wall-ms 越过上限时停止", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let nowMs = Date.parse("2024-01-01T00:00:00.000Z");
+    const model = new FakeModelDriver([textTurn("太久了")]);
+    const cli = await createDeepSeekAgentCli({
+      env: {},
+      stdout: (text) => void stdout.push(text),
+      stderr: (text) => void stderr.push(text),
+      deps: {
+        model,
+        planner: new CompletingPlanner(makeDraft({}), ["criterion-1"]),
+        tools: createRegistry(echoTool),
+        store: new InMemoryRunStore(),
+        clock: {
+          now: () => {
+            nowMs += 10_000;
+            return new Date(nowMs);
+          },
+        },
+      },
+    });
+
+    const code = await cli(["run", "跑太久", "--verbose", "--max-wall-ms", "5000"]);
+
+    expect(code).toBe(EXIT_CODES.failed);
+    const joined = stderr.join("\n");
+    expect(joined).toContain("stopped: max_wall_ms");
+    expect(joined).toContain("--max-wall-ms");
   });
 
   it("重复调用的 max_steps 运行给出重复提示，并把 budget_exhausted 写进 JSONL", async () => {

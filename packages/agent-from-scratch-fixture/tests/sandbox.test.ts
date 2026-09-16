@@ -7,8 +7,12 @@ import type { PolicyContext } from "../src/policy.js";
 import { PreApprovingLedger } from "../src/run-task.js";
 import {
   buildBubblewrapArgs,
+  buildDockerArgs,
   buildSeatbeltProfile,
+  createDockerSandbox,
+  DOCKER_SANDBOX_DEFAULT_IMAGE,
   detectSandbox,
+  dockerSandbox,
   linuxBubblewrapSandbox,
   macOsSeatbeltSandbox,
   noSandbox,
@@ -364,5 +368,105 @@ describe.skipIf(process.env["SANDBOX_INTEGRATION"] !== "1")("real platform sandb
     expect(run.exitCode, `${run.sandboxId} should fail to reach the network: ${run.stderr}`).toBe(
       1,
     );
+  });
+});
+
+/**
+ * 容器沙箱：生产环境里 seabelt / bubblewrap 都不是随处可用（CI 容器里没有 bwrap，
+ * Linux 服务器上没有 seatbelt），而"没有隔离"必须是显式选择，不能是默认。
+ */
+describe("docker 沙箱", () => {
+  const policy: SandboxPolicy = { network: "disabled", writableRoot: "/workspace" };
+
+  it("包装成 docker run：禁网、限配额、只读根 + 工作区挂载，argv 原样透传", () => {
+    const args = buildDockerArgs(
+      { command: "node", args: ["--version"], cwd: "/workspace/sub" },
+      policy,
+      { image: "node:24-bookworm-slim" },
+    );
+
+    expect(args.slice(0, 2)).toEqual(["run", "--rm"]);
+    expect(args).toContain("none"); // --network none
+    expect(args.join(" ")).toContain("--network none");
+    expect(args).toContain("--read-only");
+    expect(args.join(" ")).toContain("--cap-drop ALL");
+    expect(args.join(" ")).toContain("--security-opt no-new-privileges");
+    expect(args).toContain("--memory");
+    expect(args).toContain("--cpus");
+    expect(args).toContain("--pids-limit");
+    // 工作区以读写挂载，其余文件系统只读。
+    expect(args.join(" ")).toContain("-v /workspace:/workspace:rw");
+    expect(args.join(" ")).toContain("-w /workspace/sub");
+    // 镜像之后是原样的命令与参数：没有任何 shell 拼接。
+    const imageIndex = args.indexOf("node:24-bookworm-slim");
+    expect(args.slice(imageIndex + 1)).toEqual(["node", "--version"]);
+  });
+
+  it("策略允许网络时不加 --network none（隔离声明与实现保持一致）", () => {
+    const args = buildDockerArgs(
+      { command: "node", args: [] },
+      { ...policy, network: "enabled" },
+      {},
+    );
+
+    expect(args.join(" ")).not.toContain("--network none");
+    expect(args.join(" ")).toContain("--network bridge");
+  });
+
+  it("缺省镜像有明确默认值，调用方可以覆盖", () => {
+    expect(buildDockerArgs({ command: "node", args: [] }, policy, {})).toContain(
+      DOCKER_SANDBOX_DEFAULT_IMAGE,
+    );
+    expect(buildDockerArgs({ command: "node", args: [] }, policy, { image: "alpine:3" })).toContain(
+      "alpine:3",
+    );
+  });
+
+  it("可用性探测：docker 不在就报不可用，门禁因此拒绝执行而不是降级", async () => {
+    const missing = createDockerSandbox({ isDockerAvailable: async () => false });
+    await expect(missing.isAvailable()).resolves.toBe(false);
+
+    const present = createDockerSandbox({ isDockerAvailable: async () => true });
+    await expect(present.isAvailable()).resolves.toBe(true);
+    await expect(
+      wrapWithSandbox(
+        { command: "node", args: ["--version"], cwd: "/workspace" },
+        {
+          sandbox: present,
+          requireSandbox: true,
+          policy,
+        },
+      ),
+    ).resolves.toMatchObject({ command: "docker" });
+
+    await expect(
+      wrapWithSandbox(
+        { command: "node", args: [] },
+        {
+          sandbox: missing,
+          requireSandbox: true,
+          policy,
+        },
+      ),
+    ).rejects.toBeInstanceOf(SandboxError);
+  });
+
+  it("两个保证都声明了：网络隔离与写入收敛", () => {
+    expect(dockerSandbox.guarantees).toEqual(["network-isolation", "filesystem-write-confinement"]);
+  });
+});
+
+describe("沙箱选择", () => {
+  it("AGENT_SANDBOX 显式指定优先于平台默认", () => {
+    expect(detectSandbox("darwin", { AGENT_SANDBOX: "docker" }).id).toBe("docker");
+    expect(detectSandbox("linux", { AGENT_SANDBOX: "none" }).id).toBe("none");
+    expect(detectSandbox("linux", { AGENT_SANDBOX: "seatbelt" }).id).toBe("macos-seatbelt");
+    // 配了镜像也意味着"我要用容器"。
+    expect(detectSandbox("darwin", { AGENT_SANDBOX_IMAGE: "alpine:3" }).id).toBe("docker");
+    // 不写就按平台走。
+    expect(detectSandbox("darwin", {}).id).toBe("macos-seatbelt");
+    expect(detectSandbox("linux", {}).id).toBe("linux-bubblewrap");
+    // 无法识别的取值不猜：回落到平台默认。
+    expect(detectSandbox("linux", { AGENT_SANDBOX: "gVisor" }).id).toBe("linux-bubblewrap");
   });
 });

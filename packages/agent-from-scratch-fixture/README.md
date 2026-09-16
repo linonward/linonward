@@ -63,8 +63,11 @@ pnpm agent answer <run-id> <request-id> "用 pnpm"
 | --- | --- |
 | `--cwd <dir>` | 任务工作区根，默认当前目录。策略的 `cwd` / `realWorkspaceRoot` 都用它 |
 | `--allow <command> [args...]` | 把**一条完整 argv** 加入 `run_command` 白名单，可重复。`--allow node --version` 只放行 `node --version` 这条精确 argv；收集会持续到下一个已识别的 CLI flag |
+| `--allow-unsandboxed` | **显式例外**：允许在没有可用沙箱时照样执行命令（默认拒绝）。仅在可信环境使用 |
 | `--require-sandbox` | 显式要求隔离：没有可用沙箱时 `run_command` 拒绝执行而不是无隔离运行 |
 | `--approve-allowed` | 对**策略已经放行**的命令自动批准（白名单仍是硬边界；默认会停在 `approval_required`） |
+| `--max-cost-usd <amount>` | 花费上限（美元，按价目表估算）。越过即停（`max_cost`）；设了上限却算不出成本时同样停下 |
+| `--max-wall-ms <ms>` | 墙钟上限：越过即停（`max_wall_ms`） |
 | `--max-steps <n>` | 模型步数上限，默认 `16` |
 | `--max-tool-calls <n>` | 工具调用上限，默认 `32` |
 | `--verbose` | 在 stderr 上追加**完整运行日志**：模型的真实输入与输出（system prompt 全文、每条输入消息全文、`finalText` 全文、`toolCalls` 的 `argumentsJson` 全文）、完整工具链（每个调用的 `argsJson` 与 observation `output` 全文、`ok` / `effect` / `errorCode` 与策略决定），以及既有的每个 Loop 事件一行（`[event] ...`）与运行结束汇总（`[summary] ...`）。默认关闭，开启前后都不改变 stdout 上的最终答案与退出码；放在子命令前或后都可以 |
@@ -199,6 +202,20 @@ peak / off-peak 两档（off-peak 恰好是 peak 的一半），内置表取 **p
 
 每次 `run` / `resume` / `answer` 都会在结束时释放 run 的 lease，因此三条命令可以连续执行，
 不需要等待 TTL 过期。
+
+`answer` 按 requestId 分辨两条恢复路径：
+
+| 情况 | 恢复方式 |
+| --- | --- |
+| **澄清**（`request_user_input`） | 把回答写进上下文（`applyUserAnswer`），状态回到 `running` |
+| **审批**（策略 `ask`） | 在批准账本里放行那条请求（`grantApproval`），重放的同一调用消费一次性凭证后执行 |
+
+批准凭证绑定"真正会被执行的东西"（`command` + `args` + cwd + 网络策略）：模型重放同一调用时
+换个 `purpose` 说法不会让批准失效，但换成另一条命令就必须重新批准。
+
+> **已知限制**：`agent answer` 只有在批准账本还活着时才能批准——CLI 每次调用都新建运行时，
+> 账本在进程内，所以跨进程的 `agent answer` 依然答不了审批（澄清不受影响，因为它只读检查点）。
+> 长驻进程（例如 `apps/agent-console`）每次运行持有一个账本，因此可以在其中批准。
 
 ## 接入真实模型（DeepSeek Responses API）
 
@@ -424,6 +441,14 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `ModelDriver` / `Planner` / `ToolRegistry`（`tests/agent-cli.test.ts` 用
   `FakeModelDriver` 驱动 `run` / `resume` / `answer` 三条命令，全程离线）。
   真实通路另外提供 `src/run-task.ts` 的 `runRealTask`——它是装配函数，不是 CLI 子命令。
+- **默认要求进程隔离**。`run_command` 只在真沙箱里执行：macOS 用 seatbelt、Linux 用
+  bubblewrap，或者用 `AGENT_SANDBOX=docker`（配 `AGENT_SANDBOX_IMAGE`）走容器——
+  容器沙箱额外带 `--network none`、内存/CPU/pids 配额、只读根与工作区挂载。
+  没有可用沙箱时命令会被拒绝（`sandbox_unavailable`），要无隔离执行必须显式
+  `--allow-unsandboxed`。`run_started` 记录里因此永远能看到这次运行到底要求了什么。
+- **预算有两类**：`--max-steps` / `--max-tool-calls` 管"做了多少次"，`--max-cost-usd` /
+  `--max-wall-ms` 管"花了多少、跑了多久"。后者在每次模型调用后判定，因此**当轮的工具不会
+  再被派发**；一次调用本身可能把花费推过上限，体现在诊断里就是 `spent` 略高于 `maxCostUsd`。
 - **真实运行默认不自动批准命令**。`runRealTask` 只有在显式打开
   `autoApproveAllowedCommands` 时才会自动批准策略放行的 `run_command`（e2e 测试这么用）；
   默认仍会停在 `approval_required`。无论哪种情况，`allowedArgv` 都是硬边界。
@@ -431,6 +456,18 @@ macOS 侧仍放行系统临时目录、Linux 侧仍是整机只读可见。执�
   `changedFiles`、绑定 `mutationRevision` 的 `ValidationRecord`、`stopReason`），
   但模型是否愿意按提示调用工具仍存在不确定性；失败时先用 `console.log` 打印的
   事件序列与 answers 判断是"模型没照做"还是"harness 出错"。
+- **日志写入前会脱敏**：`redactCredentialPatterns` 盖掉常见凭证形状（`sk-…`、`ghp_…`、
+  JWT、`Bearer …`、`password=…` 等，长值保留首尾各 4 字符便于定位），调用方再用 `redact`
+  叠加"环境里真正配过的密钥"。顺序是**先脱敏再截断**，否则凭证可能落在截断边界之外。
+- **运行目录有保留策略**：`pruneRuns(root, { maxAgeMs })` 按"目录内容里最新的 mtime"
+  判断年龄并清理，支持 `dryRun`；`AGENT_RETENTION_DAYS` 是控制台侧的开关（缺省不清理）。
+- **崩溃恢复会先自动对账**：`createRealTaskVerifiers()` 给 `read_file` / `search_text`
+  （确定没有副作用）与 `apply_patch`（用内容哈希对照"执行前 / 执行后"两个确定状态）注册了
+  判定器；判定不了时**不猜**，仍旧转成人工对账请求。`run_command` 没有判定器——命令是否
+  已经产生副作用无法从工作区推断，只能由人确认。
+- **取消会打断正在飞行中的模型调用**。`createResponsesHttpClient` 接受外部 `AbortSignal`：
+  没有它，"中止"只能等下一次循环检查，用户要干等一次 60 秒超时。CLI 侧目前仍以
+  `SIGINT` + 工具/HTTP 超时为准（客户端在装配期创建，尚未绑定每次调用的信号）。
 - **`providerCursor` 真实通路未实现**。`createStatelessResponsesDriver` 不提供
   `canResume`，因为 DeepSeek 无状态：跨进程恢复只能靠客户端重发历史，
   当前 fixture 的恢复链路（`resumeAgentRun`）仍然面向 OpenAI 风格的 cursor。

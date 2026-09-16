@@ -79,6 +79,8 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
   if (overrides.onEvent !== undefined) options.onEvent = overrides.onEvent;
   if (overrides.pricing !== undefined) options.pricing = overrides.pricing;
   if (overrides.repeatGuard !== undefined) options.repeatGuard = overrides.repeatGuard;
+  if (overrides.maxCostUsd !== undefined) options.maxCostUsd = overrides.maxCostUsd;
+  if (overrides.maxWallMs !== undefined) options.maxWallMs = overrides.maxWallMs;
   return options;
 }
 
@@ -1122,5 +1124,133 @@ describe("重复工具调用守卫", () => {
     expect(
       result.state.contextSources.filter((source) => source.kind === "harness_feedback"),
     ).toHaveLength(0);
+  });
+});
+
+/**
+ * 硬上限：钱与时间。
+ *
+ * `maxSteps` / `maxToolCalls` 管的是"做了多少次"，管不住"一次花掉多少"——一次昂贵的
+ * 模型调用就能把账单甩到上限之外。价格取 $1/token，让算术一眼可验：
+ * `inputTokens: 1` ⇒ cost = $1。
+ */
+describe("硬上限：maxCostUsd / maxWallMs", () => {
+  const ONE_DOLLAR_PER_TOKEN = {
+    asOf: "2024-01-01",
+    models: {
+      "test-model": { inputPerMillionUsd: 1_000_000, outputPerMillionUsd: 0, asOf: "2024-01-01" },
+    },
+  };
+  const pricing = { modelId: "test-model", table: ONE_DOLLAR_PER_TOKEN };
+
+  it("成本越过上限就停，且这一轮的工具不会被派发", async () => {
+    const cwd = await tempDir();
+    const planner = new CompletingPlanner(makeDraft({}), ["criterion-1"]);
+    const model = new FakeModelDriver([
+      withUsage(turnWithTools(echoCall), { inputTokens: 1, outputTokens: 0 }),
+      textTurn("不该跑到这里"),
+    ]);
+    const result = await runAgentLoop(
+      "花掉超过上限的钱",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        pricing,
+        maxCostUsd: 0.5,
+      }),
+    );
+
+    expect(result.stopReason).toBe("max_cost");
+    // 关键点：钱在模型边界就超了，工具不该再执行。
+    expect(result.state.contextSources.some((source) => source.kind === "tool_observation")).toBe(
+      false,
+    );
+    expect(result.state.budget.toolCalls).toBe(0);
+
+    // 诊断进的是权威状态的运行时事件（与 max_steps / max_tool_calls 一致）。
+    const [detail] = result.state.events.filter((event) => event.type === "budget_exhausted");
+    expect(detail?.detail).toContain('"reason":"max_cost"');
+    expect(detail?.detail).toContain('"maxCostUsd":0.5');
+  });
+
+  it("没越过上限时照常跑完", async () => {
+    const cwd = await tempDir();
+    const planner = new CompletingPlanner(makeDraft({}), ["criterion-1"]);
+    const model = new FakeModelDriver([
+      withUsage(turnWithTools(echoCall), { inputTokens: 1, outputTokens: 0 }),
+      withUsage(textTurn("做完了"), { inputTokens: 1, outputTokens: 0 }),
+    ]);
+
+    const result = await runAgentLoop(
+      "正常花一点钱",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        pricing,
+        maxCostUsd: 5,
+      }),
+    );
+
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.answer).toBe("做完了");
+  });
+
+  it("设了成本上限却算不出价格时停下并说明，而不是假装没花钱", async () => {
+    const cwd = await tempDir();
+    const planner = new CompletingPlanner(makeDraft({}), ["criterion-1"]);
+    const model = new FakeModelDriver([
+      withUsage(textTurn("答案"), { inputTokens: 10, outputTokens: 0 }),
+    ]);
+
+    const result = await runAgentLoop(
+      "价格未知",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        // 价目表里没有 test-model：成本恒为 unknown。
+        pricing: { modelId: "test-model", table: { asOf: "2024-01-01", models: {} } },
+        maxCostUsd: 0.5,
+      }),
+    );
+
+    expect(result.stopReason).toBe("max_cost");
+    const [detail] = result.state.events.filter((event) => event.type === "budget_exhausted");
+    expect(detail?.detail).toContain('"cost":"unknown"');
+  });
+
+  it("墙钟超过上限就停", async () => {
+    const cwd = await tempDir();
+    const planner = new CompletingPlanner(makeDraft({}), ["criterion-1"]);
+    let nowMs = Date.parse("2024-01-01T00:00:00.000Z");
+    const clock = { now: () => new Date(nowMs) };
+    const model = new FakeModelDriver([
+      // 这一轮"花了"10 秒，超过 5 秒的上限。
+      withUsage(turnWithTools(echoCall), { inputTokens: 1, outputTokens: 0 }),
+      textTurn("不该跑到这里"),
+    ]);
+    const result = await runAgentLoop(
+      "跑得太久",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        clock: {
+          now: () => {
+            nowMs += 10_000;
+            return clock.now();
+          },
+        },
+        maxWallMs: 5_000,
+      }),
+    );
+
+    expect(result.stopReason).toBe("max_wall_ms");
+    expect(result.state.budget.toolCalls).toBe(0);
+    const [detail] = result.state.events.filter((event) => event.type === "budget_exhausted");
+    expect(detail?.detail).toContain('"reason":"max_wall_ms"');
+    expect(detail?.detail).toContain('"maxWallMs":5000');
   });
 });

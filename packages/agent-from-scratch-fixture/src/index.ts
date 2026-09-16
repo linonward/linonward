@@ -16,7 +16,7 @@ import {
   type JournalRunUsage,
 } from "./cli-journal.js";
 import { createVerboseObserver, readBudgetExhaustedDetail } from "./cli-verbose.js";
-import { applyUserAnswer } from "./interaction.js";
+import { applyUserAnswer, grantApproval } from "./interaction.js";
 import type { ModelDriver } from "./model.js";
 import type { Planner } from "./planner.js";
 import type { ApprovalLedger, PolicyContext } from "./policy.js";
@@ -27,6 +27,7 @@ import {
   loopOptionsFromRuntime,
   restoreRun,
   resumeAgentRun,
+  type ToolStateVerifier,
   toDurableState,
 } from "./recovery.js";
 import { createRunCheckpoint, type RunStore } from "./run-store.js";
@@ -296,9 +297,18 @@ export interface AgentCliOptions {
   sandbox?: Sandbox | undefined;
   /** 显式要求隔离：`true` 时没有可用沙箱就拒绝执行。 */
   requireSandbox?: boolean | undefined;
+  /**
+   * 崩溃恢复的对账器：工具名 → 判定"在途调用是否已生效"。
+   * 只影响 `resume` / `answer` 的恢复路径（首次运行不需要它）。
+   */
+  verifiers?: Record<string, ToolStateVerifier> | undefined;
   validationSpecs?: ValidationSpec[] | undefined;
   maxSteps?: number | undefined;
   maxToolCalls?: number | undefined;
+  /** 花费上限（美元）：缺省不限制。 */
+  maxCostUsd?: number | undefined;
+  /** 墙钟上限（毫秒）：缺省不限制。 */
+  maxWallMs?: number | undefined;
   /** 完整日志的工具钩子；由装配层接到 journal。 */
   onToolCall?: AgentLoopOptions["onToolCall"];
   /** 成本估算接线；由装配层从模型 id + 价目表解析。 */
@@ -322,6 +332,7 @@ export function createAgentRuntime(base: AgentCliOptions, input: CliRuntimeInput
     writeLease: base.writeLease ?? new InMemoryWriteLease(),
     sandbox: base.sandbox,
     requireSandbox: base.requireSandbox,
+    verifiers: base.verifiers,
     validationSpecs: base.validationSpecs,
     signal: input.signal,
     onEvent: input.onEvent,
@@ -346,6 +357,8 @@ export function createAgentCliRuntime(
         const state = createInitialState(task, options.cwd, {
           maxSteps: options.maxSteps ?? 12,
           maxToolCalls: options.maxToolCalls ?? 24,
+          ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+          ...(options.maxWallMs !== undefined ? { maxWallMs: options.maxWallMs } : {}),
         });
         const lease = await options.store.acquireLease(state.runId, randomUUID(), CLI_LEASE_TTL_MS);
 
@@ -372,7 +385,27 @@ export function createAgentCliRuntime(
 
         try {
           const now = runtime.clock.now();
-          const resumed = applyUserAnswer(fromDurableState(restored.state), answer, now);
+          // 审批与澄清是两条不同的恢复路径：审批只是放行一次调用（凭证进账本，
+          // 由重放的调用消费），澄清才把回答写进上下文。搞错会以
+          // `unexpected_user_input` 或 `invalid state transition: waiting -> waiting` 收场。
+          const approvals = runtime.approvals;
+          if (approvals === undefined) {
+            throw new Error("internal: runtime 缺少 approvals，无法受理回答");
+          }
+          const pendingApproval = (await approvals.pendingRequests(runId)).find(
+            (request) => request.id === answer.requestId,
+          );
+
+          const resumed =
+            pendingApproval === undefined
+              ? applyUserAnswer(fromDurableState(restored.state), answer, now)
+              : await grantApproval({
+                  approvals,
+                  state: fromDurableState(restored.state),
+                  requestId: answer.requestId,
+                  now,
+                });
+
           // store 的序号由 store 自己决定：内存日志含 `step_started` 等运行时事件，
           // 两个计数器并不共用，用 `state.nextEventSequence` 会被拒绝为 unexpected_sequence。
           const persisted = await options.store.readEvents(runId, 0);
@@ -381,11 +414,14 @@ export function createAgentCliRuntime(
             expectedSequence: (persisted.at(-1)?.sequence ?? 0) + 1,
             ownerId: restored.lease.ownerId,
             epoch: restored.lease.epoch,
-            event: {
-              type: "user_input_received",
-              requestId: answer.requestId,
-              content: answer.content,
-            },
+            event:
+              pendingApproval === undefined
+                ? {
+                    type: "user_input_received",
+                    requestId: answer.requestId,
+                    content: answer.content,
+                  }
+                : { type: "approval_granted", requestId: answer.requestId },
             now,
           });
 

@@ -42,12 +42,21 @@ import type {
   ValidationSpec,
 } from "./types.js";
 
-/** 工具声明自己的恢复策略；未知调用绝不能因为"多数时候没事"就标记完成。 */
+/**
+ * 工具声明自己的恢复策略；未知调用绝不能因为"多数时候没事"就标记完成。
+ *
+ * `ambiguous`（"确定不了"）必须是显式的：把它挤进 `not_applied` 会让循环以为副作用
+ * 没发生，从而**重复执行**；挤进 `applied` 则会凭空造出一个没发生过的结果。
+ */
 export interface ToolStateVerifier {
   verify(input: {
     call: PersistedToolCall;
     state: DurableAgentState;
-  }): Promise<{ status: "applied"; output: string } | { status: "not_applied" }>;
+  }): Promise<
+    | { status: "applied"; output: string }
+    | { status: "not_applied" }
+    | { status: "ambiguous"; reason: string }
+  >;
 }
 
 export type RecoveryPolicy =
@@ -146,6 +155,9 @@ export function reduceDurableEvent(
       return { ...state, status: "waiting", stopReason: event.reason };
     case "user_input_received":
       return state;
+    case "approval_granted":
+      // 批准把运行拉回 running；后续的 run_stopped 会按新的停止原因覆盖状态。
+      return { ...state, status: "running" };
     case "run_stopped":
       return { ...state, status: statusForStopReason(event.reason), stopReason: event.reason };
     default:
@@ -272,6 +284,9 @@ export async function reconcileInFlightTool(
   }
 
   const verified = await verifier.verify({ call, state });
+  if (verified.status === "ambiguous") {
+    return { type: "manual_reconciliation", reason: verified.reason };
+  }
   const output =
     verified.status === "applied"
       ? verified.output
@@ -332,6 +347,10 @@ export function loopOptionsFromRuntime(
     skillsDirectory: runtime.skillsDirectory,
     maxSteps: state.budget.maxSteps,
     maxToolCalls: state.budget.maxToolCalls,
+    // 钱与时间的上限同样随权威状态走：`runAgentLoop` 会用它重新建初始状态，
+    // 只把上限写进"预先建好的 state"是不够的。
+    ...(state.budget.maxCostUsd !== undefined ? { maxCostUsd: state.budget.maxCostUsd } : {}),
+    ...(state.budget.maxWallMs !== undefined ? { maxWallMs: state.budget.maxWallMs } : {}),
     toolTimeoutMs: runtime.toolTimeoutMs,
     model: runtime.model,
     planner: runtime.planner,

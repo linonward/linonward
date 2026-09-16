@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Executable reference implementation of the apps/tutorial agent-from-scratch project.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "agent": "node --env-file-if-exists=.env --import tsx scripts/agent.ts",
     "lint": "eslint src tests scripts --max-warnings=0",

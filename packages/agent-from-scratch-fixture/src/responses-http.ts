@@ -1,4 +1,10 @@
-import type { Model, ModelUsage, NormalizedModelResponse, ResponsesClientLike } from "./model.js";
+import type {
+  Model,
+  ModelResponseContentPart,
+  ModelUsage,
+  NormalizedModelResponse,
+  ResponsesClientLike,
+} from "./model.js";
 import { parseModelUsage } from "./model.js";
 
 /**
@@ -60,10 +66,12 @@ export interface ResponseOutputItem {
   content?: readonly ResponseContentPart[];
 }
 
-export interface ResponseContentPart {
-  type?: string;
-  text?: string;
-}
+/**
+ * `message` item 的 `output_text` 与 `reasoning` item 的 `reasoning_text` 分片共用
+ * `text` 字段：正文靠 `type` 区分，不靠字段名。
+ * 直接复用 `model.ts` 的定义，避免归一化层与 `toModelTurn` 对同一份 provider 形状各写一遍。
+ */
+export type ResponseContentPart = ModelResponseContentPart;
 
 /**
  * 归一化结果：`id` 保留、`output` 原样映射、`output_text` 从 message 块聚合、
@@ -78,6 +86,12 @@ export interface ResponsesHttpOptions {
   timeoutMs?: number | undefined;
   /** 附带的额外重试次数（首次尝试不计）。默认 2。 */
   maxRetries?: number | undefined;
+  /**
+   * 外部取消信号（例如"中止这次运行"）。它必须能打断**正在等待的模型调用**：
+   * 只让循环在下一步检查信号是不够的——用户点了中止，却还要干等一次 60 秒超时。
+   * 中止后不再重试。
+   */
+  signal?: AbortSignal | undefined;
 }
 
 export const DEFAULT_RESPONSES_TIMEOUT_MS = 60_000;
@@ -229,6 +243,7 @@ export function createResponsesHttpClient(options: ResponsesHttpOptions): Respon
   const url = appendPath(options.baseUrl ?? DEEPSEEK_DEFAULTS.baseUrl, "/responses");
 
   const attempt = async (body: ResponsesHttpBody): Promise<ResponseResult> => {
+    const timeout = AbortSignal.timeout(timeoutMs);
     const response = await fetchImpl(url, {
       method: "POST",
       headers: {
@@ -236,7 +251,7 @@ export function createResponsesHttpClient(options: ResponsesHttpOptions): Respon
         authorization: `Bearer ${options.apiKey}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: options.signal ? AbortSignal.any([timeout, options.signal]) : timeout,
     });
 
     if (!response.ok) {
@@ -267,6 +282,11 @@ export function createResponsesHttpClient(options: ResponsesHttpOptions): Respon
             // 没有状态码意味着网络层错误（连接重置、超时中止等），同样值得重试。
             const retryable =
               httpError === undefined ? true : httpError.status === 429 || httpError.status >= 500;
+
+            // 被外部取消时立刻收手：不再退避重试，也不再等下一次超时。
+            if (options.signal?.aborted === true) {
+              throw new ResponsesHttpError(0, "", "DeepSeek Responses API 请求已被取消");
+            }
 
             if (!retryable || retry >= maxRetries) {
               if (httpError) throw httpError;
