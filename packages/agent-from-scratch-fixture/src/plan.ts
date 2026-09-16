@@ -138,6 +138,42 @@ export function reconcilePlan(current: TaskPlan, draft: PlanDraft, reason: Repla
   };
 }
 
+/**
+ * 跳过规划模型时使用的单步计划。
+ *
+ * 调用方已经判定任务简单（`AgentLoopOptions.skipPlan`），因此这里不猜步骤内容，只把
+ * "给出回答"写成一条必然可满足的准则。标记 `shortcut: true` 让完成门禁知道：
+ * 这一轮模型直接给文本就是完成，没有工具 observation 可以引用。
+ */
+export function createShortcutPlan(goal: string): TaskPlan {
+  const trimmed = goal.trim();
+  return {
+    version: 1,
+    goal,
+    shortcut: true,
+    acceptanceCriteria: [
+      {
+        id: "answer-delivered",
+        description:
+          trimmed.length === 0
+            ? "已针对任务给出回答。"
+            : `已回答任务（${trimmed}）：给出可直接阅读的最终回答。`,
+        status: "unverified",
+      },
+    ],
+    steps: [
+      {
+        id: "answer",
+        title: "直接回答任务",
+        status: "pending",
+        dependsOn: [],
+        completionEvidence: "模型的最终回答文本",
+        evidence: [],
+      },
+    ],
+  };
+}
+
 /** 当前版本进入 Prompt；旧版本留在审计日志中。 */
 export function planAsContextSource(
   plan: TaskPlan,
@@ -152,6 +188,7 @@ export function planAsContextSource(
       acceptanceCriteria: plan.acceptanceCriteria,
       steps: plan.steps,
       activeStepId: activeStep?.id,
+      ...(plan.shortcut === true ? { shortcut: true } : {}),
     }),
     priority: 99,
   };

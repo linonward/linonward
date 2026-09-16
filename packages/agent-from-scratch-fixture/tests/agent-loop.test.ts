@@ -86,6 +86,7 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
   if (overrides.maxWallMs !== undefined) options.maxWallMs = overrides.maxWallMs;
   if (overrides.runId !== undefined) options.runId = overrides.runId;
   if (overrides.persistence !== undefined) options.persistence = overrides.persistence;
+  if (overrides.skipPlan !== undefined) options.skipPlan = overrides.skipPlan;
   return options;
 }
 
@@ -235,6 +236,54 @@ describe("agent loop control flow", () => {
     );
     expect(noTools.stopReason).toBe("max_tool_calls");
     expect(noTools.state.budget.toolCalls).toBe(0);
+  });
+
+  it("short-circuits planning for a task the caller marked as single-step", async () => {
+    const cwd = await tempDir();
+    const planner = new ScriptedPlanner(makeDraft({}));
+    const model = new FakeModelDriver([textTurn("你好，我在。")]);
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        skipPlan: (task) => task.trim().length <= 4,
+      }),
+    );
+
+    // 规划器一次都没被调用，运行仍然收敛成 final_answer。
+    expect(planner.createInputs).toHaveLength(0);
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.status).toBe("completed");
+    expect(result.answer).toBe("你好，我在。");
+    // 合成计划是单步单准则，并且真的进了模型上下文。
+    expect(result.state.plan?.steps).toHaveLength(1);
+    expect(result.state.plan?.acceptanceCriteria).toHaveLength(1);
+    expect(JSON.stringify(model.turns[0]?.request)).toContain("answer-delivered");
+  });
+
+  it("still runs the standard plan path when the caller does not mark the task", async () => {
+    const cwd = await tempDir();
+    // 走标准路径时完成门禁仍然生效：模型必须真的做一步，并拿到评估过的证据。
+    const planner = new ScriptedPlanner(makeDraft({}), [
+      completeWith([echoObservation], ["criterion-1"]),
+    ]);
+    const model = new FakeModelDriver([turnWithTools(echoCall), textTurn("完成")]);
+
+    const result = await runAgentLoop(
+      "读取 package.json 并总结",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        skipPlan: (task) => task.trim().length <= 4,
+      }),
+    );
+
+    expect(planner.createInputs).toHaveLength(1);
+    expect(result.stopReason).toBe("final_answer");
   });
 
   it("stops with plan_error and a run_stopped event when plan creation fails", async () => {

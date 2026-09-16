@@ -24,6 +24,7 @@ import {
   assertEvidenceComesFromObservations,
   completeStep,
   createInitialPlan,
+  createShortcutPlan,
   planAsContextSource,
   reconcilePlan,
   selectNextStep,
@@ -277,6 +278,13 @@ export interface AgentLoopOptions {
    * 第 3 次直接拦截。`false` 时回到旧行为——完全相同的调用也照常执行。
    */
   repeatGuard?: boolean | undefined;
+  /**
+   * 调用方判定"这个任务不需要规划"时跳过规划模型，改用合成的单步计划（见 `createShortcutPlan`）。
+   *
+   * 省掉一次规划调用，也避开了"简单任务反而触发计划契约失败"这条路径。判定权在调用方：
+   * loop 不猜任务难度，**未提供时行为与今天完全一致**（每次都调规划器）。
+   */
+  skipPlan?: ((task: string) => boolean) | undefined;
 }
 
 /** 续跑时由恢复器注入：上一轮的 responseId 与尚未送达模型的结果。 */
@@ -1177,12 +1185,15 @@ async function runNewLoop(
   let plan: TaskPlan;
   try {
     state.skills.catalog = await discoverSkills(options.skillsDirectory);
-    plan = await createInitialPlan(
-      state.task,
-      summarizeSources(state.contextSources),
-      options.tools.names(),
-      options.planner,
-    );
+    plan =
+      options.skipPlan?.(state.task) === true
+        ? createShortcutPlan(state.task)
+        : await createInitialPlan(
+            state.task,
+            summarizeSources(state.contextSources),
+            options.tools.names(),
+            options.planner,
+          );
   } catch (error) {
     return stopForPlanError(state, context, error);
   }
@@ -1573,6 +1584,17 @@ async function runLoopFromState(
     if (turn.toolCalls.length === 0) {
       const answer = turn.finalText.trim();
       if (!answer) return finishStop(state, "invalid_model_output", context);
+
+      // 单步短路计划：这一轮直接给文本就是完成。没有工具 observation 可以引用，
+      // 因此既不该调 `planner.evaluate`，也不该被计划门禁打回。
+      if (plan.shortcut === true) {
+        for (const criterion of plan.acceptanceCriteria) criterion.status = "passed";
+        for (const step of plan.steps) {
+          if (step.status !== "completed") plan = completeStep(plan, step.id, "model_final_text");
+        }
+        state.plan = plan;
+        state.activeStepId = undefined;
+      }
 
       const completionError = await checkCompletion(state);
       const planCompleted = allStepsCompleted(plan);

@@ -2,7 +2,13 @@ import type { ModelMessage } from "./context.js";
 import { extractJsonObject } from "./json-object.js";
 import type { Model } from "./model.js";
 import type { ReplanReason } from "./plan.js";
-import { type PlanDraft, type PlanEvaluation, type Planner, validatePlan } from "./planner.js";
+import {
+  type PlanDraft,
+  type PlanEvaluation,
+  type Planner,
+  validatePlan,
+  withDefaultCriterion,
+} from "./planner.js";
 import type { AcceptanceCriterion } from "./types.js";
 
 /** 供调用方直接 `import { extractJsonObject } from "./planner-model.js"`。 */
@@ -263,6 +269,16 @@ async function requestModelJson<T>(request: ModelJsonRequest<T>): Promise<T> {
   throw lastError ?? new Error(`${request.label}返回了非法 JSON`);
 }
 
+/**
+ * 只做「够得着兜底逻辑」的形状判断：criteria 与 steps 是数组。
+ * 元素级契约（id 唯一、依赖不成环、字段齐全）仍由 `validatePlan` 负责报错。
+ */
+function isPlanDraftShape(value: unknown): value is PlanDraft {
+  return (
+    isRecord(value) && Array.isArray(value["acceptanceCriteria"]) && Array.isArray(value["steps"])
+  );
+}
+
 /** Planner 的模型适配器：只解析结构化文本，不做状态写入。 */
 export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
   return {
@@ -273,7 +289,10 @@ export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
         payload: input,
         label: "create",
         parse: (raw) => {
-          const candidate = parseJson(raw, "create");
+          const parsed = parseJson(raw, "create");
+          const candidate = isPlanDraftShape(parsed)
+            ? withDefaultCriterion(parsed, input.goal)
+            : parsed;
           validatePlan(candidate);
           return candidate;
         },

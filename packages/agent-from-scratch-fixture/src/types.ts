@@ -116,6 +116,13 @@ export interface TaskPlan {
   acceptanceCriteria: AcceptanceCriterion[];
   steps: PlanStep[];
   revisionReason?: string | undefined;
+  /**
+   * 调用方判定任务足够简单、跳过规划模型后合成的单步计划。
+   *
+   * 完成门禁据此放行"模型直接给出最终文本"这一轮：没有工具 observation 可引用，
+   * 也就不该再去调 `planner.evaluate`。
+   */
+  shortcut?: boolean | undefined;
 }
 
 export interface PlanHistoryEntry {

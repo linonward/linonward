@@ -117,6 +117,34 @@ export function validatePlan(candidate: unknown): asserts candidate is PlanDraft
   for (const id of ids) visit(id);
 }
 
+/**
+ * 模型给出了步骤、却把 `acceptanceCriteria` 留空时的确定性兜底。
+ *
+ * 规划器反复要求"至少一条验收条件"，但真实模型对寒暄、纯问答这类任务很容易返回
+ * `acceptanceCriteria: []`——它认为"没有可验证的产物"。此时整次运行不该因为一条
+ * 形式化的准则而失败：补一条总是可满足的准则（"给出回答"），其余契约照常校验。
+ *
+ * 只兜底 criteria，**不**兜底 steps：空步骤意味着模型根本没说怎么做，那仍然要报错
+ * 并让调用方决定（例如换成单步短路计划）。
+ */
+export function withDefaultCriterion(draft: PlanDraft, goal: string): PlanDraft {
+  if (draft.acceptanceCriteria.length > 0) return draft;
+
+  const trimmed = goal.trim();
+  return {
+    ...draft,
+    acceptanceCriteria: [
+      {
+        id: "answer-delivered",
+        description:
+          trimmed.length === 0
+            ? "已针对任务给出回答，且回答有可观察依据。"
+            : `已针对任务给出回答（任务：${trimmed}），且回答有可观察依据。`,
+      },
+    ],
+  };
+}
+
 export async function createInitialPlan(
   goal: string,
   context: string,
