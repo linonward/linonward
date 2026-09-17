@@ -22,11 +22,35 @@ export const brand = {
   navItems: [
     { label: "关于", href: "#about" },
     { label: "内容", href: "#content" },
+    { label: "教程", href: "#tutorial" },
     { label: "文章", href: "https://notes.linonward.com" },
     { label: "Skills", href: "https://skills.linonward.com" },
     { label: "产品", href: "#products" },
     { label: "关注", href: "#follow" },
   ],
+  tutorial: {
+    name: "从 0 构建 Agent",
+    /** 教程站点的地址：换域名只需要改这一处。 */
+    href: "https://tutorial.linonward.com",
+    eyebrow: "TUTORIAL / AGENT FROM SCRATCH",
+    headline: "把 Agent，从 0 搭出来。",
+    description:
+      "从模型调用开始，逐步构建一个能理解任务、使用工具、修改代码并完成验证的本地工程 Agent。",
+    highlights: [
+      {
+        title: "18 章主线 + 6 篇扩展",
+        detail: "从一次模型调用开始，逐章搭出 Harness、工具链、权限与 Agent Loop。",
+      },
+      {
+        title: "每一章都能跑",
+        detail: "正文与可执行参考实现同步维护，Checkpoint 点名的测试真实存在。",
+      },
+      {
+        title: "可验证，也可控",
+        detail: "权限策略、人工审批、进程隔离与崩溃恢复，都在教程里逐步接上。",
+      },
+    ],
+  },
   product: {
     name: "Interview Pack",
     href: "https://interview.linonward.com",

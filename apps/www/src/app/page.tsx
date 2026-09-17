@@ -147,6 +147,52 @@ export default function Home() {
         </section>
 
         <section
+          id="tutorial"
+          className="border-b border-line py-[clamp(72px,8vw,112px)] max-sm:py-16"
+          aria-labelledby="tutorial-title"
+        >
+          <div className="mx-auto w-[min(1200px,calc(100%_-_48px))] max-[899px]:w-[min(calc(100%_-_40px),720px)] max-sm:w-[calc(100%_-_40px)]">
+            <Reveal className="flex flex-wrap items-end justify-between gap-x-[clamp(32px,6vw,96px)] gap-y-8 max-[899px]:flex-col max-[899px]:items-start">
+              <div className="max-w-165">
+                <p className="mb-6.5 text-xs font-extrabold tracking-[0.26em] before:mr-3.5 before:inline-block before:h-px before:w-9 before:align-middle before:bg-current before:content-['']">
+                  {brand.tutorial.eyebrow}
+                </p>
+                <h2
+                  className="mb-5 text-[clamp(32px,3.8vw,50px)] leading-[1.16] font-extrabold tracking-[-0.045em] max-sm:text-[clamp(28px,8.6vw,38px)]"
+                  id="tutorial-title"
+                >
+                  {brand.tutorial.headline}
+                </h2>
+                <p className="mb-0 max-w-150 text-[17px] text-ink-soft">
+                  {brand.tutorial.description}
+                </p>
+              </div>
+              <a
+                className="inline-flex min-h-12.5 cursor-pointer items-center justify-center gap-2.5 rounded-xs border border-transparent bg-brand-orange px-5.5 py-3 font-[750] leading-[1.2] text-brand-navy transition-[transform,background-color,color] duration-180 hover:-translate-y-0.5 hover:bg-[#ff9a58] motion-reduce:hover:translate-y-0 max-sm:w-full [&_svg]:size-4.5 [&_svg]:stroke-2"
+                href={brand.tutorial.href}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                开始读《{brand.tutorial.name}》 <ExternalLink aria-hidden="true" />
+              </a>
+            </Reveal>
+            <div className="mt-14 grid grid-cols-3 border-y border-line max-sm:mt-11 max-sm:grid-cols-1">
+              {brand.tutorial.highlights.map((item) => (
+                <Reveal
+                  className="border-l border-line py-8 pr-8.5 pl-8.5 first:border-l-0 first:pl-0 max-sm:border-t max-sm:border-l-0 max-sm:px-0 max-sm:py-6 max-sm:first:border-t-0"
+                  key={item.title}
+                >
+                  <h3 className="mb-3 text-[21px] leading-[1.25] font-bold max-sm:text-lg">
+                    {item.title}
+                  </h3>
+                  <p className="mb-0 max-w-68 text-[15px] text-muted">{item.detail}</p>
+                </Reveal>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section
           id="products"
           className="border-y border-line bg-surface py-[clamp(92px,10vw,148px)] max-sm:py-20.5"
           aria-labelledby="products-title"
