@@ -1,3 +1,6 @@
+/** 教程站点地址：导航与页内区块共用这一处定义，换域名只改这里。 */
+const TUTORIAL_URL = "https://tutorial.linonward.com";
+
 export const brand = {
   siteUrl: "https://www.linonward.com",
   englishName: "linonward",
@@ -22,7 +25,8 @@ export const brand = {
   navItems: [
     { label: "关于", href: "#about" },
     { label: "内容", href: "#content" },
-    { label: "教程", href: "#tutorial" },
+    // 点导航直接去教程站，而不是滚到页内区块。
+    { label: "教程", href: TUTORIAL_URL },
     { label: "文章", href: "https://notes.linonward.com" },
     { label: "Skills", href: "https://skills.linonward.com" },
     { label: "产品", href: "#products" },
@@ -30,8 +34,7 @@ export const brand = {
   ],
   tutorial: {
     name: "从 0 构建 Agent",
-    /** 教程站点的地址：换域名只需要改这一处。 */
-    href: "https://tutorial.linonward.com",
+    href: TUTORIAL_URL,
     eyebrow: "TUTORIAL / AGENT FROM SCRATCH",
     headline: "把 Agent，从 0 搭出来。",
     description:
