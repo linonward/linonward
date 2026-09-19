@@ -336,6 +336,19 @@ export function deriveStopHint(detail: JournalRecord): string | undefined {
     if (summary === undefined) return reason === undefined ? undefined : `plan_blocked: ${reason}`;
     return reason === undefined ? summary : `${summary}（reason=${reason}）`;
   }
+  if (kind === "plan_error") {
+    const phase = readString(detail, "phase");
+    const reason = readString(detail, "reason");
+    const message = readString(detail, "message");
+    const where = [
+      phase === undefined ? undefined : `phase=${phase}`,
+      reason === undefined ? undefined : `reason=${reason}`,
+    ]
+      .filter((part): part is string => part !== undefined)
+      .join("；");
+    const head = where.length === 0 ? "计划创建失败" : `计划创建失败（${where}）`;
+    return message === undefined ? head : `${head}：${message}`;
+  }
   if (kind !== "budget_exhausted") return undefined;
 
   const parts: string[] = [];

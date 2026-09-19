@@ -1,5 +1,3 @@
-import { extractJsonObject } from "./json-object.js";
-import type { Model } from "./model.js";
 import type { ReplanReason } from "./plan.js";
 import type { AcceptanceCriterion, PlanStep, TaskPlan } from "./types.js";
 
@@ -119,6 +117,34 @@ export function validatePlan(candidate: unknown): asserts candidate is PlanDraft
   for (const id of ids) visit(id);
 }
 
+/**
+ * 模型给出了步骤、却把 `acceptanceCriteria` 留空时的确定性兜底。
+ *
+ * 规划器反复要求"至少一条验收条件"，但真实模型对寒暄、纯问答这类任务很容易返回
+ * `acceptanceCriteria: []`——它认为"没有可验证的产物"。此时整次运行不该因为一条
+ * 形式化的准则而失败：补一条总是可满足的准则（"给出回答"），其余契约照常校验。
+ *
+ * 只兜底 criteria，**不**兜底 steps：空步骤意味着模型根本没说怎么做，那仍然要报错
+ * 并让调用方决定（例如换成单步短路计划）。
+ */
+export function withDefaultCriterion(draft: PlanDraft, goal: string): PlanDraft {
+  if (draft.acceptanceCriteria.length > 0) return draft;
+
+  const trimmed = goal.trim();
+  return {
+    ...draft,
+    acceptanceCriteria: [
+      {
+        id: "answer-delivered",
+        description:
+          trimmed.length === 0
+            ? "已针对任务给出回答，且回答有可观察依据。"
+            : `已针对任务给出回答（任务：${trimmed}），且回答有可观察依据。`,
+      },
+    ],
+  };
+}
+
 export async function createInitialPlan(
   goal: string,
   context: string,
@@ -138,35 +164,7 @@ export async function createInitialPlan(
   };
 }
 
-/** Planner 的模型适配器：只解析结构化文本，不做状态写入。 */
-export function createModelPlanCreator(model: Model): Pick<Planner, "create"> {
-  return {
-    async create(input) {
-      const raw = await model.generate({
-        instructions: [
-          "You create short, executable plans for repository tasks.",
-          "Return one JSON object and no Markdown fences or commentary.",
-          "Use exactly this shape:",
-          '{"acceptanceCriteria":[{"id":"...","description":"..."}],',
-          '"steps":[{"id":"...","title":"...","dependsOn":[],',
-          '"completionEvidence":"..."}]}',
-          "Every step must be possible with the declared tools.",
-          "Every completionEvidence must describe observable evidence (a tool observation).",
-          "Prefer the fewest steps and the fewest acceptance criteria that still prove the goal.",
-          "A read-only question usually needs a single step and a single acceptance criterion.",
-          "Do not add extra verification steps that the declared tools cannot produce evidence for.",
-        ].join("\n"),
-        input: [{ role: "user", content: JSON.stringify(input) }],
-      });
-
-      let candidate: unknown;
-      try {
-        candidate = extractJsonObject(raw);
-      } catch {
-        throw new Error("planner returned invalid JSON");
-      }
-      validatePlan(candidate);
-      return candidate;
-    },
-  };
-}
+/**
+ * `create` 只由模型适配器（`planner-model.ts`）实现：它复用同一套"解析 → 校验 → 带错误
+ * 有界重试"的契约适配器，因此不再在这里保留一份不重试的旧实现。
+ */

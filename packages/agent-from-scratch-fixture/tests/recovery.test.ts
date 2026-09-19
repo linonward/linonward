@@ -303,7 +303,9 @@ describe("run store fencing and event log", () => {
     clock.advance(LEASE_TTL_MS * 2);
     const restored = await restoreRun({ runId, ownerId: ownerB, store });
     expect(restored.lease.epoch).toBe(lease.epoch + 1);
-    expect(restored.state.plan.goal).toBe("完成任务");
+    // 计划在这一层是可选的（`plan_error` 的终态检查点没有计划），但这个检查点有。
+    expect(restored.state.plan).toBeDefined();
+    expect(restored.state.plan?.goal).toBe("完成任务");
   });
 });
 

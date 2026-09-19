@@ -24,6 +24,7 @@ import {
   assertEvidenceComesFromObservations,
   completeStep,
   createInitialPlan,
+  createShortcutPlan,
   planAsContextSource,
   reconcilePlan,
   selectNextStep,
@@ -277,6 +278,13 @@ export interface AgentLoopOptions {
    * 第 3 次直接拦截。`false` 时回到旧行为——完全相同的调用也照常执行。
    */
   repeatGuard?: boolean | undefined;
+  /**
+   * 调用方判定"这个任务不需要规划"时跳过规划模型，改用合成的单步计划（见 `createShortcutPlan`）。
+   *
+   * 省掉一次规划调用，也避开了"简单任务反而触发计划契约失败"这条路径。判定权在调用方：
+   * loop 不猜任务难度，**未提供时行为与今天完全一致**（每次都调规划器）。
+   */
+  skipPlan?: ((task: string) => boolean) | undefined;
 }
 
 /** 续跑时由恢复器注入：上一轮的 responseId 与尚未送达模型的结果。 */
@@ -395,8 +403,6 @@ function createDurableWriter(input: {
     async checkpoint(now) {
       if (!persistence) return true;
       if (!initialized) await initialize();
-      // 还没生成计划就没有可持久化的权威状态，恢复链路由后续边界接管。
-      if (!state.plan) return true;
       try {
         await persistence.store.saveCheckpoint(
           createRunCheckpoint({
@@ -1145,16 +1151,153 @@ export async function runAgentLoop(task: string, options: AgentLoopOptions): Pro
     { now: options.clock?.now() ?? new Date(), runId: options.runId },
   );
 
-  state.skills.catalog = await discoverSkills(options.skillsDirectory);
-  state.plan = await createInitialPlan(
-    task,
-    summarizeSources(state.contextSources),
-    options.tools.names(),
-    options.planner,
-  );
-  state.requiredCriterionIds = state.plan.acceptanceCriteria.map((criterion) => criterion.id);
+  // 用量累加器与 LoopContext 在这里就建好：初始计划也是一次真实的模型调用，
+  // 失败时必须能用同一个 context 写出检查点（见 `stopForPlanError`）。
+  const usage = createUsageTracker(options, state);
+  try {
+    return await runNewLoop(state, options, createLoopContext(options, usage));
+  } finally {
+    usage.finish();
+  }
+}
 
-  return runAgentLoopFromState(state, options);
+/**
+ * 新建运行的规划阶段 + 主循环。
+ *
+ * 规划失败是本函数唯一在"第一次落盘之前"就可能抛错的环节，因此这里把它收敛成一次
+ * 可持久化的失败停止，而不是让异常穿透到调用方——穿透会让这次运行在磁盘上不存在。
+ */
+async function runNewLoop(
+  state: AgentState,
+  options: AgentLoopOptions,
+  context: LoopContext,
+): Promise<AgentResult> {
+  // `run_started` 先于规划：它是一次真实的模型调用，失败时那次失败也该留下完整的日志
+  // （`run_started → plan_error → run_stopped`），而不是只剩一条没有起点的停止事件。
+  context.emit(state, { type: "run_started", runId: state.runId });
+  if (context.options.persistence) {
+    // store 为空时先落盘 `run_started`，否则事件日志缺少开头——计划失败时尤其明显。
+    if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
+      return interruptedResult(state);
+    }
+  }
+
+  let plan: TaskPlan;
+  // 规划阶段只有两步：先发现 Skill（环境），再让规划器产出计划（模型边界）。
+  // 失败时带上阶段，操作者才能区分"技能目录有问题"和"模型没按契约输出"。
+  let phase: PlanErrorDetail["phase"] = "skills";
+  try {
+    state.skills.catalog = await discoverSkills(options.skillsDirectory);
+    phase = "plan";
+    plan =
+      options.skipPlan?.(state.task) === true
+        ? createShortcutPlan(state.task)
+        : await createInitialPlan(
+            state.task,
+            summarizeSources(state.contextSources),
+            options.tools.names(),
+            options.planner,
+          );
+  } catch (error) {
+    return stopForPlanError(state, context, error, phase);
+  }
+
+  state.plan = plan;
+  state.requiredCriterionIds = plan.acceptanceCriteria.map((criterion) => criterion.id);
+
+  // `run_started` 已由本函数发出，主循环不再重复。
+  return runLoopFromState(state, options, {}, context, false);
+}
+
+/**
+ * 计划创建失败的诊断：回答"失败在哪一步、是环境问题还是模型没按契约输出"。
+ *
+ * `phase` 区分 Skill 发现与规划本身；`reason` 区分"规划服务不可用"（重试无用）
+ * 与"模型输出不合法"（可归因到契约）。两者处置完全不同，混成一个字符串会让
+ * 操作者只能靠猜。
+ */
+export interface PlanErrorDetail {
+  type: "plan_error";
+  phase: "skills" | "plan";
+  reason: "model_call" | "invalid_plan";
+  message: string;
+}
+
+/** 与"规划服务不可用"（网络 / 鉴权 / 限流 / 上游 5xx）相关的错误码。 */
+const PLAN_MODEL_CALL_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+/**
+ * 分类规划失败。返回码 / 网络错误码在前，契约错误在后：`invalid_plan` 只在
+ * 消息明确形如契约违规（`plan ...`）时才给出，其余归为模型调用失败或计划不可用。
+ */
+function classifyPlanError(error: unknown): PlanErrorDetail["reason"] {
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+  if (code === "ERR_PLANNER_RETRIES" || code === "ERR_PLAN_VALIDATION") return "invalid_plan";
+  if (PLAN_MODEL_CALL_CODES.has(code)) return "model_call";
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("plan ")) return "invalid_plan";
+  if (/\b(401|403|429|5\d\d)\b/.test(message)) return "model_call";
+  return "model_call";
+}
+
+/**
+ * 初始计划创建失败的统一出口：转成 `failed` 状态，落 `run_stopped` 事件与检查点。
+ *
+ * 与 `finishStop` 的差别只有一个：此时 `state.plan` 可能还不存在（规划本身失败），
+ * 因此状态转移不能依赖计划。持久化失败时不抛出——调用方已经拿到一个明确的失败结果。
+ */
+async function stopForPlanError(
+  state: AgentState,
+  context: LoopContext,
+  error: unknown,
+  phase: PlanErrorDetail["phase"],
+): Promise<AgentResult> {
+  const message = error instanceof Error ? error.message : String(error);
+  const detail: PlanErrorDetail = {
+    type: "plan_error",
+    phase,
+    reason: classifyPlanError(error),
+    message,
+  };
+  context.persistRuntime(state, "plan_error", JSON.stringify(detail));
+
+  const stopped = transitionState(state, "failed", "plan_error", context.now());
+  stopped.failedAttempts.push(message);
+  context.emit(stopped, { type: "run_stopped", reason: "plan_error" });
+
+  try {
+    if (await context.persist(stopped, { type: "run_stopped", reason: "plan_error" })) {
+      await context.checkpoint(stopped, context.now());
+    }
+  } catch {
+    // 持久化围栏不可用时保持内存结果：运行仍然是 `failed`，只是没有磁盘痕迹。
+  }
+
+  return { status: "failed", answer: "", stopReason: "plan_error", state: stopped };
+}
+
+/** 从权威状态里取最后一条 `plan_error` 诊断：日志通路（CLI / 控制台）据此渲染原因。 */
+export function readPlanErrorDetail(state: AgentState): PlanErrorDetail | undefined {
+  const event = [...state.events].reverse().find((candidate) => candidate.type === "plan_error");
+  if (event === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(event.detail);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const candidate = parsed as PlanErrorDetail;
+    return candidate.type === "plan_error" ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1175,7 +1318,7 @@ export async function runAgentLoopFromState(
 ): Promise<AgentResult> {
   const usage = createUsageTracker(options, state);
   try {
-    return await runLoopFromState(state, options, resume, usage);
+    return await runLoopFromState(state, options, resume, createLoopContext(options, usage));
   } finally {
     usage.finish();
   }
@@ -1185,9 +1328,9 @@ async function runLoopFromState(
   state: AgentState,
   options: AgentLoopOptions,
   resume: AgentLoopResume,
-  usageTracker: UsageTracker,
+  context: LoopContext,
+  emitRunStarted = true,
 ): Promise<AgentResult> {
-  const context = createLoopContext(options, usageTracker);
   const toolDefinitions = options.tools.definitions();
   const specs = options.validationSpecs ?? [];
 
@@ -1216,11 +1359,14 @@ async function runLoopFromState(
     await context.persist(state, { type: "plan_updated", plan });
   };
 
-  context.emit(state, { type: "run_started", runId: state.runId });
-  if (options.persistence) {
-    // store 为空时先落盘 `run_started`，否则新运行的事件日志会缺少开头。
-    if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
-      return interruptedResult(state);
+  // 新建运行的 `run_started` 已由 `runNewLoop` 在规划之前登记并落盘；续跑时由这里补上。
+  if (emitRunStarted) {
+    context.emit(state, { type: "run_started", runId: state.runId });
+    if (options.persistence) {
+      // store 为空时先落盘 `run_started`，否则新运行的事件日志会缺少开头。
+      if (!(await context.persist(state, { type: "run_started", task: state.task }))) {
+        return interruptedResult(state);
+      }
     }
   }
   if (!state.plan) {
@@ -1504,6 +1650,17 @@ async function runLoopFromState(
     if (turn.toolCalls.length === 0) {
       const answer = turn.finalText.trim();
       if (!answer) return finishStop(state, "invalid_model_output", context);
+
+      // 单步短路计划：这一轮直接给文本就是完成。没有工具 observation 可以引用，
+      // 因此既不该调 `planner.evaluate`，也不该被计划门禁打回。
+      if (plan.shortcut === true) {
+        for (const criterion of plan.acceptanceCriteria) criterion.status = "passed";
+        for (const step of plan.steps) {
+          if (step.status !== "completed") plan = completeStep(plan, step.id, "model_final_text");
+        }
+        state.plan = plan;
+        state.activeStepId = undefined;
+      }
 
       const completionError = await checkCompletion(state);
       const planCompleted = allStepsCompleted(plan);

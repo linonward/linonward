@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -13,7 +14,9 @@ import {
 import { isRecord, sha256 } from "../src/checkpoint.js";
 import { fromDurableState, toDurableState } from "../src/durable-state.js";
 import { FakeModelDriver, textTurn, turnWithTools, withUsage } from "../src/fake-model.js";
+import type { Planner } from "../src/planner.js";
 import { InMemoryApprovalLedger, type PolicyContext } from "../src/policy.js";
+import { LocalFileRunStore } from "../src/run-store.js";
 import { createInitialState, transitionState } from "../src/state.js";
 import { defineTool } from "../src/tool.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
@@ -81,6 +84,9 @@ function base(cwd: string, overrides: LoopOverrides): AgentLoopOptions {
   if (overrides.repeatGuard !== undefined) options.repeatGuard = overrides.repeatGuard;
   if (overrides.maxCostUsd !== undefined) options.maxCostUsd = overrides.maxCostUsd;
   if (overrides.maxWallMs !== undefined) options.maxWallMs = overrides.maxWallMs;
+  if (overrides.runId !== undefined) options.runId = overrides.runId;
+  if (overrides.persistence !== undefined) options.persistence = overrides.persistence;
+  if (overrides.skipPlan !== undefined) options.skipPlan = overrides.skipPlan;
   return options;
 }
 
@@ -126,6 +132,22 @@ function recordAt(items: unknown[], index: number): Record<string, unknown> {
   const value = items[index];
   if (!isRecord(value)) throw new Error(`item ${index} is not an object`);
   return value;
+}
+
+/** 规划器在 `create` 就失败：复用同一条错误，模拟模型违反计划契约且重试后仍不合法。 */
+function failingPlanner(message = "plan requires at least one acceptance criterion"): Planner {
+  const failure = new Error(message);
+  return {
+    async create() {
+      throw failure;
+    },
+    async revise() {
+      throw failure;
+    },
+    async evaluate() {
+      throw failure;
+    },
+  };
 }
 
 describe("agent loop control flow", () => {
@@ -214,6 +236,112 @@ describe("agent loop control flow", () => {
     );
     expect(noTools.stopReason).toBe("max_tool_calls");
     expect(noTools.state.budget.toolCalls).toBe(0);
+  });
+
+  it("short-circuits planning for a task the caller marked as single-step", async () => {
+    const cwd = await tempDir();
+    const planner = new ScriptedPlanner(makeDraft({}));
+    const model = new FakeModelDriver([textTurn("你好，我在。")]);
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        skipPlan: (task) => task.trim().length <= 4,
+      }),
+    );
+
+    // 规划器一次都没被调用，运行仍然收敛成 final_answer。
+    expect(planner.createInputs).toHaveLength(0);
+    expect(result.stopReason).toBe("final_answer");
+    expect(result.status).toBe("completed");
+    expect(result.answer).toBe("你好，我在。");
+    // 合成计划是单步单准则，并且真的进了模型上下文。
+    expect(result.state.plan?.steps).toHaveLength(1);
+    expect(result.state.plan?.acceptanceCriteria).toHaveLength(1);
+    expect(JSON.stringify(model.turns[0]?.request)).toContain("answer-delivered");
+  });
+
+  it("still runs the standard plan path when the caller does not mark the task", async () => {
+    const cwd = await tempDir();
+    // 走标准路径时完成门禁仍然生效：模型必须真的做一步，并拿到评估过的证据。
+    const planner = new ScriptedPlanner(makeDraft({}), [
+      completeWith([echoObservation], ["criterion-1"]),
+    ]);
+    const model = new FakeModelDriver([turnWithTools(echoCall), textTurn("完成")]);
+
+    const result = await runAgentLoop(
+      "读取 package.json 并总结",
+      base(cwd, {
+        model,
+        planner,
+        tools: createRegistry(echoTool),
+        skipPlan: (task) => task.trim().length <= 4,
+      }),
+    );
+
+    expect(planner.createInputs).toHaveLength(1);
+    expect(result.stopReason).toBe("final_answer");
+  });
+
+  it("stops with plan_error and a run_stopped event when plan creation fails", async () => {
+    const cwd = await tempDir();
+    const events: AgentLoopEvent[] = [];
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        model: new FakeModelDriver([]),
+        planner: failingPlanner(),
+        tools: createRegistry(echoTool),
+        onEvent: (event) => events.push(event),
+      }),
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.stopReason).toBe("plan_error");
+    expect(events).toContainEqual({ type: "run_stopped", reason: "plan_error" });
+
+    // 阶段与原因要可读：调用失败（model_call）与"模型输出违反契约"（invalid_plan）处置不同。
+    const detail = result.state.events.find((event) => event.type === "plan_error");
+    expect(detail).toBeDefined();
+    expect(JSON.parse(detail?.detail ?? "{}")).toEqual({
+      type: "plan_error",
+      phase: "plan",
+      reason: "invalid_plan",
+      message: "plan requires at least one acceptance criterion",
+    });
+  });
+
+  it("persists a checkpoint when plan creation fails so the run stays auditable", async () => {
+    const cwd = await tempDir();
+    const runId = "run-plan-error-1";
+    const store = new LocalFileRunStore(join(cwd, "runs"));
+    const lease = await store.acquireLease(runId, "worker", 30_000);
+
+    const result = await runAgentLoop(
+      "hi",
+      base(cwd, {
+        runId,
+        model: new FakeModelDriver([]),
+        planner: failingPlanner(),
+        tools: createRegistry(echoTool),
+        persistence: { store, lease },
+      }),
+    );
+
+    expect(result.stopReason).toBe("plan_error");
+
+    // 运行列表与快照都只读磁盘上的 checkpoint：有它，这次失败才可发现、可审计。
+    const history = await store.loadCheckpointHistory(runId, 1);
+    expect(history).toHaveLength(1);
+    expect(history[0]?.state.status).toBe("failed");
+    expect(history[0]?.state.stopReason).toBe("plan_error");
+
+    const events = await store.readEvents(runId, 0);
+    expect(events.map((record) => record.event.type)).toEqual(["run_started", "run_stopped"]);
   });
 
   it("maps model failures, cancellation and evidence forgery to stable stop reasons", async () => {

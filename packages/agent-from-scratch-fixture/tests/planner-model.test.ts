@@ -120,13 +120,64 @@ describe("createModelPlanner", () => {
     ).resolves.toEqual(DRAFT);
   });
 
-  it("rejects an invalid plan draft from create", async () => {
-    const { model } = scriptedModel([JSON.stringify({ acceptanceCriteria: [], steps: [] })]);
+  it("rejects a plan draft without steps", async () => {
+    const { model } = scriptedModel([
+      JSON.stringify({ acceptanceCriteria: DRAFT.acceptanceCriteria, steps: [] }),
+    ]);
     const planner = createModelPlanner(model);
 
     await expect(planner.create({ goal: "g", context: "c", availableTools: [] })).rejects.toThrow(
-      "plan requires at least one acceptance criterion",
+      "plan requires at least one step",
     );
+  });
+
+  it("retries create once with the contract error when the draft violates the plan contract", async () => {
+    const { model, requests } = scriptedModel([
+      JSON.stringify({ acceptanceCriteria: [], steps: [] }),
+      JSON.stringify(DRAFT),
+    ]);
+    const planner = createModelPlanner(model);
+
+    await expect(
+      planner.create({
+        goal: "把 README 第一行改成 # Hello Agent",
+        context: "c",
+        availableTools: [],
+      }),
+    ).resolves.toEqual(DRAFT);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.input.at(-1)?.content).toContain("plan requires at least one step");
+  });
+
+  it("fills a deterministic acceptance criterion instead of failing when only criteria are empty", async () => {
+    const { model } = scriptedModel([
+      JSON.stringify({ acceptanceCriteria: [], steps: DRAFT.steps }),
+    ]);
+    const planner = createModelPlanner(model);
+
+    const draft = await planner.create({
+      goal: "回答用户的只读问题",
+      context: "c",
+      availableTools: [],
+    });
+
+    expect(draft.steps).toEqual(DRAFT.steps);
+    expect(draft.acceptanceCriteria).toHaveLength(1);
+    expect(draft.acceptanceCriteria[0]?.description).toContain("回答用户的只读问题");
+  });
+
+  it("gives up with the contract error after the bounded create retries", async () => {
+    const empty = JSON.stringify({ acceptanceCriteria: [], steps: [] });
+    const { model, requests } = scriptedModel(
+      Array.from({ length: MAX_PLANNER_RETRIES + 1 }, () => empty),
+    );
+    const planner = createModelPlanner(model);
+
+    await expect(planner.create({ goal: "g", context: "c", availableTools: [] })).rejects.toThrow(
+      "plan requires at least one step",
+    );
+    expect(requests).toHaveLength(MAX_PLANNER_RETRIES + 1);
   });
 
   it("accepts a create draft wrapped in a Markdown fence", async () => {

@@ -64,6 +64,13 @@ export interface StopReasonMap {
   interrupted: true;
   /** 压缩连续校验失败导致的停止：宁可停下，也不用"差不多"的摘要继续。 */
   compaction_failed: true;
+  /**
+   * 初始计划创建失败（规划模型调用报错，或输出违反计划契约且重试后仍不合法）。
+   *
+   * 它发生在第一次落盘之前，因此必须落一份失败检查点：否则这次运行在运行列表里
+   * 不可见、也无法审计，而它恰恰是最需要复盘的失败。
+   */
+  plan_error: true;
 }
 
 export type StopReason = keyof StopReasonMap;
@@ -109,6 +116,13 @@ export interface TaskPlan {
   acceptanceCriteria: AcceptanceCriterion[];
   steps: PlanStep[];
   revisionReason?: string | undefined;
+  /**
+   * 调用方判定任务足够简单、跳过规划模型后合成的单步计划。
+   *
+   * 完成门禁据此放行"模型直接给出最终文本"这一轮：没有工具 observation 可引用，
+   * 也就不该再去调 `planner.evaluate`。
+   */
+  shortcut?: boolean | undefined;
 }
 
 export interface PlanHistoryEntry {
@@ -247,7 +261,11 @@ export interface DurableAgentState {
   task: string;
   cwd: string;
   status: AgentState["status"];
-  plan: TaskPlan;
+  /**
+   * 初始计划可能不存在：计划创建失败会以 `plan_error` 停在第一次落盘之前。
+   * 这类**终态**失败仍然必须能落成检查点，否则它在运行列表里不可见、无法审计。
+   */
+  plan?: TaskPlan | undefined;
   activeStepId?: string | undefined;
   planHistory: PlanHistoryEntry[];
   messages: AgentMessage[];

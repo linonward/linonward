@@ -16,6 +16,7 @@ import {
 import {
   type AgentLoopEvent,
   type LoopPricing,
+  readPlanErrorDetail,
   runAgentLoop,
 } from "../../../packages/agent-from-scratch-fixture/src/agent-loop.js";
 import {
@@ -555,7 +556,15 @@ export function createConsoleRunner(options: ConsoleRunnerOptions): ConsoleRunne
     // 保证 journal 里的 usage / budget 记录先于 done 到达浏览器。
     context.tailer.flush();
 
-    const detail: unknown = budget ?? planBlocked;
+    // 计划创建失败没有 `plan_blocked` / `budget_exhausted`，它的诊断在自己的运行时事件里。
+    const planError = readPlanErrorDetail(result.state);
+    if (planError !== undefined) {
+      context.channel.push(
+        redactRecord({ kind: "plan_error", at, ...planError }, context.secrets) as JournalRecord,
+      );
+    }
+
+    const detail: unknown = budget ?? planBlocked ?? planError;
     const stopped: JournalRecord = {
       kind: "run_stopped",
       at,
